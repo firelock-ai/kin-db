@@ -32,7 +32,7 @@ This repo is infrastructure, not the user-facing semantic product. If a behavior
 cargo test -p kin-db
 ```
 
-Optional feature flags live in [`crates/kin-db/Cargo.toml`](/Users/troyfortinjr/GitHub/kin-db/crates/kin-db/Cargo.toml) for Metal, CUDA, and Accelerate-backed embedding/runtime paths.
+Optional feature flags live in [`crates/kin-db/Cargo.toml`](/Users/troyfortinjr/GitHub/kin-ecosystem/kin-db/crates/kin-db/Cargo.toml) for Metal, CUDA, and Accelerate-backed embedding/runtime paths.
 
 ## Repo Layout
 
