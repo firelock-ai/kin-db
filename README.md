@@ -1,69 +1,113 @@
 # KinDB
 
-KinDB is the graph and search substrate for the Kin ecosystem.
+**Embeddable graph engine for code-aware tools.**
 
-It exists as a separate repo because storage, snapshots, indexing, vector search, and retrieval-adjacent infrastructure are foundational below multiple Kin surfaces. The goal is to keep those concerns cleanly below the semantic VCS, editor, agent, and hosted product layers.
+KinDB is a purpose-built, embeddable graph database in Rust. It provides the storage, indexing, and retrieval substrate for the [Kin](https://github.com/anthropics/kin) semantic version control system and is designed to be usable independently by any tool that needs a fast, typed code graph.
 
-## What This Repo Owns
+> **Alpha** -- APIs will evolve. The core engine is proven: it powers Kin's 1,400+ test suite and validated benchmark sweeps.
 
-- graph storage and mutation primitives
-- snapshot persistence and recovery-friendly serialization
-- incremental index support
-- full-text search substrate
-- vector search substrate
-- low-level traversal and query machinery
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Rust](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
+[![Status: Alpha](https://img.shields.io/badge/Status-Alpha-yellow.svg)](#status)
 
-## Current State
+---
 
-Today this repo contains the `kin-db` crate under `crates/kin-db/` and provides the storage layer used by `kin`.
+## What KinDB Does
 
-Current implementation themes:
+- **In-memory graph engine** with HashMap-based adjacency lists and compiled Rust queries (no query language, zero parsing overhead)
+- **Snapshot persistence** with mmap and RCU snapshots (single writer, concurrent readers, zero-blocking reads)
+- **Full-text search** via Tantivy
+- **Vector similarity search** via HNSW index
+- **Incremental indexing** for graph updates without full rebuilds
+- **Static schema** -- Entity and Relation types known at compile time
 
-- in-memory graph engine with snapshot persistence
-- Tantivy-backed text search
-- embedding and vector-search dependencies for semantic retrieval work
-- concurrency and storage primitives meant to be reused by higher Kin layers
+---
 
-This repo is infrastructure, not the user-facing semantic product. If a behavior changes local repo truth, review semantics, or product UX directly, it probably belongs in `kin`, `kin-review`, `kin-search`, `kin-code`, or `kinhub`, not here.
-
-## Validate
+## Quick Start
 
 ```bash
+# Prerequisites: Rust 1.75+
+git clone https://github.com/anthropics/kin-db.git
+cd kin-db
+cargo build --release
+
+# Run tests
 cargo test -p kin-db
 ```
 
-Optional feature flags live in [`crates/kin-db/Cargo.toml`](/Users/troyfortinjr/GitHub/kin-ecosystem/kin-db/crates/kin-db/Cargo.toml) for Metal, CUDA, and Accelerate-backed embedding/runtime paths.
+---
 
 ## Repo Layout
 
-- `crates/kin-db/`
-  the main Rust crate
-- `docs/ARCHITECTURE.md`
-  storage and engine design
-- `docs/EVALUATION.md`
-  evaluation notes and measurement direction
-- `docs/ZERO_COPY_PLAN.md`
-  lower-level performance and memory direction
+```
+crates/kin-db/       # Main Rust crate
+  src/
+    types.rs         # Core types: Entity, Relation, EntityKind, RelationKind
+    store.rs         # GraphStore trait
+    engine/          # In-memory graph, indexes, traversal
+    storage/         # mmap persistence, RCU snapshots
+    vector/          # HNSW vector similarity search
+    search/          # Full-text search via Tantivy
+docs/
+  ARCHITECTURE.md    # Storage and engine design
+  EVALUATION.md      # Database comparison that led to building KinDB
+  ZERO_COPY_PLAN.md  # Performance and memory direction
+```
 
-## Relationship To Other Repos
+Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Accelerate-backed embedding/runtime paths.
 
-- `kin`
-  uses KinDB as its semantic graph storage and query engine
-- `kin-search`
-  should own ranking and retrieval policy above KinDB's raw indices
-- `kin-code`, `kin-codex`, and `kinhub`
-  should consume Kin semantics through stable boundaries built above KinDB, not by embedding product-specific logic into the database layer
-- `kin-graph-service`
-  depends on graph-backed data and projections, but should not redefine storage behavior
+---
 
-## Design Rule
+## Design Principles
 
-Keep KinDB narrow and composable:
+- **Batch write, continuous read** -- optimized for bulk indexing (like `kin commit`) followed by many reads.
+- **No query language** -- all queries are compiled Rust functions. No parsing overhead, no runtime interpretation.
+- **Static schema** -- Entity/Relation types known at compile time. No runtime schema discovery.
+- **Narrow scope** -- storage and low-level query capability live here. Semantic rules, review logic, and ranking strategy belong in higher layers.
 
-- put storage and low-level query capability here
-- keep semantic repo rules in `kin`
-- keep review/gate logic in `kin-review`
-- keep ranking strategy in `kin-search`
-- keep hosted/workbench behavior out of the database layer
+---
 
-For deeper design detail, start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Status
+
+**What's solid:**
+- In-memory graph with snapshot persistence
+- Concurrent read access via RCU
+- Tantivy-backed full-text search
+- Vector similarity search
+- Used as the storage engine for Kin's full test and benchmark suite
+
+**What's evolving:**
+- Embedding and vector-search tuning
+- Zero-copy read path optimizations
+- API surface for standalone use outside Kin
+
+---
+
+## Ecosystem
+
+KinDB is the storage substrate for the Kin ecosystem:
+
+| Component | Description |
+|-----------|-------------|
+| **[kin](https://github.com/anthropics/kin)** | Semantic VCS -- primary consumer of KinDB |
+| **[kin-db](https://github.com/anthropics/kin-db)** | Embeddable graph engine (this repo) |
+| **[kin-stack](https://github.com/anthropics/kin-stack)** | Orchestration, benchmarking, and proof tooling |
+| **kin-code** | Editor shell |
+| **kin-pilot** | Agent shell |
+| **[KinHub](https://dev.kinhub.firelock.ai)** | Hosted collaboration layer |
+
+KinDB exists as a separate repo because storage, indexing, and retrieval are foundational concerns that sit below all product layers. Higher-level tools should consume Kin semantics through stable boundaries, not by embedding product logic into the database layer.
+
+---
+
+## Contributing
+
+Contributions welcome. Please open an issue before submitting large changes.
+
+## License
+
+Apache-2.0.
+
+---
+
+Built by [Firelock, LLC](https://firelock.ai).
