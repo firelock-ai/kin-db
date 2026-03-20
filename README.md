@@ -1,5 +1,9 @@
 <p align="center">
-  <img src=".github/kindb-lockup-light.png" height="64" alt="KinDB">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/kindb-lockup-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset=".github/kindb-lockup-light.png">
+    <img src=".github/kindb-lockup-light.png" height="64" alt="KinDB">
+  </picture>
 </p>
 
 # KinDB
