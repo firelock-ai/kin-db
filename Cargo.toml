@@ -2,10 +2,21 @@
 # Copyright 2026 Firelock, LLC
 
 [workspace]
-members = ["crates/kin-db"]
+members = ["crates/kin-db", "crates/kin-model"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+pretty_assertions = "1"

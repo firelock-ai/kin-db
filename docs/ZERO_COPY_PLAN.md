@@ -1,5 +1,10 @@
 # Zero-Copy Snapshot: rkyv + mmap
 
+> Planning note: this document describes a future optimization path, not the current
+> alpha storage format. Today's alpha still persists KinDB snapshots via MessagePack
+> with mmap-backed file access around that snapshot. References to KuzuDB below are
+> comparisons against the earlier prototype backend, not the live backend shipped now.
+
 ## Problem
 
 Every CLI invocation deserializes a 73MB MessagePack snapshot into memory (~800ms).
@@ -47,7 +52,7 @@ let snapshot = rkyv::access::<ArchivedGraphSnapshot>(&mmap)?;
 
 ## Implementation Steps
 
-### Phase 1: Add rkyv derives to all types (kin-model)
+### Phase 1: Add rkyv derives to all types (`crates/kin-model`)
 - Add `rkyv::Archive, rkyv::Serialize, rkyv::Deserialize` derives to:
   Entity, EntityId, EntityKind, Relation, RelationKind, RelationId,
   Branch, BranchName, SemanticChange, SemanticChangeId, and all nested types

@@ -1,10 +1,12 @@
 # Database Evaluation for Kin
 
+> Historical note: this is the evaluation memo written before KinDB replaced KuzuDB. It remains useful background for the design tradeoffs, but KinDB is already the current engine in today's alpha.
+
 ## Context
 
-Kin needs a graph database that can handle codebases from 3K entities (zod) to 10M+
-entities (large monorepos). The current KuzuDB backend works at small scale but has
-fundamental limitations that prevent scaling.
+Kin needed a graph database that could handle codebases from 3K entities (zod) to 10M+
+entities (large monorepos). The earlier KuzuDB prototype worked at small scale but had
+fundamental limitations that prevented scaling.
 
 ## Requirements
 
@@ -13,7 +15,7 @@ fundamental limitations that prevent scaling.
 | Embeddable in Rust       | Must   | Kin is a CLI tool, not a server                |
 | Graph traversal          | Must   | Call chains, dependency analysis, dead code    |
 | Concurrent reads         | Must   | MCP server + CLI queries simultaneously        |
-| Concurrent writes        | Must   | Index while querying (open-source use case)    |
+| Concurrent writes        | Must   | Index while querying during broader public alpha use |
 | Vector similarity search | Must   | "Find code similar to X" is a core feature     |
 | Full-text search         | High   | Fuzzy entity name matching                     |
 | Incremental updates      | Must   | Only re-index changed files on commit          |
@@ -23,7 +25,7 @@ fundamental limitations that prevent scaling.
 
 ## Candidates Evaluated
 
-### KuzuDB v0.11 (Current)
+### KuzuDB v0.11 (Prior Prototype Backend)
 
 - **Type:** Embedded C++ graph database with Rust bindings
 - **Query language:** Cypher
@@ -144,7 +146,7 @@ Legend: Yes = fully supported, ~ = partial/uncertain, No = not supported
 
 ## Decision
 
-**Build KinDB** — a purpose-built, embeddable code graph database in Rust.
+**We built KinDB** — a purpose-built, embeddable code graph database in Rust.
 
 ### Rationale
 
