@@ -1,16 +1,18 @@
 # KinDB Architecture
 
+> Historical note: this document started as the KuzuDB-to-KinDB migration design memo. KinDB is now Kin's current graph engine. References to KuzuDB below describe the prior prototype baseline and the rationale for replacing it, not the live backend shipped in today's alpha. The detached `kin-db` repo now also carries the local `crates/kin-model` crate that defines the canonical semantic model and trait surface used here.
+
 ## Why We're Building This
 
 Kin is a sovereign semantic VCS that replaces file-based version control with a graph of
-semantic entities and relationships. Today it uses KuzuDB (v0.11), an embedded C++ graph
-database with Rust bindings. KuzuDB works at small scale but **will not survive
-open-source adoption**.
+semantic entities and relationships. Before KinDB, the prototype stack used KuzuDB
+(v0.11), an embedded C++ graph database with Rust bindings. This document captures why
+that backend was replaced as Kin moved toward public-alpha scale.
 
 ### The Scale Problem
 
-When kin goes open-source, developers will run it on repos of all sizes. Here's what
-happens to KuzuDB at scale:
+As Kin usage expands to larger public repos, the limits of the earlier KuzuDB prototype
+become clear:
 
 | Repo             | Entities   | KuzuDB Graph | Index Time | In-Memory  |
 |------------------|------------|-------------|------------|------------|
@@ -148,7 +150,7 @@ Inspired by Linux kernel's Read-Copy-Update (RCU) pattern:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        KinDB API                            │
-│              (GraphStore trait — drop-in for KuzuDB)        │
+│   (current graph engine behind the repo-owned kin-model surface)   │
 ├─────────────┬──────────────┬──────────────┬─────────────────┤
 │  Graph      │  Vector      │  Text        │  Traversal      │
 │  Engine     │  Index       │  Search      │  Algorithms     │
@@ -158,7 +160,8 @@ Inspired by Linux kernel's Read-Copy-Update (RCU) pattern:
 │         (concurrent readers + single background writer)     │
 ├─────────────────────────────────────────────────────────────┤
 │                   Storage Layer (mmap)                       │
-│         (zero-copy reads, rkyv serialization)               │
+│   (MessagePack snapshots with mmap-backed loads today;      │
+│            zero-copy/rkyv remains future work)              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -203,12 +206,12 @@ Tantivy (Rust-native Lucene alternative) for full-text search:
 
 ### Persistence
 
-Memory-mapped files with zero-copy deserialization:
+Memory-mapped snapshot files with mmap-backed loads:
 
-- `rkyv` for zero-copy deserialization (read directly from mmap, no parse step)
+- current snapshot files use MessagePack plus checksum validation
 - Atomic save: write to `.tmp`, fsync, rename
 - Snapshot-based: each save creates a complete, self-contained file
-- Old snapshots kept for crash recovery
+- Recovery focuses on atomic writes plus rebuild workflows; old snapshots are not retained automatically
 
 ### Concurrency
 
@@ -221,7 +224,7 @@ Read-Copy-Update (RCU) inspired by `cloudflare/mmap-sync`:
 
 ## Performance Targets
 
-| Operation                         | KuzuDB (current) | KinDB (target)  |
+| Operation                         | KuzuDB (prototype baseline) | KinDB (current direction) |
 |-----------------------------------|-------------------|-----------------|
 | `kin trace <name>`                | 5-30ms            | <1ms            |
 | `kin search <name>`               | 10-50ms           | <1ms            |
@@ -234,15 +237,15 @@ Read-Copy-Update (RCU) inspired by `cloudflare/mmap-sync`:
 
 ## Migration Path
 
-KinDB implements the existing `GraphStore` trait from `kin-model`. This makes it a
-**drop-in replacement** for `KuzuGraphStore`:
+KinDB implements the repo-owned `GraphStore` trait exposed by `crates/kin-model`.
+That kept the backend swap surface stable for the earlier `KuzuGraphStore` migration:
 
 ```rust
 // Before (kin-graph/KuzuDB)
 let store = KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
 // After (kin-db)
-let store = KinDB::open(&layout.graph_dir())?;
+let store = SnapshotManager::open(&layout.graph_dir())?;
 ```
 
 All 20+ trait methods are implemented. The kin CLI, MCP server, and benchmark harness
@@ -251,28 +254,31 @@ work unchanged — only the storage backend switches.
 ## Crate Structure
 
 ```
-crates/kin-db/
-├── src/
-│   ├── lib.rs              # Public API, KinDB struct
-│   ├── types.rs            # Entity, Relation, etc. (from kin-model)
-│   ├── store.rs            # GraphStore trait definition
-│   ├── error.rs            # Error types
-│   ├── engine/
-│   │   ├── mod.rs          # In-memory graph module
-│   │   ├── graph.rs        # InMemoryGraph + GraphStore impl
-│   │   ├── index.rs        # Name, file, kind indexes
-│   │   └── traverse.rs     # BFS, DFS, dead_code, impact analysis
-│   ├── vector/
-│   │   ├── mod.rs          # Vector index module
-│   │   └── hnsw.rs         # usearch HNSW wrapper
-│   ├── search/
-│   │   ├── mod.rs          # Text search module
-│   │   └── text.rs         # Tantivy full-text search
-│   └── storage/
-│       ├── mod.rs          # Persistence module
-│       ├── format.rs       # rkyv serialization format
-│       ├── snapshot.rs     # RCU snapshot management
-│       └── mmap.rs         # Memory-mapped file wrapper
+crates/
+├── kin-model/
+│   └── src/                # Canonical semantic types, layout, and GraphStore trait
+└── kin-db/
+    └── src/
+        ├── lib.rs          # Public exports for graph, search, and snapshot APIs
+        ├── types.rs        # Re-exports of canonical types from kin-model
+        ├── store.rs        # Re-export of the local GraphStore trait surface
+        ├── error.rs        # Error types
+        ├── engine/
+        │   ├── mod.rs      # In-memory graph module
+        │   ├── graph.rs    # InMemoryGraph + GraphStore impl
+        │   ├── index.rs    # Name, file, kind indexes
+        │   └── traverse.rs # BFS, DFS, dead_code, impact analysis
+        ├── vector/
+        │   ├── mod.rs      # Vector index module
+        │   └── hnsw.rs     # usearch HNSW wrapper
+        ├── search/
+        │   ├── mod.rs      # Text search module
+        │   └── text.rs     # Tantivy full-text search
+        └── storage/
+            ├── mod.rs      # Persistence module
+            ├── format.rs   # Current MessagePack snapshot envelope format
+            ├── snapshot.rs # RCU snapshot management
+            └── mmap.rs     # Memory-mapped file wrapper
 ```
 
 ## Future Work

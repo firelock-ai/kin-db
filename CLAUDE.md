@@ -5,22 +5,23 @@ Purpose-built, embeddable code graph database in Rust. Designed for kin — a se
 ## Build
 
 ```bash
+git clone https://github.com/firelock-ai/kin-db.git
+cd kin-db
 cargo build
-cargo test
+cargo test --workspace
 ```
 
 ## Architecture
 
 See `docs/ARCHITECTURE.md` for the full design rationale and `docs/EVALUATION.md` for the database comparison that led to building KinDB.
 
-### Crate: `kin-db`
+### Crates
 
-- `types.rs` — Core types: Entity, Relation, EntityKind, RelationKind, etc.
-- `store.rs` — `GraphStore` trait (drop-in compatible with kin's KuzuDB backend)
-- `engine/` — In-memory graph with HashMap-based adjacency lists, indexes, and traversal
-- `storage/` — mmap persistence with RCU snapshots (single writer / multiple readers)
-- `vector/` — HNSW vector similarity search
-- `search/` — Full-text search via tantivy
+- `crates/kin-model` — Canonical semantic model crate owned by this repo: entities, relations, layout, and the `GraphStore` trait surface that KinDB implements.
+- `crates/kin-db` — Graph engine crate.
+  `types.rs` re-exports the canonical `kin-model` types for local compatibility.
+  `store.rs` re-exports the local `GraphStore` trait surface.
+  `engine/`, `storage/`, `vector/`, and `search/` implement the runtime behavior.
 
 ### Key Design Decisions
 
@@ -33,5 +34,5 @@ See `docs/ARCHITECTURE.md` for the full design rationale and `docs/EVALUATION.md
 ## Testing
 
 ```bash
-cargo test --lib      # Unit tests (29+ tests)
+cargo test -p kin-db  # Current alpha test surface for the crate
 ```

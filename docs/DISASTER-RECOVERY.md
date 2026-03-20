@@ -1,5 +1,9 @@
 # KinDB Disaster Recovery
 
+> Current-state note: the recovery steps in this document describe today's KinDB
+> snapshot format. The delegation-chain section near the end is a design note for a
+> future `kin audit --verify-chain` feature and is not implemented in this alpha.
+
 How to detect, diagnose, and recover from data corruption or loss in KinDB.
 
 ## Snapshot Storage Layout
@@ -209,7 +213,7 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
 Work items, annotations, test metadata, actors, and audit events are graph-only state with no Git equivalent — they cannot be recovered from external sources.
 
-## Delegation Chain Verification
+## Delegation Chain Verification (Design Note)
 
 ### `kin audit --verify-chain <actor-id>`
 
@@ -219,11 +223,11 @@ Work items, annotations, test metadata, actors, and audit events are graph-only 
 
 ### Implementation Plan
 
-**File to modify:** `kin/crates/kin-cli/src/commands/audit.rs`
+**Integration file to modify (in Kin's CLI repo):** `kin/crates/kin-cli/src/commands/audit.rs`
 
 **Changes required:**
 
-1. Add a `--verify-chain <actor-id>` option to the CLI argument parser (in `kin/crates/kin-cli/src/main.rs` or wherever clap args are defined).
+1. Add a `--verify-chain <actor-id>` option to the CLI argument parser in Kin's CLI surface (`kin/crates/kin-cli/src/main.rs` or equivalent).
 
 2. Add a `verify_chain` function to `audit.rs`:
 
