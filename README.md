@@ -94,7 +94,7 @@ KinDB is the storage substrate for the Kin ecosystem:
 | **[kin-stack](https://github.com/anthropics/kin-stack)** | Orchestration, benchmarking, and proof tooling |
 | **kin-code** | Editor shell |
 | **kin-pilot** | Agent shell |
-| **[KinHub](https://dev.kinhub.firelock.ai)** | Hosted collaboration layer |
+| **[KinLab](https://kinlab.ai)** | Hosted collaboration layer |
 
 KinDB exists as a separate repo because storage, indexing, and retrieval are foundational concerns that sit below all product layers. Higher-level tools should consume Kin semantics through stable boundaries, not by embedding product logic into the database layer.
 
