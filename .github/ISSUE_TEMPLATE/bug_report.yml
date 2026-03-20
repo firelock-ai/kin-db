@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Bug Report
+description: Report a bug in KinDB
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the details below.
+
+  - type: input
+    id: version
+    attributes:
+      label: KinDB Version
+      description: Version from your Cargo.toml or lockfile
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Architecture
+      placeholder: "macOS 14.3 arm64 / Ubuntu 22.04 x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps or code to reproduce the issue
+      placeholder: |
+        1. Create a GraphStore with ...
+        2. Insert entities ...
+        3. Query returns unexpected result
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output or error messages
+      render: shell
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected Module (if known)
+      options:
+        - engine (graph store)
+        - storage (mmap/snapshots)
+        - search (full-text)
+        - vector (HNSW)
+        - types
+        - Unknown
