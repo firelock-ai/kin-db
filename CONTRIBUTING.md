@@ -6,7 +6,7 @@ Thank you for your interest in contributing to KinDB. This document covers every
 
 ### Prerequisites
 
-- **Rust 1.75+** (2021 edition) -- install via [rustup](https://rustup.rs/)
+- **Rust stable** (2021 edition) -- install via [rustup](https://rustup.rs/)
 - **C/C++ compiler** -- required for native dependencies
   - macOS: `xcode-select --install`
   - Ubuntu/Debian: `apt install build-essential`
@@ -20,11 +20,13 @@ cd kin-db
 cargo build
 ```
 
+This repo now builds standalone. The repo-owned `kin-model` crate lives in this workspace, so no sibling checkout is required.
+
 ### Run Tests
 
 ```bash
 # Run all tests
-cargo test
+cargo test --workspace
 
 # Run tests for the kin-db crate
 cargo test -p kin-db
@@ -37,7 +39,7 @@ cargo test -p kin-db
 cargo fmt -- --check
 
 # Run clippy
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Developer Certificate of Origin (DCO)
@@ -55,6 +57,8 @@ Signed-off-by: Your Name <your.email@example.com>
 You can do this automatically with `git commit -s`.
 
 **Why DCO?** KinDB is licensed under Apache-2.0. The DCO creates a clear chain of title for all contributions, which protects both you and the project.
+
+KinDB currently also checks a contributor CLA in GitHub Actions. If you open a PR, follow the prompt in [CLA.md](CLA.md) to record that signature as well.
 
 ## Making Changes
 
@@ -99,8 +103,9 @@ Closes #15
 
 Each module has a specific responsibility. Before adding code, make sure it belongs in the module you're modifying:
 
-- **types.rs** -- Core types: Entity, Relation, EntityKind, RelationKind.
-- **store.rs** -- `GraphStore` trait. No implementation details.
+- **crates/kin-model/** -- Canonical semantic types, traits, layout, and shared contracts used by KinDB.
+- **types.rs** -- Re-exports of the canonical types from `crates/kin-model`.
+- **store.rs** -- Re-export of the local `GraphStore` trait surface.
 - **engine/** -- In-memory graph, adjacency lists, indexes, traversal.
 - **storage/** -- mmap persistence, RCU snapshots.
 - **vector/** -- HNSW vector similarity search.
