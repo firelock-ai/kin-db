@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/kindb-lockup-light.png" height="48" alt="KinDB">
+  <img src=".github/kindb-lockup-light.png" height="64" alt="KinDB">
 </p>
 
 # KinDB
