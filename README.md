@@ -6,6 +6,8 @@ KinDB is a purpose-built, embeddable graph database in Rust. It provides the sto
 
 > **Alpha** -- APIs will evolve. The core engine is proven: it powers Kin's 1,400+ test suite and validated benchmark sweeps.
 
+[![CI](https://github.com/firelock-ai/kin-db/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin-db/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/firelock-ai/kin-db/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin-db)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 [![Status: Alpha](https://img.shields.io/badge/Status-Alpha-yellow.svg)](#status)
