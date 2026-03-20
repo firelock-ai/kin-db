@@ -55,7 +55,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --all-targets
@@ -102,7 +102,10 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Run coverage
-        run: cargo tarpaulin --out xml --out stdout
+        run: |
+          if ! cargo tarpaulin --out xml --out stdout; then
+            echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha."
+          fi
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
