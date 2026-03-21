@@ -14,6 +14,7 @@ pub mod contract;
 pub mod entity;
 pub mod error;
 pub mod evidence;
+pub mod federation;
 pub mod graph;
 pub mod ids;
 pub mod layout;
@@ -43,6 +44,10 @@ pub use entity::{
 };
 pub use error::{ModelError, Result};
 pub use evidence::{Evidence, TestResult};
+pub use federation::{
+    ActorRef, GraphCapabilitySet, GraphLocator, GraphManifest, RemoteRelation, RemoteRelationKind,
+    RemoteRelationOrigin, ScopeRef, SessionLease,
+};
 pub use graph::{EntityFilter, GraphStore, SubGraph};
 pub use ids::{
     AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId, FilePathId,
