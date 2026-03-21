@@ -1,7 +1,12 @@
-/target
+target/
 Cargo.lock
 *.swp
 *.swo
 .DS_Store
 .env
 .fastembed_cache/
+
+# Private keys / certs
+*.pem
+*.key
+*.p12
