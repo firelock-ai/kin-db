@@ -137,7 +137,7 @@ impl std::str::FromStr for WorkStatus {
         match s.to_lowercase().as_str() {
             "proposed" => Ok(WorkStatus::Proposed),
             "planned" => Ok(WorkStatus::Planned),
-            "in_progress" | "inprogress" => Ok(WorkStatus::InProgress),
+            "in_progress" | "in-progress" | "inprogress" => Ok(WorkStatus::InProgress),
             "blocked" => Ok(WorkStatus::Blocked),
             "done" => Ok(WorkStatus::Done),
             "verified" => Ok(WorkStatus::Verified),
