@@ -58,8 +58,6 @@ You can do this automatically with `git commit -s`.
 
 **Why DCO?** KinDB uses DCO as a lightweight contribution policy to maintain a clear provenance trail for all contributions and to document that they are submitted under the project's licensing terms. DCO is not required by Apache-2.0, but it helps keep contribution history clear for maintainers and future stewards.
 
-KinDB currently also checks a contributor CLA in GitHub Actions. If you open a PR, follow the prompt in [CLA.md](CLA.md) to record that signature as well.
-
 ## Making Changes
 
 ### Branch Strategy
