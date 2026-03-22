@@ -12,7 +12,7 @@
 
 KinDB is a purpose-built graph engine in Rust. It provides the storage, indexing, and retrieval substrate for the [Kin](https://github.com/firelock-ai/kin) semantic version control system and now ships as its own Apache-licensed repo.
 
-> **Alpha** -- APIs will evolve. The core engine is proven inside Kin's 1,400+ test suite and validated benchmark sweeps. Standalone source builds now work directly from this repo; the repo-owned `kin-model` crate ships here alongside `kin-db`.
+> **Alpha** -- APIs will evolve. Proven now: the core engine is exercised by Kin's 1,400+ test suite, current validated benchmark sweeps, and standalone source builds from this repo. Still hardening: API shape, embedding/vector tuning, and surfaces above the substrate.
 
 [![CI](https://github.com/firelock-ai/kin-db/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin-db/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/firelock-ai/kin-db/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin-db)
@@ -82,14 +82,14 @@ Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Acc
 
 ## Status
 
-**What's solid:**
+**Proven now:**
 - In-memory graph with snapshot persistence
 - Concurrent read access via RCU
 - Tantivy-backed full-text search
 - Vector similarity search
 - Used as the storage engine for Kin's full test and benchmark suite
 
-**What's evolving:**
+**Still hardening:**
 - Embedding and vector-search tuning
 - Zero-copy read path optimizations
 - API surface outside Kin
@@ -98,15 +98,16 @@ Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Acc
 
 ## Ecosystem
 
-Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack is supporting infrastructure or planned follow-on surfaces.
+The substrate is shipping now. The rest of the stack is active infrastructure around it, with some surfaces still hardening rather than speculative.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS -- primary consumer of KinDB |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate (this repo) |
-| **kin-code** | Planned | Editor shell |
-| **kin-pilot** | Planned | Agent shell |
-| **[KinLab](https://kinlab.ai)** | Planned | Hosted collaboration layer |
+| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Active | Bootstrap, orchestration, config, validation, benchmarks, and migration support |
+| **kin-code** | Active, hardening | Editor shell |
+| **kin-pilot** | Active, hardening | Agent shell |
+| **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
 
 KinDB exists as a separate repo because storage, indexing, retrieval, and the shared `kin-model` surface are foundational concerns that sit below the higher-level Kin product layers.
 
