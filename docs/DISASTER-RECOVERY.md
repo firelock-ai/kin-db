@@ -86,9 +86,9 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
 **Steps:**
 
-1. **Let KinDB attempt automatic recovery first.** When `graph.kndb` is corrupted and `graph.tmp` is still valid, opening the repository will now promote the recovery snapshot back into place automatically.
+1. **Let KinDB attempt automatic recovery first.** When `graph.kndb` is corrupted and `graph.tmp` is still valid *and has a matching recovery marker from an interrupted atomic save*, opening the repository will promote the recovery snapshot back into place automatically.
 
-2. **Check for a stale `.tmp` file manually if automatic recovery still fails.** If `graph.tmp` exists alongside `graph.kndb`, a crash may have interrupted an atomic write. The `.tmp` may contain a valid newer snapshot:
+2. **Check for an unproven or stale `.tmp` file manually if automatic recovery still fails.** If `graph.tmp` exists alongside `graph.kndb` but there is no matching `graph.tmp.meta`, KinDB now refuses to auto-promote it because the file could be stale. If you determine the `.tmp` file is the intended interrupted save, promote it manually:
 
    ```bash
    # Verify the tmp file is valid
@@ -131,7 +131,7 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
 **Steps:**
 
-1. If `graph.tmp` exists, try opening the repo once before rebuilding. KinDB will promote a valid recovery snapshot automatically when `graph.kndb` is missing.
+1. If `graph.tmp` and `graph.tmp.meta` both exist, try opening the repo once before rebuilding. KinDB will promote a valid marked recovery snapshot automatically when `graph.kndb` is missing.
 
 2. If the `.kin/` directory structure is intact and there is no recoverable `graph.tmp`, the snapshot was likely deleted or never created. Run:
 
