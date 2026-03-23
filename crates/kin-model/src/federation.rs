@@ -165,7 +165,13 @@ pub struct SessionLease {
     pub graph: GraphLocator,
     pub transport: SessionTransport,
     pub capabilities: SessionCapabilities,
+    #[serde(default = "default_fence_epoch")]
+    pub fence_epoch: u64,
     pub expires_at: Timestamp,
+}
+
+fn default_fence_epoch() -> u64 {
+    1
 }
 
 /// Cross-graph relation categories.
@@ -361,6 +367,7 @@ mod tests {
             graph,
             transport: SessionTransport::Mcp,
             capabilities: SessionCapabilities::default(),
+            fence_epoch: 1,
             expires_at: Timestamp::now(),
         };
         let json = serde_json::to_string(&lease).unwrap();
@@ -368,6 +375,28 @@ mod tests {
         assert_eq!(parsed.graph, lease.graph);
         assert_eq!(parsed.actor, lease.actor);
         assert_eq!(parsed.transport, SessionTransport::Mcp);
+    }
+
+    #[test]
+    fn session_lease_defaults_fence_epoch_for_legacy_payloads() {
+        let lease_json = serde_json::json!({
+            "session_id": SessionId::new(),
+            "actor": {
+                "authority": "https://kinlab.example.com",
+                "actor_id": "actor-1",
+            },
+            "graph": {
+                "authority": "https://kinlab.example.com",
+                "organization_id": "acme",
+                "repo_id": "repo-1",
+            },
+            "transport": "Mcp",
+            "capabilities": SessionCapabilities::default(),
+            "expires_at": Timestamp::now(),
+        });
+
+        let parsed: SessionLease = serde_json::from_value(lease_json).unwrap();
+        assert_eq!(parsed.fence_epoch, 1);
     }
 
     #[test]
