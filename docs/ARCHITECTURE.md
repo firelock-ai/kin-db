@@ -220,6 +220,7 @@ Memory-mapped snapshot files with mmap-backed loads:
 - current snapshot files use MessagePack plus checksum validation
 - Atomic save: write to `.tmp`, fsync, rename
 - Snapshot-based: each save creates a complete, self-contained file
+- Vector sidecars fail closed on reload: non-empty HNSW indexes require a matching digest-checked key map, so stale same-size sidecars do not silently remap entity IDs
 - Recovery focuses on atomic writes, automatic promotion of a valid `graph.tmp` when the primary snapshot is missing or corrupted, and rebuild workflows; old snapshots are not retained automatically
 
 ### Concurrency
