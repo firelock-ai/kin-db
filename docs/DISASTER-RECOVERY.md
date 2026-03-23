@@ -18,7 +18,7 @@ KinDB persists the entire graph as a single snapshot file:
 ```
 
 - **`graph.kndb`** — The current graph snapshot. Written atomically via tmp+rename so it is always in a consistent state on disk.
-- **`graph.tmp`** — Exists only during a write operation. If present after a crash, it may contain a valid snapshot that was never promoted.
+- **`graph.tmp`** — Exists only during a write operation. If present after a crash, KinDB now treats it as a recovery candidate: on open, a valid `graph.tmp` is promoted back to `graph.kndb` when the primary snapshot is missing or corrupted.
 
 The snapshot path is computed by `KinLayout::kindb_snapshot_path()` — always `.kin/kindb/graph.kndb` relative to the repository root.
 
@@ -86,7 +86,9 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
 **Steps:**
 
-1. **Check for a stale `.tmp` file.** If `graph.tmp` exists alongside `graph.kndb`, a crash may have interrupted an atomic write. The `.tmp` may contain a valid newer snapshot:
+1. **Let KinDB attempt automatic recovery first.** When `graph.kndb` is corrupted and `graph.tmp` is still valid, opening the repository will now promote the recovery snapshot back into place automatically.
+
+2. **Check for a stale `.tmp` file manually if automatic recovery still fails.** If `graph.tmp` exists alongside `graph.kndb`, a crash may have interrupted an atomic write. The `.tmp` may contain a valid newer snapshot:
 
    ```bash
    # Verify the tmp file is valid
@@ -97,7 +99,7 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
    mv .kin/kindb/graph.tmp .kin/kindb/graph.kndb
    ```
 
-2. **Rebuild from Git history** using `kin migrate`:
+3. **Rebuild from Git history** using `kin migrate`:
 
    ```bash
    # Back up the corrupted snapshot
@@ -109,7 +111,7 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
    This scans the repository's source files and rebuilds entities and relations from scratch. Use `--depth deep` for full commit history traversal (slower but recovers change DAG).
 
-3. **Rebuild from source files** (if Git is unavailable):
+4. **Rebuild from source files** (if Git is unavailable):
 
    ```bash
    # Remove corrupted snapshot
@@ -129,14 +131,16 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 
 **Steps:**
 
-1. If the `.kin/` directory structure is intact, the snapshot was likely deleted or never created. Run:
+1. If `graph.tmp` exists, try opening the repo once before rebuilding. KinDB will promote a valid recovery snapshot automatically when `graph.kndb` is missing.
+
+2. If the `.kin/` directory structure is intact and there is no recoverable `graph.tmp`, the snapshot was likely deleted or never created. Run:
 
    ```bash
    kin init    # creates a fresh empty graph
    kin commit  # indexes the working tree
    ```
 
-2. If rebuilding from a Git repo:
+3. If rebuilding from a Git repo:
 
    ```bash
    kin migrate --depth shallow
@@ -212,6 +216,40 @@ For v1/v2 snapshots (no trailing checksum), basic validation is: the file starts
 | Sessions & intents | Lost (ephemeral) | Lost (ephemeral) | Lost (ephemeral) |
 
 Work items, annotations, test metadata, actors, and audit events are graph-only state with no Git equivalent — they cannot be recovered from external sources.
+
+## Standalone Vector Index Recovery
+
+KinDB's persisted HNSW index also has a fail-closed recovery story when it is used directly outside the main snapshot flow.
+
+Typical files:
+
+```
+<index-dir>/
+  vectors.usearch     # saved HNSW structure
+  vectors.keys        # digest-bound EntityId key-map sidecar
+  vectors.tmp         # transient sidecar write file
+```
+
+- `vectors.keys` is not optional for a non-empty persisted index. Reload rejects a missing sidecar instead of guessing EntityId mappings.
+- Reload also rejects stale, corrupted, or out-of-sync sidecars. KinDB compares the saved index digest with the sidecar digest and checks key counts against the loaded index size.
+- A stale `vectors.tmp` from a prior interrupted sidecar write is overwritten on the next successful save.
+
+**Symptoms:** vector reload fails with one of:
+
+```text
+vector key map ... is missing for non-empty index
+vector key map ... does not match index ... (digest mismatch)
+vector key map ... is out of sync with index ...
+failed to deserialize vector key map ...
+```
+
+**Recovery:**
+
+1. Keep the current index files as evidence instead of editing them in place.
+2. Rebuild the vector index from the canonical embeddings/source graph.
+3. Save the rebuilt index again so KinDB writes a fresh `vectors.keys` sidecar that matches the saved index bytes.
+
+KinDB intentionally fails closed here: the safe outcome is an explicit reload failure, not silently returning the wrong EntityIds from similarity search.
 
 ## Delegation Chain Verification (Design Note)
 
