@@ -84,6 +84,8 @@ Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Acc
 
 **Proven now:**
 - In-memory graph with snapshot persistence
+- Mixed-language persistence/reload plus entity and graph-root verification coverage
+- Checksum-protected snapshots plus atomic-write recovery from partial tmp files
 - Concurrent read access via RCU
 - Tantivy-backed full-text search
 - Vector similarity search
