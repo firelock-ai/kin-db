@@ -145,6 +145,14 @@ Inspired by Linux kernel's Read-Copy-Update (RCU) pattern:
 - Atomic pointer swap makes the new snapshot visible to future readers
 - Old snapshot is freed when the last reader releases it
 
+### Boundary Reminder
+
+KinDB is the storage and retrieval substrate, not the layer that decides what a repository
+"is." Repo-root detection, brownfield code-root inference, manifest interpretation, and UI
+level truncation rules belong in Kin, KinLab, and kin-stack. KinDB's job is to preserve the
+raw semantic facts underneath those surfaces - including full per-entity language
+distribution - so higher layers can stay truthful when they summarize mixed-language repos.
+
 ## Architecture
 
 ```
