@@ -202,6 +202,7 @@ HNSW (Hierarchical Navigable Small World) index via the usearch crate:
 - Optional GPU acceleration for batch operations
 - Supports 10M+ vectors with sub-millisecond search
 - Embeddings stored alongside entities
+- Persisted indexes carry a digest-bound EntityId key-map sidecar, and reload fails closed if that sidecar is missing, stale, corrupted, or out of sync with the saved index
 
 ### Text Search
 
@@ -219,7 +220,7 @@ Memory-mapped snapshot files with mmap-backed loads:
 - current snapshot files use MessagePack plus checksum validation
 - Atomic save: write to `.tmp`, fsync, rename
 - Snapshot-based: each save creates a complete, self-contained file
-- Recovery focuses on atomic writes plus rebuild workflows; old snapshots are not retained automatically
+- Recovery focuses on atomic writes, automatic promotion of a valid `graph.tmp` when the primary snapshot is missing or corrupted, and rebuild workflows; old snapshots are not retained automatically
 
 ### Concurrency
 

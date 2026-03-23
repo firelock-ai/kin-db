@@ -88,7 +88,7 @@ Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Acc
 - Checksum-protected snapshots plus atomic-write recovery from partial tmp files
 - Concurrent read access via RCU
 - Tantivy-backed full-text search
-- Vector similarity search
+- Vector similarity search with save/load coherence and fail-closed key-map sidecars
 - Used as the storage engine for Kin's full test and benchmark suite
 
 **Still hardening:**
