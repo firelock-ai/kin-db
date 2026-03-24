@@ -227,12 +227,16 @@ Typical files:
 <index-dir>/
   vectors.usearch     # saved HNSW structure
   vectors.keys        # digest-bound EntityId key-map sidecar
-  vectors.tmp         # transient sidecar write file
+  vectors.tmp         # marker-proven recovery candidate for the HNSW index
+  vectors.tmp.meta    # checksum + length proof for vectors.tmp
+  vectors.keys.tmp    # marker-proven recovery candidate for the key-map sidecar
+  vectors.keys.tmp.meta
 ```
 
 - `vectors.keys` is not optional for a non-empty persisted index. Reload rejects a missing sidecar instead of guessing EntityId mappings.
 - Reload also rejects stale, corrupted, or out-of-sync sidecars. KinDB compares the saved index digest with the sidecar digest and checks key counts against the loaded index size.
-- A stale `vectors.tmp` from a prior interrupted sidecar write is overwritten on the next successful save.
+- `vectors.tmp` and `vectors.keys.tmp` are only promoted automatically when the matching `.tmp.meta` marker proves the tmp file length and checksum. Missing or mismatched markers are rejected instead of being silently promoted.
+- A stale `vectors.tmp`, `vectors.tmp.meta`, `vectors.keys.tmp`, or `vectors.keys.tmp.meta` from a prior interrupted write is overwritten on the next successful save.
 
 **Symptoms:** vector reload fails with one of:
 
@@ -241,6 +245,8 @@ vector key map ... is missing for non-empty index
 vector key map ... does not match index ... (digest mismatch)
 vector key map ... is out of sync with index ...
 failed to deserialize vector key map ...
+recovery key map ... is unproven without a valid marker ...
+recovery key map ... does not match marker ...
 ```
 
 **Recovery:**
