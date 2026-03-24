@@ -106,9 +106,10 @@ The substrate is shipping now. The rest of the stack is active infrastructure ar
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS -- primary consumer of KinDB |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate (this repo) |
-| **kin-code** | Active, hardening | Editor shell |
-| **kin-pilot** | Active, hardening | Agent shell |
-| **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
+| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | Virtual filesystem -- serves files from blob store |
+| **kin-code** | Hardening | Editor shell (VS Code fork) |
+| **kin-pilot** | Hardening | Agent shell (Codex fork) |
+| **[KinLab](https://kinlab.ai)** | Hardening | Hosted collaboration layer |
 
 KinDB exists as a separate repo because storage, indexing, retrieval, and the shared `kin-model` surface are foundational concerns that sit below the higher-level Kin product layers.
 
