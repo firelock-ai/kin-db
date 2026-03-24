@@ -34,6 +34,10 @@ pub struct GraphOverlay {
     pub entity_removes: Vec<EntityId>,
     pub relation_adds: HashMap<RelationId, Relation>,
     pub relation_removes: Vec<RelationId>,
+    /// Entity bodies for modified/added entities.
+    /// Used by VFS to project overlay changes without re-reading files.
+    #[serde(default)]
+    pub entity_bodies: HashMap<EntityId, Vec<u8>>,
 }
 
 /// State of a merge operation.
@@ -55,6 +59,7 @@ mod tests {
         assert!(overlay.entity_removes.is_empty());
         assert!(overlay.relation_adds.is_empty());
         assert!(overlay.relation_removes.is_empty());
+        assert!(overlay.entity_bodies.is_empty());
     }
 
     #[test]
