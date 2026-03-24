@@ -106,7 +106,6 @@ The substrate is shipping now. The rest of the stack is active infrastructure ar
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS -- primary consumer of KinDB |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate (this repo) |
-| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Active | Bootstrap, orchestration, config, validation, benchmarks, and migration support |
 | **kin-code** | Active, hardening | Editor shell |
 | **kin-pilot** | Active, hardening | Agent shell |
 | **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
