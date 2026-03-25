@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[workspace]
+members = ["crates/kin-db"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
