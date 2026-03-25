@@ -17,6 +17,12 @@ pub struct Relation {
     pub origin: RelationOrigin,
     /// None while in overlay; set on kin commit.
     pub created_in: Option<SemanticChangeId>,
+    /// For Calls/References edges, the module/package the target was imported from.
+    /// Enables qualified cross-repo resolution in the spine.
+    /// e.g., "requests" for `from requests import get`,
+    ///        "kin_db" for `use kin_db::InMemoryGraph`
+    #[serde(default)]
+    pub import_source: Option<String>,
 }
 
 /// Classification of a relation edge.
