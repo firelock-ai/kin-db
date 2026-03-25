@@ -10,3 +10,4 @@ Cargo.lock
 *.pem
 *.key
 *.p12
+.kin/
