@@ -229,6 +229,10 @@ pub enum LanguageId {
     Cpp,
     CSharp,
     Ruby,
+    Php,
+    Swift,
+    Kotlin,
+    Hcl,
 }
 
 impl fmt::Display for LanguageId {
@@ -244,6 +248,10 @@ impl fmt::Display for LanguageId {
             LanguageId::Cpp => write!(f, "cpp"),
             LanguageId::CSharp => write!(f, "csharp"),
             LanguageId::Ruby => write!(f, "ruby"),
+            LanguageId::Php => write!(f, "php"),
+            LanguageId::Swift => write!(f, "swift"),
+            LanguageId::Kotlin => write!(f, "kotlin"),
+            LanguageId::Hcl => write!(f, "hcl"),
         }
     }
 }
@@ -372,6 +380,8 @@ mod tests {
         assert_eq!(LanguageId::Cpp.to_string(), "cpp");
         assert_eq!(LanguageId::CSharp.to_string(), "csharp");
         assert_eq!(LanguageId::Ruby.to_string(), "ruby");
+        assert_eq!(LanguageId::Php.to_string(), "php");
+        assert_eq!(LanguageId::Swift.to_string(), "swift");
     }
 
     #[test]
