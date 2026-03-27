@@ -38,7 +38,7 @@ rmp-serde = "1"
 sha2 = "0.10"
 memmap2 = "0.9"
 fs2 = "0.4"
-object_store = { version = "0.11", optional = true }
+object_store = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 bytes = { version = "1", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
