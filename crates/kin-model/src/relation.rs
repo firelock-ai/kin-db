@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::*;
 
 /// A typed edge in the semantic graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Relation {
     pub id: RelationId,
     pub kind: RelationKind,
@@ -26,7 +27,7 @@ pub struct Relation {
 }
 
 /// Classification of a relation edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum RelationKind {
     Calls,
     Imports,
@@ -44,7 +45,7 @@ pub enum RelationKind {
 }
 
 /// How a relation was established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum RelationOrigin {
     Parsed,
     Inferred,

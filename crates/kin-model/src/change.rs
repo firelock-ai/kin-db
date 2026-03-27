@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::entity::Entity;
@@ -9,7 +10,7 @@ use crate::review::RiskSummary;
 use crate::timestamp::Timestamp;
 
 /// Kin's native commit — the unit of semantic history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticChange {
     /// Content-addressed hash.
     pub id: SemanticChangeId,
@@ -32,7 +33,7 @@ pub struct SemanticChange {
 }
 
 /// Delta for a single entity within a SemanticChange.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::large_enum_variant)]
 pub enum EntityDelta {
     Added(Entity),
@@ -41,14 +42,14 @@ pub enum EntityDelta {
 }
 
 /// Delta for a single relation within a SemanticChange.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum RelationDelta {
     Added(crate::relation::Relation),
     Removed(RelationId),
 }
 
 /// Delta for a non-entity file within a SemanticChange.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactDelta {
     pub file_id: FilePathId,
     pub kind: ArtifactDeltaKind,
@@ -57,7 +58,7 @@ pub struct ArtifactDelta {
 }
 
 /// Classification of an artifact delta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ArtifactDeltaKind {
     Added,
     Modified,

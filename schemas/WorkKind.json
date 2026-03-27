@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkKind",
+  "description": "The kind of work this item represents.",
+  "type": "string",
+  "enum": [
+    "Feature",
+    "Task",
+    "Issue",
+    "Debt",
+    "Todo",
+    "Investigation"
+  ]
+}

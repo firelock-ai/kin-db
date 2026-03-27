@@ -1,0 +1,225 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Annotation",
+  "description": "A living annotation attached to one or more semantic scopes.\n\nAnnotations survive renames and moves because they are anchored to entity/contract/artifact identities, not line numbers. When the anchored entity's fingerprint drifts, staleness is detected.",
+  "type": "object",
+  "required": [
+    "annotation_id",
+    "authored_by",
+    "body",
+    "created_at",
+    "kind",
+    "scopes",
+    "staleness"
+  ],
+  "properties": {
+    "anchored_fingerprint": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticAnchor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "annotation_id": {
+      "$ref": "#/definitions/AnnotationId"
+    },
+    "authored_by": {
+      "$ref": "#/definitions/IdentityRef"
+    },
+    "body": {
+      "type": "string"
+    },
+    "created_at": {
+      "$ref": "#/definitions/Timestamp"
+    },
+    "kind": {
+      "$ref": "#/definitions/AnnotationKind"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkScope"
+      }
+    },
+    "staleness": {
+      "$ref": "#/definitions/StalenessState"
+    }
+  },
+  "definitions": {
+    "AnnotationId": {
+      "description": "Unique identifier for an Annotation.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "AnnotationKind": {
+      "description": "The kind of annotation attached to a semantic scope.",
+      "type": "string",
+      "enum": [
+        "Comment",
+        "Warning",
+        "Instruction",
+        "Reasoning"
+      ]
+    },
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "IdentityKind": {
+      "description": "Whether an identity is a human or an assistant.",
+      "type": "string",
+      "enum": [
+        "Human",
+        "Assistant"
+      ]
+    },
+    "IdentityRef": {
+      "description": "A lightweight identity reference for authorship.\n\nPhase 8 uses this as a placeholder. Phase 10 hardens it into the full `Actor` / `Delegation` / `Approval` model.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/IdentityKind"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "SemanticAnchor": {
+      "description": "A fingerprint used to detect when an annotation's anchor has drifted.\n\nStored at annotation creation time and compared against the current entity fingerprint to determine staleness.",
+      "type": "object",
+      "required": [
+        "ast_hash",
+        "signature_hash"
+      ],
+      "properties": {
+        "ast_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "signature_hash": {
+          "$ref": "#/definitions/Hash256"
+        }
+      }
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "StalenessState": {
+      "description": "How fresh an annotation's anchor is relative to current code state.",
+      "oneOf": [
+        {
+          "description": "The anchored fingerprint matches the current entity state.",
+          "type": "string",
+          "enum": [
+            "Fresh"
+          ]
+        },
+        {
+          "description": "The entity has changed but not structurally — annotation may still apply.",
+          "type": "string",
+          "enum": [
+            "Suspect"
+          ]
+        },
+        {
+          "description": "The entity's signature or behavior has changed materially.",
+          "type": "string",
+          "enum": [
+            "Stale"
+          ]
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "WorkScope": {
+      "description": "A semantic scope that a work item or annotation is anchored to.\n\nUnlike line numbers, these survive renames, moves, and formatting changes because they reference semantic identities in the graph.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/FilePathId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Change"
+          ],
+          "properties": {
+            "Change": {
+              "$ref": "#/definitions/SemanticChangeId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

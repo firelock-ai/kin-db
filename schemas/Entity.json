@@ -1,0 +1,289 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Entity",
+  "description": "The atomic semantic unit in Kin's graph.",
+  "type": "object",
+  "required": [
+    "fingerprint",
+    "id",
+    "kind",
+    "language",
+    "metadata",
+    "name",
+    "signature",
+    "visibility"
+  ],
+  "properties": {
+    "created_in": {
+      "description": "None while in overlay; set on kin commit.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "doc_summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "file_origin": {
+      "description": "None for graph-created entities before placement.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FilePathId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fingerprint": {
+      "$ref": "#/definitions/SemanticFingerprint"
+    },
+    "id": {
+      "$ref": "#/definitions/EntityId"
+    },
+    "kind": {
+      "$ref": "#/definitions/EntityKind"
+    },
+    "language": {
+      "$ref": "#/definitions/LanguageId"
+    },
+    "lineage_parent": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EntityId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "metadata": {
+      "$ref": "#/definitions/EntityMetadata"
+    },
+    "name": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    },
+    "span": {
+      "description": "None until projection assigns a file location.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SourceSpan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "superseded_by": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EntityId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "visibility": {
+      "$ref": "#/definitions/Visibility"
+    }
+  },
+  "definitions": {
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityKind": {
+      "description": "Classification of a semantic entity.",
+      "type": "string",
+      "enum": [
+        "function",
+        "class",
+        "interface",
+        "trait_def",
+        "type_alias",
+        "module",
+        "package",
+        "test",
+        "schema",
+        "api_endpoint",
+        "event_contract",
+        "file",
+        "document_node",
+        "method",
+        "enum_def",
+        "enum_variant",
+        "constant",
+        "static_var"
+      ]
+    },
+    "EntityMetadata": {
+      "description": "Extensible metadata bag for entities.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "FingerprintAlgorithm": {
+      "type": "string",
+      "enum": [
+        "V1TreeSitter"
+      ]
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "LanguageId": {
+      "description": "Supported programming languages (Tier 1).",
+      "type": "string",
+      "enum": [
+        "TypeScript",
+        "JavaScript",
+        "Python",
+        "Go",
+        "Java",
+        "Rust",
+        "C",
+        "Cpp",
+        "CSharp",
+        "Ruby",
+        "Php",
+        "Swift",
+        "Kotlin",
+        "Hcl"
+      ]
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "SemanticFingerprint": {
+      "description": "Kin's identity moat. Survives renames, moves, formatting.",
+      "type": "object",
+      "required": [
+        "algorithm",
+        "ast_hash",
+        "behavior_hash",
+        "signature_hash",
+        "stability_score"
+      ],
+      "properties": {
+        "algorithm": {
+          "$ref": "#/definitions/FingerprintAlgorithm"
+        },
+        "ast_hash": {
+          "description": "Normalized AST shape hash.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "behavior_hash": {
+          "description": "Control flow + side effects hash.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "signature_hash": {
+          "description": "Parameter/return contract hash.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "stability_score": {
+          "description": "Confidence in fingerprint stability (0.0 - 1.0).",
+          "type": "number",
+          "format": "float"
+        }
+      }
+    },
+    "SourceSpan": {
+      "description": "Source location of an entity within a file.",
+      "type": "object",
+      "required": [
+        "end_byte",
+        "end_col",
+        "end_line",
+        "file",
+        "start_byte",
+        "start_col",
+        "start_line"
+      ],
+      "properties": {
+        "end_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "end_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "end_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "file": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "start_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "start_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Visibility": {
+      "description": "Visibility of a semantic entity.",
+      "type": "string",
+      "enum": [
+        "Public",
+        "Private",
+        "Internal",
+        "Crate"
+      ]
+    }
+  }
+}

@@ -111,7 +111,7 @@ Code changes arrive in batches (`kin commit`). Between commits, the graph is 100
 This is the classic OLAP pattern and allows aggressive read optimization:
 
 - Write path: bulk insert with sort-merge, rebuild indexes
-- Read path: lock-free, zero-allocation, cache-friendly
+- Read path: concurrent via sharded RwLock read guards, cache-friendly
 
 ### 3. Incremental Updates
 
@@ -138,18 +138,19 @@ package. KinDB exploits this:
 
 ### 6. Concurrent Reads During Writes
 
-Inspired by Linux kernel's Read-Copy-Update (RCU) pattern:
+Two-layer concurrency model:
 
-- Readers access an immutable snapshot (zero locking)
-- Writer creates a new snapshot in the background
-- Atomic pointer swap makes the new snapshot visible to future readers
-- Old snapshot is freed when the last reader releases it
+**In-process (InMemoryGraph):** Uses 6 sharded `parking_lot::RwLock` instances. Multiple threads can hold read guards simultaneously for zero-contention queries. Write access requires an exclusive lock on the relevant shard.
+
+**Cross-process (SnapshotManager):** Uses `fs2::flock` for exclusive file-level locking on snapshot access. This serializes cross-process operations (e.g., daemon and CLI both accessing the same `.kin/kindb/` directory) but does not block in-process readers.
+
+The original design aspiration was RCU-style atomic pointer swaps. The current implementation achieves concurrent in-process reads via sharded RwLocks but uses exclusive file locks for cross-process safety — not lock-free RCU.
 
 ### Boundary Reminder
 
 KinDB is the storage and retrieval substrate, not the layer that decides what a repository
 "is." Repo-root detection, brownfield code-root inference, manifest interpretation, and UI
-level truncation rules belong in Kin, KinLab, and kin-stack. KinDB's job is to preserve the
+level truncation rules belong in Kin and KinLab. KinDB's job is to preserve the
 raw semantic facts underneath those surfaces - including full per-entity language
 distribution - so higher layers can stay truthful when they summarize mixed-language repos.
 
@@ -164,8 +165,8 @@ distribution - so higher layers can stay truthful when they summarize mixed-lang
 │  Engine     │  Index       │  Search      │  Algorithms     │
 │             │  (HNSW)      │  (Tantivy)   │  (BFS/DFS)      │
 ├─────────────┴──────────────┴──────────────┴─────────────────┤
-│                   Snapshot Manager (RCU)                     │
-│         (concurrent readers + single background writer)     │
+│                   Snapshot Manager                            │
+│  (exclusive flock for cross-process, sharded RwLock in-process) │
 ├─────────────────────────────────────────────────────────────┤
 │                   Storage Layer (mmap)                       │
 │   (MessagePack snapshots with mmap-backed loads today;      │
@@ -225,12 +226,11 @@ Memory-mapped snapshot files with mmap-backed loads:
 
 ### Concurrency
 
-Read-Copy-Update (RCU) inspired by `cloudflare/mmap-sync`:
+Two-layer model:
 
-- Current snapshot behind `Arc<InMemoryGraph>`
-- Readers clone the Arc (cheap) and work with immutable data
-- Writer builds new graph, swaps the Arc atomically
-- Zero reader-side locking
+- **In-process:** `InMemoryGraph` behind `Arc<RwLock<...>>` (parking_lot) with 6 sharded locks. Concurrent read guards allow zero-contention queries within a single process. Write access takes an exclusive lock on the relevant shard.
+- **Cross-process:** `SnapshotManager::open()` takes an exclusive `fs2::flock` on the snapshot directory. This serializes access across separate processes (daemon, CLI, MCP server) but does not affect in-process reader concurrency.
+- Snapshot persistence uses atomic write (`.tmp` + fsync + rename) so a crash during save does not corrupt the live snapshot.
 
 ## Performance Targets
 
@@ -287,7 +287,7 @@ crates/
         └── storage/
             ├── mod.rs      # Persistence module
             ├── format.rs   # Current MessagePack snapshot envelope format
-            ├── snapshot.rs # RCU snapshot management
+            ├── snapshot.rs # Snapshot management (flock + atomic save)
             └── mmap.rs     # Memory-mapped file wrapper
 ```
 

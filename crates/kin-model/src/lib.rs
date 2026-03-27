@@ -49,8 +49,8 @@ pub use federation::{
     RemoteRelationOrigin, ScopeRef, SessionLease,
 };
 pub use graph::{
-    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, SubGraph,
-    VerificationStore, WorkStore,
+    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
+    SubGraph, VerificationStore, WorkStore,
 };
 pub use ids::{
     AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId, FilePathId,
@@ -65,7 +65,11 @@ pub use preset::{
     ProjectionMode, ReconcilePolicy, ReconcilePolicyProvider, ValidationLevel, WorldPreset,
 };
 pub use projection::{Projection, ProjectionKind};
-pub use review::{RiskLevel, RiskSummary};
+pub use review::{
+    Review, ReviewAssignment, ReviewComment, ReviewCompletionState, ReviewDecision,
+    ReviewDecisionState, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewFilter,
+    ReviewId, ReviewNote, ReviewNoteId, RiskLevel, RiskSummary,
+};
 pub use spec::Spec;
 pub use timestamp::Timestamp;
 

@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Relation",
+  "description": "A typed edge in the semantic graph.",
+  "type": "object",
+  "required": [
+    "confidence",
+    "dst",
+    "id",
+    "kind",
+    "origin",
+    "src"
+  ],
+  "properties": {
+    "confidence": {
+      "description": "Confidence score (0.0 - 1.0).",
+      "type": "number",
+      "format": "float"
+    },
+    "created_in": {
+      "description": "None while in overlay; set on kin commit.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "dst": {
+      "$ref": "#/definitions/EntityId"
+    },
+    "id": {
+      "$ref": "#/definitions/RelationId"
+    },
+    "import_source": {
+      "description": "For Calls/References edges, the module/package the target was imported from. Enables qualified cross-repo resolution in the spine. e.g., \"requests\" for `from requests import get`, \"kin_db\" for `use kin_db::InMemoryGraph`",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "$ref": "#/definitions/RelationKind"
+    },
+    "origin": {
+      "$ref": "#/definitions/RelationOrigin"
+    },
+    "src": {
+      "$ref": "#/definitions/EntityId"
+    }
+  },
+  "definitions": {
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "RelationId": {
+      "description": "Unique identifier for a Relation.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "RelationKind": {
+      "description": "Classification of a relation edge.",
+      "type": "string",
+      "enum": [
+        "Calls",
+        "Imports",
+        "Contains",
+        "References",
+        "Implements",
+        "Extends",
+        "Tests",
+        "DependsOn",
+        "DefinesContract",
+        "ConsumesContract",
+        "EmitsEvent",
+        "OwnedBy",
+        "DocumentedBy"
+      ]
+    },
+    "RelationOrigin": {
+      "description": "How a relation was established.",
+      "type": "string",
+      "enum": [
+        "Parsed",
+        "Inferred",
+        "Manual"
+      ]
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    }
+  }
+}
