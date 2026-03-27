@@ -753,3 +753,120 @@ impl<G: GraphStore> GraphStore for &G {
         (**self).list_shallow_files()
     }
 }
+
+// ===========================================================================
+// Domain sub-traits — narrower interfaces for consumers that only need a
+// subset of GraphStore. These are defined for Phase 2, where consumer
+// functions will be narrowed from `G: GraphStore` to e.g. `G: EntityStore`.
+//
+// For now, these traits are NOT automatically implemented for GraphStore
+// implementors to avoid method ambiguity. Phase 2 will migrate InMemoryGraph
+// to implement sub-traits directly, with GraphStore becoming a supertrait.
+// ===========================================================================
+
+/// Core entity and relation CRUD plus graph traversal operations.
+pub trait EntityStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error>;
+    fn get_relations(&self, id: &EntityId, kinds: &[RelationKind]) -> std::result::Result<Vec<Relation>, Self::Error>;
+    fn get_all_relations_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<Relation>, Self::Error>;
+    fn get_downstream_impact(&self, id: &EntityId, max_depth: u32) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn get_dependency_neighborhood(&self, id: &EntityId, depth: u32) -> std::result::Result<SubGraph, Self::Error>;
+    fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn has_incoming_relation_kinds(&self, id: &EntityId, kinds: &[RelationKind], exclude_same_file: bool) -> std::result::Result<bool, Self::Error>;
+    fn query_entities(&self, filter: &EntityFilter) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
+    fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
+    fn remove_entity(&self, id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn remove_relation(&self, id: &RelationId) -> std::result::Result<(), Self::Error>;
+}
+
+/// Semantic change DAG and branch operations.
+pub trait ChangeStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn get_entity_history(&self, id: &EntityId) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn find_merge_bases(&self, a: &SemanticChangeId, b: &SemanticChangeId) -> std::result::Result<Vec<SemanticChangeId>, Self::Error>;
+    fn create_change(&self, change: &SemanticChange) -> std::result::Result<(), Self::Error>;
+    fn get_change(&self, id: &SemanticChangeId) -> std::result::Result<Option<SemanticChange>, Self::Error>;
+    fn get_changes_since(&self, base: &SemanticChangeId, head: &SemanticChangeId) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
+    fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
+    fn update_branch_head(&self, name: &BranchName, new_head: &SemanticChangeId) -> std::result::Result<(), Self::Error>;
+    fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error>;
+    fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error>;
+}
+
+/// Work items, annotations, and work graph relationships.
+pub trait WorkStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn create_work_item(&self, item: &WorkItem) -> std::result::Result<(), Self::Error>;
+    fn get_work_item(&self, id: &WorkId) -> std::result::Result<Option<WorkItem>, Self::Error>;
+    fn list_work_items(&self, filter: &WorkFilter) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn update_work_status(&self, id: &WorkId, status: WorkStatus) -> std::result::Result<(), Self::Error>;
+    fn delete_work_item(&self, id: &WorkId) -> std::result::Result<(), Self::Error>;
+    fn create_annotation(&self, ann: &Annotation) -> std::result::Result<(), Self::Error>;
+    fn get_annotation(&self, id: &AnnotationId) -> std::result::Result<Option<Annotation>, Self::Error>;
+    fn list_annotations(&self, filter: &AnnotationFilter) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn update_annotation_staleness(&self, id: &AnnotationId, staleness: crate::work::StalenessState) -> std::result::Result<(), Self::Error>;
+    fn delete_annotation(&self, id: &AnnotationId) -> std::result::Result<(), Self::Error>;
+    fn create_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
+    fn delete_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
+    fn get_work_for_scope(&self, scope: &WorkScope) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_annotations_for_scope(&self, scope: &WorkScope) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn get_child_work_items(&self, parent: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_parent_work_items(&self, child: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_blockers(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_blocked_work_items(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_implementors(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkScope>, Self::Error>;
+    fn get_annotations_for_work_item(&self, work_id: &WorkId) -> std::result::Result<Vec<Annotation>, Self::Error>;
+}
+
+/// Test verification, coverage, contracts, and mock hints.
+pub trait VerificationStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn create_test_case(&self, test: &crate::verification::TestCase) -> std::result::Result<(), Self::Error>;
+    fn get_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn delete_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<(), Self::Error>;
+    fn create_assertion(&self, assertion: &crate::verification::Assertion) -> std::result::Result<(), Self::Error>;
+    fn get_assertion(&self, id: &crate::verification::AssertionId) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
+    fn get_coverage_summary(&self) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
+    fn create_verification_run(&self, run: &VerificationRun) -> std::result::Result<(), Self::Error>;
+    fn get_verification_run(&self, id: &VerificationRunId) -> std::result::Result<Option<VerificationRun>, Self::Error>;
+    fn list_runs_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn create_test_covers_entity(&self, test_id: &crate::verification::TestId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn create_test_covers_contract(&self, test_id: &crate::verification::TestId, contract_id: &ContractId) -> std::result::Result<(), Self::Error>;
+    fn create_test_verifies_work(&self, test_id: &crate::verification::TestId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
+    fn get_tests_covering_contract(&self, contract_id: &ContractId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_verifying_work(&self, work_id: &WorkId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn create_mock_hint(&self, hint: &MockHint) -> std::result::Result<(), Self::Error>;
+    fn get_mock_hints_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<MockHint>, Self::Error>;
+    fn link_run_proves_entity(&self, run_id: &VerificationRunId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn link_run_proves_work(&self, run_id: &VerificationRunId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
+    fn list_runs_proving_entity(&self, entity_id: &EntityId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn list_runs_proving_work(&self, work_id: &WorkId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn create_contract(&self, contract: &crate::contract::Contract) -> std::result::Result<(), Self::Error>;
+    fn get_contract(&self, id: &ContractId) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
+    fn list_contracts(&self) -> std::result::Result<Vec<crate::contract::Contract>, Self::Error>;
+    fn get_contract_coverage_summary(&self) -> std::result::Result<ContractCoverageSummary, Self::Error>;
+}
+
+/// Actor provenance, delegations, approvals, and audit trail.
+pub trait ProvenanceStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn create_actor(&self, actor: &crate::provenance::Actor) -> std::result::Result<(), Self::Error>;
+    fn get_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
+    fn list_actors(&self) -> std::result::Result<Vec<crate::provenance::Actor>, Self::Error>;
+    fn create_delegation(&self, delegation: &crate::provenance::Delegation) -> std::result::Result<(), Self::Error>;
+    fn get_delegations_for_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
+    fn create_approval(&self, approval: &crate::provenance::Approval) -> std::result::Result<(), Self::Error>;
+    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
+    fn record_audit_event(&self, event: &crate::provenance::AuditEvent) -> std::result::Result<(), Self::Error>;
+    fn query_audit_events(&self, actor_id: Option<&crate::provenance::ActorId>, limit: usize) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
+}

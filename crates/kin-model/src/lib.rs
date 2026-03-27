@@ -48,7 +48,10 @@ pub use federation::{
     ActorRef, GraphCapabilitySet, GraphLocator, GraphManifest, RemoteRelation, RemoteRelationKind,
     RemoteRelationOrigin, ScopeRef, SessionLease,
 };
-pub use graph::{EntityFilter, GraphStore, SubGraph};
+pub use graph::{
+    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, SubGraph,
+    VerificationStore, WorkStore,
+};
 pub use ids::{
     AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId, FilePathId,
     Hash256, IntentId, LanguageId, RelationId, SemanticChangeId, SessionId, SpecId,
