@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RiskSummary",
+  "description": "Summary of risk associated with a semantic change.",
+  "type": "object",
+  "required": [
+    "breaking_changes",
+    "contract_violations",
+    "notes",
+    "overall_risk",
+    "test_coverage_gaps",
+    "work_risks"
+  ],
+  "properties": {
+    "breaking_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "contract_violations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "overall_risk": {
+      "$ref": "#/definitions/RiskLevel"
+    },
+    "test_coverage_gaps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "work_risks": {
+      "description": "Risks related to in-progress work items affected by changes.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "RiskLevel": {
+      "description": "Risk classification.",
+      "type": "string",
+      "enum": [
+        "Low",
+        "Medium",
+        "High",
+        "Critical"
+      ]
+    }
+  }
+}

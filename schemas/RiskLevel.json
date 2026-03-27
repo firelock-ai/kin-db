@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RiskLevel",
+  "description": "Risk classification.",
+  "type": "string",
+  "enum": [
+    "Low",
+    "Medium",
+    "High",
+    "Critical"
+  ]
+}

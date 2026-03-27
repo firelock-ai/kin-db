@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EntityKind",
+  "description": "Classification of a semantic entity.",
+  "type": "string",
+  "enum": [
+    "function",
+    "class",
+    "interface",
+    "trait_def",
+    "type_alias",
+    "module",
+    "package",
+    "test",
+    "schema",
+    "api_endpoint",
+    "event_contract",
+    "file",
+    "document_node",
+    "method",
+    "enum_def",
+    "enum_variant",
+    "constant",
+    "static_var"
+  ]
+}

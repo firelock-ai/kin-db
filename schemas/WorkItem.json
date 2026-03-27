@@ -1,0 +1,243 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkItem",
+  "description": "The canonical work item: a feature, task, issue, debt item, or TODO anchored to semantic scopes in the code graph.",
+  "type": "object",
+  "required": [
+    "acceptance_criteria",
+    "created_at",
+    "created_by",
+    "description",
+    "external_refs",
+    "kind",
+    "priority",
+    "scopes",
+    "status",
+    "title",
+    "work_id"
+  ],
+  "properties": {
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "created_at": {
+      "$ref": "#/definitions/Timestamp"
+    },
+    "created_by": {
+      "$ref": "#/definitions/IdentityRef"
+    },
+    "description": {
+      "type": "string"
+    },
+    "external_refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ExternalRef"
+      }
+    },
+    "kind": {
+      "$ref": "#/definitions/WorkKind"
+    },
+    "priority": {
+      "$ref": "#/definitions/Priority"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkScope"
+      }
+    },
+    "status": {
+      "$ref": "#/definitions/WorkStatus"
+    },
+    "title": {
+      "type": "string"
+    },
+    "work_id": {
+      "$ref": "#/definitions/WorkId"
+    }
+  },
+  "definitions": {
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "ExternalRef": {
+      "description": "A reference to an external system (Jira, GitHub Issues, etc.).",
+      "type": "object",
+      "required": [
+        "identifier",
+        "system"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string"
+        },
+        "system": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "IdentityKind": {
+      "description": "Whether an identity is a human or an assistant.",
+      "type": "string",
+      "enum": [
+        "Human",
+        "Assistant"
+      ]
+    },
+    "IdentityRef": {
+      "description": "A lightweight identity reference for authorship.\n\nPhase 8 uses this as a placeholder. Phase 10 hardens it into the full `Actor` / `Delegation` / `Approval` model.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/IdentityKind"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "Priority": {
+      "description": "Priority level for work items.",
+      "type": "string",
+      "enum": [
+        "Critical",
+        "High",
+        "Medium",
+        "Low",
+        "None"
+      ]
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "WorkId": {
+      "description": "Unique identifier for a WorkItem.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkKind": {
+      "description": "The kind of work this item represents.",
+      "type": "string",
+      "enum": [
+        "Feature",
+        "Task",
+        "Issue",
+        "Debt",
+        "Todo",
+        "Investigation"
+      ]
+    },
+    "WorkScope": {
+      "description": "A semantic scope that a work item or annotation is anchored to.\n\nUnlike line numbers, these survive renames, moves, and formatting changes because they reference semantic identities in the graph.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/FilePathId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Change"
+          ],
+          "properties": {
+            "Change": {
+              "$ref": "#/definitions/SemanticChangeId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkStatus": {
+      "description": "Lifecycle status of a work item.",
+      "type": "string",
+      "enum": [
+        "Proposed",
+        "Planned",
+        "InProgress",
+        "Blocked",
+        "Done",
+        "Verified",
+        "Archived"
+      ]
+    }
+  }
+}

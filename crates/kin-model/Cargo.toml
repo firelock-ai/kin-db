@@ -16,6 +16,7 @@ hex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

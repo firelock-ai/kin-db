@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::ids::*;
 
 /// The atomic semantic unit in Kin's graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Entity {
     pub id: EntityId,
     pub kind: EntityKind,
@@ -29,7 +30,7 @@ pub struct Entity {
 }
 
 /// Classification of a semantic entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Function,
@@ -53,7 +54,7 @@ pub enum EntityKind {
 }
 
 /// Kin's identity moat. Survives renames, moves, formatting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticFingerprint {
     pub algorithm: FingerprintAlgorithm,
     /// Normalized AST shape hash.
@@ -66,13 +67,13 @@ pub struct SemanticFingerprint {
     pub stability_score: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum FingerprintAlgorithm {
     V1TreeSitter,
 }
 
 /// Visibility of a semantic entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum Visibility {
     Public,
     Private,
@@ -81,14 +82,14 @@ pub enum Visibility {
 }
 
 /// Extensible metadata bag for entities.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EntityMetadata {
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Source location of an entity within a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceSpan {
     pub file: FilePathId,
     pub start_byte: usize,

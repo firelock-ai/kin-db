@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
 /// Content-addressed 256-bit hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Serializes as a 32-element byte array.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
@@ -38,7 +40,7 @@ impl fmt::Debug for Hash256 {
 }
 
 /// Unique identifier for an Entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct EntityId(pub Uuid);
 
 impl EntityId {
@@ -60,7 +62,7 @@ impl fmt::Display for EntityId {
 }
 
 /// Unique identifier for a Relation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct RelationId(pub Uuid);
 
 impl RelationId {
@@ -87,7 +89,7 @@ impl fmt::Display for RelationId {
 }
 
 /// Content-addressed identifier for a SemanticChange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticChangeId(pub Hash256);
 
 impl SemanticChangeId {
@@ -103,7 +105,7 @@ impl fmt::Display for SemanticChangeId {
 }
 
 /// File path identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct FilePathId(pub String);
 
 impl FilePathId {
@@ -119,7 +121,7 @@ impl fmt::Display for FilePathId {
 }
 
 /// Unique identifier for a Spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct SpecId(pub Uuid);
 
 impl SpecId {
@@ -141,7 +143,7 @@ impl fmt::Display for SpecId {
 }
 
 /// Unique identifier for an Evidence record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceId(pub Uuid);
 
 impl EvidenceId {
@@ -163,7 +165,7 @@ impl fmt::Display for EvidenceId {
 }
 
 /// Unique identifier for a Branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct BranchId(pub Uuid);
 
 impl BranchId {
@@ -185,7 +187,7 @@ impl fmt::Display for BranchId {
 }
 
 /// Branch name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct BranchName(pub String);
 
 impl BranchName {
@@ -201,7 +203,7 @@ impl fmt::Display for BranchName {
 }
 
 /// Author identifier (human or assistant).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AuthorId(pub String);
 
 impl AuthorId {
@@ -217,7 +219,7 @@ impl fmt::Display for AuthorId {
 }
 
 /// Supported programming languages (Tier 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum LanguageId {
     TypeScript,
     JavaScript,
@@ -257,7 +259,7 @@ impl fmt::Display for LanguageId {
 }
 
 /// Unique identifier for a Contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ContractId(pub Uuid);
 
 impl ContractId {
@@ -279,7 +281,7 @@ impl fmt::Display for ContractId {
 }
 
 /// Unique identifier for an AgentSession.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -301,7 +303,7 @@ impl fmt::Display for SessionId {
 }
 
 /// Unique identifier for an Intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct IntentId(pub Uuid);
 
 impl IntentId {
@@ -323,7 +325,7 @@ impl fmt::Display for IntentId {
 }
 
 /// Unique identifier for a Conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ConflictId(pub Uuid);
 
 impl ConflictId {

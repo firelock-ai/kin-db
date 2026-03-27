@@ -10,6 +10,7 @@
 
 use crate::ids::*;
 use crate::timestamp::Timestamp;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for a WorkItem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct WorkId(pub uuid::Uuid);
 
 impl WorkId {
@@ -39,7 +40,7 @@ impl std::fmt::Display for WorkId {
 }
 
 /// Unique identifier for an Annotation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AnnotationId(pub uuid::Uuid);
 
 impl AnnotationId {
@@ -65,7 +66,7 @@ impl std::fmt::Display for AnnotationId {
 // ---------------------------------------------------------------------------
 
 /// The kind of work this item represents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WorkKind {
     Feature,
     Task,
@@ -105,7 +106,7 @@ impl std::str::FromStr for WorkKind {
 }
 
 /// Lifecycle status of a work item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WorkStatus {
     Proposed,
     Planned,
@@ -148,7 +149,7 @@ impl std::str::FromStr for WorkStatus {
 }
 
 /// Priority level for work items.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum Priority {
     Critical,
     High,
@@ -189,7 +190,7 @@ impl std::str::FromStr for Priority {
 ///
 /// Unlike line numbers, these survive renames, moves, and formatting changes
 /// because they reference semantic identities in the graph.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WorkScope {
     Entity(EntityId),
     Contract(ContractId),
@@ -209,7 +210,7 @@ impl std::fmt::Display for WorkScope {
 }
 
 /// A reference to an external system (Jira, GitHub Issues, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ExternalRef {
     pub system: String,
     pub identifier: String,
@@ -220,7 +221,7 @@ pub struct ExternalRef {
 ///
 /// Phase 8 uses this as a placeholder. Phase 10 hardens it into
 /// the full `Actor` / `Delegation` / `Approval` model.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct IdentityRef {
     pub name: String,
     pub kind: IdentityKind,
@@ -243,7 +244,7 @@ impl IdentityRef {
 }
 
 /// Whether an identity is a human or an assistant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum IdentityKind {
     Human,
     Assistant,
@@ -253,7 +254,7 @@ pub enum IdentityKind {
 ///
 /// Stored at annotation creation time and compared against the current
 /// entity fingerprint to determine staleness.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticAnchor {
     pub ast_hash: Hash256,
     pub signature_hash: Hash256,
@@ -261,7 +262,7 @@ pub struct SemanticAnchor {
 
 /// The canonical work item: a feature, task, issue, debt item, or TODO
 /// anchored to semantic scopes in the code graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkItem {
     pub work_id: WorkId,
     pub kind: WorkKind,
@@ -291,7 +292,7 @@ impl WorkItem {
 // ---------------------------------------------------------------------------
 
 /// The kind of annotation attached to a semantic scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum AnnotationKind {
     Comment,
     Warning,
@@ -325,7 +326,7 @@ impl std::str::FromStr for AnnotationKind {
 }
 
 /// How fresh an annotation's anchor is relative to current code state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum StalenessState {
     /// The anchored fingerprint matches the current entity state.
     #[default]
@@ -351,7 +352,7 @@ impl std::fmt::Display for StalenessState {
 /// Annotations survive renames and moves because they are anchored to
 /// entity/contract/artifact identities, not line numbers. When the
 /// anchored entity's fingerprint drifts, staleness is detected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Annotation {
     pub annotation_id: AnnotationId,
     pub kind: AnnotationKind,
@@ -376,7 +377,7 @@ pub struct Annotation {
 /// - `(Entity | Contract | Artifact)-[:IMPLEMENTS]->(WorkItem)`
 /// - `(Annotation)-[:ATTACHED_TO]->(Entity | Contract | Artifact | WorkItem)`
 /// - `(Annotation)-[:SUPERSEDES]->(Annotation)`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum WorkLink {
     /// Work item affects a semantic scope.
     Affects { work_id: WorkId, scope: WorkScope },
@@ -399,7 +400,7 @@ pub enum WorkLink {
 }
 
 /// What an annotation is attached to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AnnotationTarget {
     Scope(WorkScope),
     Work(WorkId),
@@ -419,7 +420,7 @@ impl std::fmt::Display for AnnotationTarget {
 // ---------------------------------------------------------------------------
 
 /// Filter for querying work items.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WorkFilter {
     pub kinds: Option<Vec<WorkKind>>,
     pub statuses: Option<Vec<WorkStatus>>,
