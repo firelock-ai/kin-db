@@ -35,7 +35,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-alpha') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
       # Uncomment to publish to crates.io:
       # - uses: dtolnay/rust-toolchain@stable
       # - run: cargo publish --package kin-db
