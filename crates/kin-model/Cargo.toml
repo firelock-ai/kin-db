@@ -9,6 +9,7 @@ license.workspace = true
 description = "Canonical types for Kin semantic VCS"
 
 [dependencies]
+kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
