@@ -36,8 +36,17 @@ jobs:
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-      # Uncomment to publish to crates.io:
-      # - uses: dtolnay/rust-toolchain@stable
-      # - run: cargo publish --package kin-db
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_registry:
+    name: Publish crates to KinLab
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish kin-model and kin-db
+        run: bash ./scripts/publish-kinlab-crates.sh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
+          KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
