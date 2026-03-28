@@ -4,7 +4,7 @@
 # Cloud Build config for kin-db repo.
 #
 # On every push: run tests
-# On push to main: publish kin-model and kin-db crates to KinLab registry
+# Tagged GitHub releases publish kin-model and kin-db crates to KinLab registry
 
 steps:
   # Run tests
@@ -16,41 +16,6 @@ steps:
         apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
         cargo test --workspace
     id: 'test'
-
-  # Publish crates to KinLab registry (only on main)
-  - name: 'rust:slim'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        if [ "$BRANCH_NAME" != "main" ]; then
-          echo "Not main branch ($BRANCH_NAME), skipping publish"
-          exit 0
-        fi
-        apt-get update && apt-get install -y pkg-config libssl-dev curl && rm -rf /var/lib/apt/lists/*
-
-        # Package and publish kin-model
-        cargo package -p kin-model --allow-dirty --no-verify
-        MODEL_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; print([p['version'] for p in pkgs if p['name']=='kin-model'][0])")
-        curl -sf -X POST "${_REGISTRY_URL}/registry/cargo/api/v1/crates/publish?name=kin-model&version=$MODEL_VERSION" \
-          -H "content-type: application/octet-stream" \
-          --data-binary "@target/package/kin-model-$MODEL_VERSION.crate" \
-          && echo "Published kin-model@$MODEL_VERSION" \
-          || echo "kin-model@$MODEL_VERSION already published (or error)"
-
-        # Package and publish kin-db
-        cargo package -p kin-db --allow-dirty --no-verify
-        DB_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; print([p['version'] for p in pkgs if p['name']=='kin-db'][0])")
-        curl -sf -X POST "${_REGISTRY_URL}/registry/cargo/api/v1/crates/publish?name=kin-db&version=$DB_VERSION" \
-          -H "content-type: application/octet-stream" \
-          --data-binary "@target/package/kin-db-$DB_VERSION.crate" \
-          && echo "Published kin-db@$DB_VERSION" \
-          || echo "kin-db@$DB_VERSION already published (or error)"
-    id: 'publish'
-    waitFor: ['test']
-
-substitutions:
-  _REGISTRY_URL: 'https://kinlab.ai'
 
 options:
   machineType: 'E2_HIGHCPU_8'
