@@ -109,7 +109,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger kin CI
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           # Requires a PAT with repo scope stored as DISPATCH_TOKEN secret.
           # Create at: GitHub > Settings > Developer settings > Personal access tokens
