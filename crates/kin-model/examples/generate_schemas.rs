@@ -70,7 +70,8 @@ fn main() {
 
     for (name, schema) in &schemas {
         let path = out.join(format!("{}.json", name));
-        fs::write(&path, schema).unwrap_or_else(|e| panic!("failed to write {}: {}", path.display(), e));
+        fs::write(&path, schema)
+            .unwrap_or_else(|e| panic!("failed to write {}: {}", path.display(), e));
     }
 
     println!("Generated {} schemas to {}", schemas.len(), out.display());

@@ -7,9 +7,8 @@ use crate::entity::{Entity, EntityKind};
 use crate::ids::*;
 use crate::relation::{Relation, RelationKind};
 use crate::review::{
-    Review, ReviewAssignment, ReviewComment, ReviewDecision, ReviewDecisionState,
-    ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewFilter, ReviewId, ReviewNote,
-    ReviewNoteId,
+    Review, ReviewAssignment, ReviewComment, ReviewDecision, ReviewDecisionState, ReviewDiscussion,
+    ReviewDiscussionId, ReviewDiscussionState, ReviewFilter, ReviewId, ReviewNote, ReviewNoteId,
 };
 use crate::verification::{ContractCoverageSummary, MockHint, VerificationRun, VerificationRunId};
 use crate::work::{
@@ -29,13 +28,36 @@ pub trait EntityStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error>;
-    fn get_relations(&self, id: &EntityId, kinds: &[RelationKind]) -> std::result::Result<Vec<Relation>, Self::Error>;
-    fn get_all_relations_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<Relation>, Self::Error>;
-    fn get_downstream_impact(&self, id: &EntityId, max_depth: u32) -> std::result::Result<Vec<Entity>, Self::Error>;
-    fn get_dependency_neighborhood(&self, id: &EntityId, depth: u32) -> std::result::Result<SubGraph, Self::Error>;
+    fn get_relations(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+    ) -> std::result::Result<Vec<Relation>, Self::Error>;
+    fn get_all_relations_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<Relation>, Self::Error>;
+    fn get_downstream_impact(
+        &self,
+        id: &EntityId,
+        max_depth: u32,
+    ) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn get_dependency_neighborhood(
+        &self,
+        id: &EntityId,
+        depth: u32,
+    ) -> std::result::Result<SubGraph, Self::Error>;
     fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
-    fn has_incoming_relation_kinds(&self, id: &EntityId, kinds: &[RelationKind], exclude_same_file: bool) -> std::result::Result<bool, Self::Error>;
-    fn query_entities(&self, filter: &EntityFilter) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn has_incoming_relation_kinds(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+        exclude_same_file: bool,
+    ) -> std::result::Result<bool, Self::Error>;
+    fn query_entities(
+        &self,
+        filter: &EntityFilter,
+    ) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
     fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
@@ -56,14 +78,32 @@ pub trait EntityStore: Send + Sync {
 pub trait ChangeStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn get_entity_history(&self, id: &EntityId) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
-    fn find_merge_bases(&self, a: &SemanticChangeId, b: &SemanticChangeId) -> std::result::Result<Vec<SemanticChangeId>, Self::Error>;
+    fn get_entity_history(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn find_merge_bases(
+        &self,
+        a: &SemanticChangeId,
+        b: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error>;
     fn create_change(&self, change: &SemanticChange) -> std::result::Result<(), Self::Error>;
-    fn get_change(&self, id: &SemanticChangeId) -> std::result::Result<Option<SemanticChange>, Self::Error>;
-    fn get_changes_since(&self, base: &SemanticChangeId, head: &SemanticChangeId) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn get_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Option<SemanticChange>, Self::Error>;
+    fn get_changes_since(
+        &self,
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
     fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
     fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
-    fn update_branch_head(&self, name: &BranchName, new_head: &SemanticChangeId) -> std::result::Result<(), Self::Error>;
+    fn update_branch_head(
+        &self,
+        name: &BranchName,
+        new_head: &SemanticChangeId,
+    ) -> std::result::Result<(), Self::Error>;
     fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error>;
     fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error>;
 }
@@ -74,70 +114,205 @@ pub trait WorkStore: Send + Sync {
 
     fn create_work_item(&self, item: &WorkItem) -> std::result::Result<(), Self::Error>;
     fn get_work_item(&self, id: &WorkId) -> std::result::Result<Option<WorkItem>, Self::Error>;
-    fn list_work_items(&self, filter: &WorkFilter) -> std::result::Result<Vec<WorkItem>, Self::Error>;
-    fn update_work_status(&self, id: &WorkId, status: WorkStatus) -> std::result::Result<(), Self::Error>;
+    fn list_work_items(
+        &self,
+        filter: &WorkFilter,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn update_work_status(
+        &self,
+        id: &WorkId,
+        status: WorkStatus,
+    ) -> std::result::Result<(), Self::Error>;
     fn delete_work_item(&self, id: &WorkId) -> std::result::Result<(), Self::Error>;
     fn create_annotation(&self, ann: &Annotation) -> std::result::Result<(), Self::Error>;
-    fn get_annotation(&self, id: &AnnotationId) -> std::result::Result<Option<Annotation>, Self::Error>;
-    fn list_annotations(&self, filter: &AnnotationFilter) -> std::result::Result<Vec<Annotation>, Self::Error>;
-    fn update_annotation_staleness(&self, id: &AnnotationId, staleness: crate::work::StalenessState) -> std::result::Result<(), Self::Error>;
+    fn get_annotation(
+        &self,
+        id: &AnnotationId,
+    ) -> std::result::Result<Option<Annotation>, Self::Error>;
+    fn list_annotations(
+        &self,
+        filter: &AnnotationFilter,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn update_annotation_staleness(
+        &self,
+        id: &AnnotationId,
+        staleness: crate::work::StalenessState,
+    ) -> std::result::Result<(), Self::Error>;
     fn delete_annotation(&self, id: &AnnotationId) -> std::result::Result<(), Self::Error>;
     fn create_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
     fn delete_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
-    fn get_work_for_scope(&self, scope: &WorkScope) -> std::result::Result<Vec<WorkItem>, Self::Error>;
-    fn get_annotations_for_scope(&self, scope: &WorkScope) -> std::result::Result<Vec<Annotation>, Self::Error>;
-    fn get_child_work_items(&self, parent: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
-    fn get_parent_work_items(&self, child: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_work_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_annotations_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn get_child_work_items(
+        &self,
+        parent: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_parent_work_items(
+        &self,
+        child: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
     fn get_blockers(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
-    fn get_blocked_work_items(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
-    fn get_implementors(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkScope>, Self::Error>;
-    fn get_annotations_for_work_item(&self, work_id: &WorkId) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn get_blocked_work_items(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_implementors(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<WorkScope>, Self::Error>;
+    fn get_annotations_for_work_item(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
 }
 
 /// Test verification, coverage, contracts, and mock hints.
 pub trait VerificationStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn create_test_case(&self, test: &crate::verification::TestCase) -> std::result::Result<(), Self::Error>;
-    fn get_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
-    fn get_tests_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
-    fn delete_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<(), Self::Error>;
-    fn create_assertion(&self, assertion: &crate::verification::Assertion) -> std::result::Result<(), Self::Error>;
-    fn get_assertion(&self, id: &crate::verification::AssertionId) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
-    fn get_coverage_summary(&self) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
-    fn create_verification_run(&self, run: &VerificationRun) -> std::result::Result<(), Self::Error>;
-    fn get_verification_run(&self, id: &VerificationRunId) -> std::result::Result<Option<VerificationRun>, Self::Error>;
-    fn list_runs_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
-    fn create_test_covers_entity(&self, test_id: &crate::verification::TestId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
-    fn create_test_covers_contract(&self, test_id: &crate::verification::TestId, contract_id: &ContractId) -> std::result::Result<(), Self::Error>;
-    fn create_test_verifies_work(&self, test_id: &crate::verification::TestId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
-    fn get_tests_covering_contract(&self, contract_id: &ContractId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
-    fn get_tests_verifying_work(&self, work_id: &WorkId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn create_test_case(
+        &self,
+        test: &crate::verification::TestCase,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_test_case(
+        &self,
+        id: &crate::verification::TestId,
+    ) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn delete_test_case(
+        &self,
+        id: &crate::verification::TestId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_assertion(
+        &self,
+        assertion: &crate::verification::Assertion,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_assertion(
+        &self,
+        id: &crate::verification::AssertionId,
+    ) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
+    fn get_coverage_summary(
+        &self,
+    ) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
+    fn create_verification_run(
+        &self,
+        run: &VerificationRun,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_verification_run(
+        &self,
+        id: &VerificationRunId,
+    ) -> std::result::Result<Option<VerificationRun>, Self::Error>;
+    fn list_runs_for_test(
+        &self,
+        test_id: &crate::verification::TestId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn create_test_covers_entity(
+        &self,
+        test_id: &crate::verification::TestId,
+        entity_id: &EntityId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_test_covers_contract(
+        &self,
+        test_id: &crate::verification::TestId,
+        contract_id: &ContractId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_test_verifies_work(
+        &self,
+        test_id: &crate::verification::TestId,
+        work_id: &WorkId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_tests_covering_contract(
+        &self,
+        contract_id: &ContractId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_verifying_work(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
     fn create_mock_hint(&self, hint: &MockHint) -> std::result::Result<(), Self::Error>;
-    fn get_mock_hints_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<MockHint>, Self::Error>;
-    fn link_run_proves_entity(&self, run_id: &VerificationRunId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
-    fn link_run_proves_work(&self, run_id: &VerificationRunId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
-    fn list_runs_proving_entity(&self, entity_id: &EntityId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
-    fn list_runs_proving_work(&self, work_id: &WorkId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
-    fn create_contract(&self, contract: &crate::contract::Contract) -> std::result::Result<(), Self::Error>;
-    fn get_contract(&self, id: &ContractId) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
+    fn get_mock_hints_for_test(
+        &self,
+        test_id: &crate::verification::TestId,
+    ) -> std::result::Result<Vec<MockHint>, Self::Error>;
+    fn link_run_proves_entity(
+        &self,
+        run_id: &VerificationRunId,
+        entity_id: &EntityId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn link_run_proves_work(
+        &self,
+        run_id: &VerificationRunId,
+        work_id: &WorkId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn list_runs_proving_entity(
+        &self,
+        entity_id: &EntityId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn list_runs_proving_work(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn create_contract(
+        &self,
+        contract: &crate::contract::Contract,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_contract(
+        &self,
+        id: &ContractId,
+    ) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
     fn list_contracts(&self) -> std::result::Result<Vec<crate::contract::Contract>, Self::Error>;
-    fn get_contract_coverage_summary(&self) -> std::result::Result<ContractCoverageSummary, Self::Error>;
+    fn get_contract_coverage_summary(
+        &self,
+    ) -> std::result::Result<ContractCoverageSummary, Self::Error>;
 }
 
 /// Actor provenance, delegations, approvals, and audit trail.
 pub trait ProvenanceStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn create_actor(&self, actor: &crate::provenance::Actor) -> std::result::Result<(), Self::Error>;
-    fn get_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
+    fn create_actor(
+        &self,
+        actor: &crate::provenance::Actor,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_actor(
+        &self,
+        id: &crate::provenance::ActorId,
+    ) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
     fn list_actors(&self) -> std::result::Result<Vec<crate::provenance::Actor>, Self::Error>;
-    fn create_delegation(&self, delegation: &crate::provenance::Delegation) -> std::result::Result<(), Self::Error>;
-    fn get_delegations_for_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
-    fn create_approval(&self, approval: &crate::provenance::Approval) -> std::result::Result<(), Self::Error>;
-    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
-    fn record_audit_event(&self, event: &crate::provenance::AuditEvent) -> std::result::Result<(), Self::Error>;
-    fn query_audit_events(&self, actor_id: Option<&crate::provenance::ActorId>, limit: usize) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
+    fn create_delegation(
+        &self,
+        delegation: &crate::provenance::Delegation,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_delegations_for_actor(
+        &self,
+        id: &crate::provenance::ActorId,
+    ) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
+    fn create_approval(
+        &self,
+        approval: &crate::provenance::Approval,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_approvals_for_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
+    fn record_audit_event(
+        &self,
+        event: &crate::provenance::AuditEvent,
+    ) -> std::result::Result<(), Self::Error>;
+    fn query_audit_events(
+        &self,
+        actor_id: Option<&crate::provenance::ActorId>,
+        limit: usize,
+    ) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
 }
 
 /// Review decisions, notes, discussions, and assignments.
@@ -147,39 +322,93 @@ pub trait ReviewStore: Send + Sync {
     fn create_review(&self, review: &Review) -> std::result::Result<(), Self::Error>;
     fn get_review(&self, id: &ReviewId) -> std::result::Result<Option<Review>, Self::Error>;
     fn list_reviews(&self, filter: &ReviewFilter) -> std::result::Result<Vec<Review>, Self::Error>;
-    fn update_review_state(&self, id: &ReviewId, state: ReviewDecisionState) -> std::result::Result<(), Self::Error>;
+    fn update_review_state(
+        &self,
+        id: &ReviewId,
+        state: ReviewDecisionState,
+    ) -> std::result::Result<(), Self::Error>;
     fn delete_review(&self, id: &ReviewId) -> std::result::Result<(), Self::Error>;
 
-    fn add_review_decision(&self, id: &ReviewId, decision: &ReviewDecision) -> std::result::Result<(), Self::Error>;
-    fn get_review_decisions(&self, id: &ReviewId) -> std::result::Result<Vec<ReviewDecision>, Self::Error>;
+    fn add_review_decision(
+        &self,
+        id: &ReviewId,
+        decision: &ReviewDecision,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_review_decisions(
+        &self,
+        id: &ReviewId,
+    ) -> std::result::Result<Vec<ReviewDecision>, Self::Error>;
 
     fn add_review_note(&self, note: &ReviewNote) -> std::result::Result<(), Self::Error>;
     fn get_review_notes(&self, id: &ReviewId) -> std::result::Result<Vec<ReviewNote>, Self::Error>;
     fn delete_review_note(&self, note_id: &ReviewNoteId) -> std::result::Result<(), Self::Error>;
 
-    fn create_review_discussion(&self, discussion: &ReviewDiscussion) -> std::result::Result<(), Self::Error>;
-    fn get_review_discussions(&self, id: &ReviewId) -> std::result::Result<Vec<ReviewDiscussion>, Self::Error>;
-    fn add_discussion_comment(&self, id: &ReviewDiscussionId, comment: &ReviewComment) -> std::result::Result<(), Self::Error>;
-    fn set_discussion_state(&self, id: &ReviewDiscussionId, state: ReviewDiscussionState) -> std::result::Result<(), Self::Error>;
+    fn create_review_discussion(
+        &self,
+        discussion: &ReviewDiscussion,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_review_discussions(
+        &self,
+        id: &ReviewId,
+    ) -> std::result::Result<Vec<ReviewDiscussion>, Self::Error>;
+    fn add_discussion_comment(
+        &self,
+        id: &ReviewDiscussionId,
+        comment: &ReviewComment,
+    ) -> std::result::Result<(), Self::Error>;
+    fn set_discussion_state(
+        &self,
+        id: &ReviewDiscussionId,
+        state: ReviewDiscussionState,
+    ) -> std::result::Result<(), Self::Error>;
 
-    fn assign_reviewer(&self, assignment: &ReviewAssignment) -> std::result::Result<(), Self::Error>;
-    fn get_review_assignments(&self, id: &ReviewId) -> std::result::Result<Vec<ReviewAssignment>, Self::Error>;
-    fn remove_reviewer(&self, review_id: &ReviewId, reviewer: &str) -> std::result::Result<(), Self::Error>;
+    fn assign_reviewer(
+        &self,
+        assignment: &ReviewAssignment,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_review_assignments(
+        &self,
+        id: &ReviewId,
+    ) -> std::result::Result<Vec<ReviewAssignment>, Self::Error>;
+    fn remove_reviewer(
+        &self,
+        review_id: &ReviewId,
+        reviewer: &str,
+    ) -> std::result::Result<(), Self::Error>;
 }
 
 /// Session and intent management (daemon coordination).
 pub trait SessionStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn upsert_session(&self, session: &crate::session::AgentSession) -> std::result::Result<(), Self::Error>;
-    fn get_session(&self, session_id: &SessionId) -> std::result::Result<Option<crate::session::AgentSession>, Self::Error>;
+    fn upsert_session(
+        &self,
+        session: &crate::session::AgentSession,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_session(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<Option<crate::session::AgentSession>, Self::Error>;
     fn delete_session(&self, session_id: &SessionId) -> std::result::Result<(), Self::Error>;
     fn list_sessions(&self) -> std::result::Result<Vec<crate::session::AgentSession>, Self::Error>;
-    fn update_heartbeat(&self, session_id: &SessionId, heartbeat: &crate::timestamp::Timestamp) -> std::result::Result<(), Self::Error>;
-    fn register_intent(&self, intent: &crate::session::Intent) -> std::result::Result<(), Self::Error>;
-    fn get_intent(&self, intent_id: &IntentId) -> std::result::Result<Option<crate::session::Intent>, Self::Error>;
+    fn update_heartbeat(
+        &self,
+        session_id: &SessionId,
+        heartbeat: &crate::timestamp::Timestamp,
+    ) -> std::result::Result<(), Self::Error>;
+    fn register_intent(
+        &self,
+        intent: &crate::session::Intent,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_intent(
+        &self,
+        intent_id: &IntentId,
+    ) -> std::result::Result<Option<crate::session::Intent>, Self::Error>;
     fn delete_intent(&self, intent_id: &IntentId) -> std::result::Result<(), Self::Error>;
-    fn list_intents_for_session(&self, session_id: &SessionId) -> std::result::Result<Vec<crate::session::Intent>, Self::Error>;
+    fn list_intents_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<Vec<crate::session::Intent>, Self::Error>;
     fn list_all_intents(&self) -> std::result::Result<Vec<crate::session::Intent>, Self::Error>;
 }
 
@@ -476,10 +705,7 @@ impl<G: ReviewStore> ReviewStore for &G {
     fn get_review(&self, id: &ReviewId) -> std::result::Result<Option<Review>, Self::Error> {
         (**self).get_review(id)
     }
-    fn list_reviews(
-        &self,
-        filter: &ReviewFilter,
-    ) -> std::result::Result<Vec<Review>, Self::Error> {
+    fn list_reviews(&self, filter: &ReviewFilter) -> std::result::Result<Vec<Review>, Self::Error> {
         (**self).list_reviews(filter)
     }
     fn update_review_state(
@@ -508,16 +734,10 @@ impl<G: ReviewStore> ReviewStore for &G {
     fn add_review_note(&self, note: &ReviewNote) -> std::result::Result<(), Self::Error> {
         (**self).add_review_note(note)
     }
-    fn get_review_notes(
-        &self,
-        id: &ReviewId,
-    ) -> std::result::Result<Vec<ReviewNote>, Self::Error> {
+    fn get_review_notes(&self, id: &ReviewId) -> std::result::Result<Vec<ReviewNote>, Self::Error> {
         (**self).get_review_notes(id)
     }
-    fn delete_review_note(
-        &self,
-        note_id: &ReviewNoteId,
-    ) -> std::result::Result<(), Self::Error> {
+    fn delete_review_note(&self, note_id: &ReviewNoteId) -> std::result::Result<(), Self::Error> {
         (**self).delete_review_note(note_id)
     }
     fn create_review_discussion(
@@ -794,9 +1014,7 @@ impl<G: SessionStore> SessionStore for &G {
     fn delete_session(&self, session_id: &SessionId) -> std::result::Result<(), Self::Error> {
         (**self).delete_session(session_id)
     }
-    fn list_sessions(
-        &self,
-    ) -> std::result::Result<Vec<crate::session::AgentSession>, Self::Error> {
+    fn list_sessions(&self) -> std::result::Result<Vec<crate::session::AgentSession>, Self::Error> {
         (**self).list_sessions()
     }
     fn update_heartbeat(
@@ -827,9 +1045,7 @@ impl<G: SessionStore> SessionStore for &G {
     ) -> std::result::Result<Vec<crate::session::Intent>, Self::Error> {
         (**self).list_intents_for_session(session_id)
     }
-    fn list_all_intents(
-        &self,
-    ) -> std::result::Result<Vec<crate::session::Intent>, Self::Error> {
+    fn list_all_intents(&self) -> std::result::Result<Vec<crate::session::Intent>, Self::Error> {
         (**self).list_all_intents()
     }
 }
