@@ -1,5 +1,11 @@
-# KinLab Cargo registry — packages published here are served by kin-daemon.
-# This file is NOT gitignored — all builds (local + CI) use the Kin registry.
+# KinLab Cargo registry — all kin-* crates are published here.
+# Local patches point to sibling checkouts for cross-repo development.
 
 [registries.kin]
 index = "sparse+https://kinlab.ai/registry/cargo/"
+
+[patch.kin]
+kin-blobs = { path = "../kin-blobs" }
+kin-vector = { path = "../kin-vector" }
+kin-search = { path = "../kin-search" }
+kin-infer = { path = "../kin-infer" }
