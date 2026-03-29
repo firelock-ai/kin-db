@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// UTC timestamp wrapper.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct Timestamp(pub DateTime<Utc>);
 
 impl Timestamp {
