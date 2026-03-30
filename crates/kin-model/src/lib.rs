@@ -36,8 +36,9 @@ pub use branch::{Branch, GraphOverlay, MergeState, WorkingCopy};
 pub use change::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
-    AnnotationEntry, ContextEntry, ContextPack, ProjectionLevel, TokenBudget, TrafficEntry,
-    TrafficProximity, WorkItemEntry,
+    AnnotationEntry, ArtifactContextEntry, ArtifactContextKind, ContextEntry, ContextPack,
+    ContextPlan, ContextPlanSeed, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
+    WorkItemEntry,
 };
 pub use contract::{Contract, ContractKind};
 pub use entity::{
