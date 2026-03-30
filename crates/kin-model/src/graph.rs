@@ -113,6 +113,10 @@ pub trait EntityStore: Send + Sync {
     ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
     fn list_file_layouts(&self)
         -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
+    fn get_file_hash(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<Hash256>, Self::Error>;
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 }
 
@@ -645,6 +649,12 @@ impl<G: EntityStore> EntityStore for &G {
         &self,
     ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error> {
         (**self).list_file_layouts()
+    }
+    fn get_file_hash(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<Hash256>, Self::Error> {
+        (**self).get_file_hash(file_id)
     }
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_file_layout(file_id)
