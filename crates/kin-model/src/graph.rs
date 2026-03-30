@@ -47,6 +47,12 @@ pub trait EntityStore: Send + Sync {
         id: &EntityId,
         depth: u32,
     ) -> std::result::Result<SubGraph, Self::Error>;
+    fn expand_neighborhood(
+        &self,
+        entity_ids: &[EntityId],
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> std::result::Result<SubGraph, Self::Error>;
     fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn has_incoming_relation_kinds(
         &self,
@@ -525,6 +531,14 @@ impl<G: EntityStore> EntityStore for &G {
         depth: u32,
     ) -> std::result::Result<SubGraph, Self::Error> {
         (**self).get_dependency_neighborhood(id, depth)
+    }
+    fn expand_neighborhood(
+        &self,
+        entity_ids: &[EntityId],
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> std::result::Result<SubGraph, Self::Error> {
+        (**self).expand_neighborhood(entity_ids, edge_kinds, depth)
     }
     fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).find_dead_code()
