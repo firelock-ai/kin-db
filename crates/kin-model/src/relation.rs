@@ -3,16 +3,89 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-use crate::ids::*;
+use crate::ids::{ContractId, EntityId, RelationId, SemanticChangeId};
+use crate::retrieval::ArtifactId;
+use crate::verification::{TestId, VerificationRunId};
+use crate::work::WorkId;
+
+/// Typed graph node reference for first-class mixed-domain relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum GraphNodeId {
+    Entity(EntityId),
+    Artifact(ArtifactId),
+    Test(TestId),
+    Contract(ContractId),
+    Work(WorkId),
+    VerificationRun(VerificationRunId),
+}
+
+impl GraphNodeId {
+    pub fn as_entity(&self) -> Option<EntityId> {
+        match self {
+            Self::Entity(id) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GraphNodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entity(id) => write!(f, "entity:{id}"),
+            Self::Artifact(id) => write!(f, "artifact:{}", id.0),
+            Self::Test(id) => write!(f, "test:{id}"),
+            Self::Contract(id) => write!(f, "contract:{id}"),
+            Self::Work(id) => write!(f, "work:{id}"),
+            Self::VerificationRun(id) => write!(f, "verification_run:{id}"),
+        }
+    }
+}
+
+impl From<EntityId> for GraphNodeId {
+    fn from(value: EntityId) -> Self {
+        Self::Entity(value)
+    }
+}
+
+impl From<ArtifactId> for GraphNodeId {
+    fn from(value: ArtifactId) -> Self {
+        Self::Artifact(value)
+    }
+}
+
+impl From<TestId> for GraphNodeId {
+    fn from(value: TestId) -> Self {
+        Self::Test(value)
+    }
+}
+
+impl From<ContractId> for GraphNodeId {
+    fn from(value: ContractId) -> Self {
+        Self::Contract(value)
+    }
+}
+
+impl From<WorkId> for GraphNodeId {
+    fn from(value: WorkId) -> Self {
+        Self::Work(value)
+    }
+}
+
+impl From<VerificationRunId> for GraphNodeId {
+    fn from(value: VerificationRunId) -> Self {
+        Self::VerificationRun(value)
+    }
+}
 
 /// A typed edge in the semantic graph.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Relation {
     pub id: RelationId,
     pub kind: RelationKind,
-    pub src: EntityId,
-    pub dst: EntityId,
+    pub src: GraphNodeId,
+    pub dst: GraphNodeId,
     /// Confidence score (0.0 - 1.0).
     pub confidence: f32,
     pub origin: RelationOrigin,
@@ -43,6 +116,9 @@ pub enum RelationKind {
     EmitsEvent,
     OwnedBy,
     DocumentedBy,
+    Covers,
+    DerivedFrom,
+    OwnedByFile,
 }
 
 /// How a relation was established.
@@ -74,11 +150,23 @@ mod tests {
             RelationKind::EmitsEvent,
             RelationKind::OwnedBy,
             RelationKind::DocumentedBy,
+            RelationKind::Covers,
+            RelationKind::DerivedFrom,
+            RelationKind::OwnedByFile,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();
             let parsed: RelationKind = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, k);
         }
+    }
+
+    #[test]
+    fn graph_node_id_roundtrips_through_json() {
+        let node = GraphNodeId::Work(WorkId::new());
+        let json = serde_json::to_string(&node).unwrap();
+        let parsed: GraphNodeId = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, node);
     }
 }

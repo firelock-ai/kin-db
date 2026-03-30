@@ -81,7 +81,7 @@ pub use provenance::{
     Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
     Delegation, DelegationId,
 };
-pub use relation::{Relation, RelationKind, RelationOrigin};
+pub use relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
 pub use retrieval::{ArtifactId, RetrievalKey, RetrievalKeyFileResolver};
 pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
