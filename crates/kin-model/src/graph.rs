@@ -91,6 +91,18 @@ pub trait EntityStore: Send + Sync {
         &self,
     ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
+    fn upsert_file_layout(
+        &self,
+        layout: &crate::layout::FileLayout,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_file_layout(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
+    fn list_file_layouts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
+    fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 }
 
 /// Semantic change DAG and branch operations.
@@ -587,6 +599,26 @@ impl<G: EntityStore> EntityStore for &G {
     }
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_opaque_artifact(file_id)
+    }
+    fn upsert_file_layout(
+        &self,
+        layout: &crate::layout::FileLayout,
+    ) -> std::result::Result<(), Self::Error> {
+        (**self).upsert_file_layout(layout)
+    }
+    fn get_file_layout(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error> {
+        (**self).get_file_layout(file_id)
+    }
+    fn list_file_layouts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error> {
+        (**self).list_file_layouts()
+    }
+    fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
+        (**self).delete_file_layout(file_id)
     }
 }
 

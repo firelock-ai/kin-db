@@ -4,12 +4,52 @@
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+use crate::entity::ParseState;
 use crate::ids::*;
+
+/// How complete the persisted layout is relative to the latest parse attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParseCompleteness {
+    Full,
+    Partial(String),
+    Failed(String),
+}
+
+impl ParseCompleteness {
+    pub fn from_parse_state(parse_state: &ParseState) -> Self {
+        match parse_state {
+            ParseState::Valid => Self::Full,
+            ParseState::Incomplete { error_ranges } => Self::Partial(format!(
+                "{} parse error range(s) during indexing",
+                error_ranges.len()
+            )),
+            ParseState::LastKnownGood { .. } => {
+                Self::Failed("projection preserved last known good layout".to_string())
+            }
+        }
+    }
+
+    pub fn bucket(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial(_) => "partial",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+impl Default for ParseCompleteness {
+    fn default() -> Self {
+        Self::Full
+    }
+}
 
 /// CST mapping for a source file, enabling surgical byte-range splicing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileLayout {
     pub file_id: FilePathId,
+    #[serde(default)]
+    pub parse_completeness: ParseCompleteness,
     pub imports: ImportSection,
     /// Interleaved entities and trivia.
     pub regions: Vec<SourceRegion>,
@@ -123,5 +163,18 @@ mod tests {
         let json = serde_json::to_string(&opaque).unwrap();
         let parsed: TrackedFile = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, TrackedFile::OpaqueArtifact(_)));
+    }
+
+    #[test]
+    fn parse_completeness_buckets_match_variants() {
+        assert_eq!(ParseCompleteness::Full.bucket(), "full");
+        assert_eq!(
+            ParseCompleteness::Partial("incomplete".to_string()).bucket(),
+            "partial"
+        );
+        assert_eq!(
+            ParseCompleteness::Failed("broken".to_string()).bucket(),
+            "failed"
+        );
     }
 }

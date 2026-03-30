@@ -59,8 +59,8 @@ pub use ids::{
     Hash256, IntentId, LanguageId, RelationId, SemanticChangeId, SessionId, SpecId,
 };
 pub use layout::{
-    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,
-    SourceRegion, StructuredArtifact, TrackedFile,
+    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
+    ShallowTrackedFile, SourceRegion, StructuredArtifact, TrackedFile,
 };
 pub use preset::{
     BrokenAstBehavior, DirectoryPreset, FormattingPolicy, PolicyOverrides, PresetConfig,
