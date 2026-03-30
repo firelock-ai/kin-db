@@ -22,6 +22,7 @@ pub mod preset;
 pub mod projection;
 pub mod provenance;
 pub mod relation;
+pub mod retrieval;
 pub mod review;
 pub mod session;
 pub mod spec;
@@ -80,6 +81,7 @@ pub use provenance::{
     Delegation, DelegationId,
 };
 pub use relation::{Relation, RelationKind, RelationOrigin};
+pub use retrieval::{ArtifactId, RetrievalKey, RetrievalKeyFileResolver};
 pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
     SessionCapabilities, SessionTransport, TrafficReport,
