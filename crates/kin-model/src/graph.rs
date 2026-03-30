@@ -72,6 +72,25 @@ pub trait EntityStore: Send + Sync {
     fn list_shallow_files(
         &self,
     ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error>;
+    fn upsert_structured_artifact(
+        &self,
+        artifact: &crate::layout::StructuredArtifact,
+    ) -> std::result::Result<(), Self::Error>;
+    fn list_structured_artifacts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::StructuredArtifact>, Self::Error>;
+    fn delete_structured_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn upsert_opaque_artifact(
+        &self,
+        artifact: &crate::layout::OpaqueArtifact,
+    ) -> std::result::Result<(), Self::Error>;
+    fn list_opaque_artifacts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
+    fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 }
 
 /// Semantic change DAG and branch operations.
@@ -537,6 +556,37 @@ impl<G: EntityStore> EntityStore for &G {
         &self,
     ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error> {
         (**self).list_shallow_files()
+    }
+    fn upsert_structured_artifact(
+        &self,
+        artifact: &crate::layout::StructuredArtifact,
+    ) -> std::result::Result<(), Self::Error> {
+        (**self).upsert_structured_artifact(artifact)
+    }
+    fn list_structured_artifacts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::StructuredArtifact>, Self::Error> {
+        (**self).list_structured_artifacts()
+    }
+    fn delete_structured_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<(), Self::Error> {
+        (**self).delete_structured_artifact(file_id)
+    }
+    fn upsert_opaque_artifact(
+        &self,
+        artifact: &crate::layout::OpaqueArtifact,
+    ) -> std::result::Result<(), Self::Error> {
+        (**self).upsert_opaque_artifact(artifact)
+    }
+    fn list_opaque_artifacts(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error> {
+        (**self).list_opaque_artifacts()
+    }
+    fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
+        (**self).delete_opaque_artifact(file_id)
     }
 }
 
