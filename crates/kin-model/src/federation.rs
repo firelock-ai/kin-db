@@ -185,6 +185,7 @@ pub enum RemoteRelationKind {
     Extends,
     Tests,
     DependsOn,
+    CoChanges,
     DefinesContract,
     ConsumesContract,
     EmitsEvent,
@@ -203,6 +204,7 @@ impl From<RelationKind> for RemoteRelationKind {
             RelationKind::Extends => Self::Extends,
             RelationKind::Tests => Self::Tests,
             RelationKind::DependsOn => Self::DependsOn,
+            RelationKind::CoChanges => Self::CoChanges,
             RelationKind::DefinesContract => Self::DefinesContract,
             RelationKind::ConsumesContract => Self::ConsumesContract,
             RelationKind::EmitsEvent => Self::EmitsEvent,
@@ -223,6 +225,7 @@ impl From<RemoteRelationKind> for RelationKind {
             RemoteRelationKind::Extends => Self::Extends,
             RemoteRelationKind::Tests => Self::Tests,
             RemoteRelationKind::DependsOn => Self::DependsOn,
+            RemoteRelationKind::CoChanges => Self::CoChanges,
             RemoteRelationKind::DefinesContract => Self::DefinesContract,
             RemoteRelationKind::ConsumesContract => Self::ConsumesContract,
             RemoteRelationKind::EmitsEvent => Self::EmitsEvent,
@@ -320,10 +323,11 @@ mod tests {
 
     #[test]
     fn remote_relation_kind_conversions_roundtrip() {
-        let local = RelationKind::DependsOn;
-        let remote: RemoteRelationKind = local.into();
-        let back: RelationKind = remote.into();
-        assert_eq!(back, local);
+        for local in [RelationKind::DependsOn, RelationKind::CoChanges] {
+            let remote: RemoteRelationKind = local.into();
+            let back: RelationKind = remote.into();
+            assert_eq!(back, local);
+        }
     }
 
     #[test]
@@ -422,5 +426,23 @@ mod tests {
         assert_eq!(parsed.kind, RemoteRelationKind::DependsOn);
         assert_eq!(parsed.origin, RemoteRelationOrigin::Imported);
         assert_eq!(parsed.asserted_by, graph);
+
+        let cochange = RemoteRelation::new(
+            "rel-2",
+            RemoteRelationKind::CoChanges,
+            ScopeRef::Entity {
+                graph: graph.clone(),
+                entity_id: EntityId::new(),
+            },
+            ScopeRef::Entity {
+                graph: graph.clone(),
+                entity_id: EntityId::new(),
+            },
+            graph.clone(),
+            RemoteRelationOrigin::Imported,
+        );
+        let json = serde_json::to_string(&cochange).unwrap();
+        let parsed: RemoteRelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, RemoteRelationKind::CoChanges);
     }
 }
