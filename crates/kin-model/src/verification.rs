@@ -10,6 +10,7 @@
 use crate::ids::{ContractId, EntityId, FilePathId, Hash256};
 use crate::timestamp::Timestamp;
 use crate::work::WorkScope;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for a test case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct TestId(pub Hash256);
 
 impl TestId {
@@ -71,7 +72,7 @@ impl std::fmt::Display for AssertionId {
 }
 
 /// Unique identifier for a verification run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct VerificationRunId(pub Hash256);
 
 impl VerificationRunId {

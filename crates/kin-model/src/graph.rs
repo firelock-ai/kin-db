@@ -5,7 +5,7 @@ use crate::branch::Branch;
 use crate::change::SemanticChange;
 use crate::entity::{Entity, EntityKind};
 use crate::ids::*;
-use crate::relation::{Relation, RelationKind};
+use crate::relation::{GraphNodeId, Relation, RelationKind};
 use crate::review::{
     Review, ReviewAssignment, ReviewComment, ReviewDecision, ReviewDecisionState, ReviewDiscussion,
     ReviewDiscussionId, ReviewDiscussionState, ReviewFilter, ReviewId, ReviewNote, ReviewNoteId,
@@ -50,6 +50,12 @@ pub trait EntityStore: Send + Sync {
     fn expand_neighborhood(
         &self,
         entity_ids: &[EntityId],
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> std::result::Result<SubGraph, Self::Error>;
+    fn traverse(
+        &self,
+        start: &GraphNodeId,
         edge_kinds: &[RelationKind],
         depth: u32,
     ) -> std::result::Result<SubGraph, Self::Error>;
@@ -105,9 +111,8 @@ pub trait EntityStore: Send + Sync {
         &self,
         file_id: &FilePathId,
     ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
-    fn list_file_layouts(
-        &self,
-    ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
+    fn list_file_layouts(&self)
+        -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 }
 
@@ -482,6 +487,8 @@ pub trait GraphStore:
 /// A subgraph returned from neighborhood queries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubGraph {
+    #[serde(default)]
+    pub nodes: Vec<GraphNodeId>,
     pub entities: HashMap<EntityId, Entity>,
     pub relations: Vec<Relation>,
 }
@@ -539,6 +546,14 @@ impl<G: EntityStore> EntityStore for &G {
         depth: u32,
     ) -> std::result::Result<SubGraph, Self::Error> {
         (**self).expand_neighborhood(entity_ids, edge_kinds, depth)
+    }
+    fn traverse(
+        &self,
+        start: &GraphNodeId,
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> std::result::Result<SubGraph, Self::Error> {
+        (**self).traverse(start, edge_kinds, depth)
     }
     fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).find_dead_code()

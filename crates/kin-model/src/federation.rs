@@ -191,6 +191,9 @@ pub enum RemoteRelationKind {
     EmitsEvent,
     OwnedBy,
     DocumentedBy,
+    Covers,
+    DerivedFrom,
+    OwnedByFile,
 }
 
 impl From<RelationKind> for RemoteRelationKind {
@@ -210,6 +213,9 @@ impl From<RelationKind> for RemoteRelationKind {
             RelationKind::EmitsEvent => Self::EmitsEvent,
             RelationKind::OwnedBy => Self::OwnedBy,
             RelationKind::DocumentedBy => Self::DocumentedBy,
+            RelationKind::Covers => Self::Covers,
+            RelationKind::DerivedFrom => Self::DerivedFrom,
+            RelationKind::OwnedByFile => Self::OwnedByFile,
         }
     }
 }
@@ -231,6 +237,9 @@ impl From<RemoteRelationKind> for RelationKind {
             RemoteRelationKind::EmitsEvent => Self::EmitsEvent,
             RemoteRelationKind::OwnedBy => Self::OwnedBy,
             RemoteRelationKind::DocumentedBy => Self::DocumentedBy,
+            RemoteRelationKind::Covers => Self::Covers,
+            RemoteRelationKind::DerivedFrom => Self::DerivedFrom,
+            RemoteRelationKind::OwnedByFile => Self::OwnedByFile,
         }
     }
 }
