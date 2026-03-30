@@ -11,12 +11,16 @@ pub struct GraphStats {
     pub entity_counts: HashMap<String, usize>,
     /// Relation counts keyed by RelationKind debug name (e.g. "Calls", "Imports").
     pub relation_counts: HashMap<String, usize>,
+    /// Parse completeness counts keyed by layout completeness bucket.
+    pub parse_completeness_counts: HashMap<String, usize>,
     /// Number of shallow-tracked files (C2 tier).
     pub shallow_file_count: usize,
     /// Number of structured artifacts (C1 tier).
     pub structured_artifact_count: usize,
     /// Number of opaque artifacts (C0 tier).
     pub opaque_artifact_count: usize,
+    /// Number of persisted file layouts.
+    pub file_layout_count: usize,
     /// Number of file content hashes recorded.
     pub file_hash_count: usize,
     /// Number of entities currently visible in the committed text index.
