@@ -60,6 +60,8 @@ pub struct StructuredArtifact {
     pub file_id: FilePathId,
     pub kind: ArtifactKind,
     pub content_hash: Hash256,
+    #[serde(default)]
+    pub text_preview: Option<String>,
 }
 
 /// Classification of structured artifact types.
@@ -79,6 +81,8 @@ pub struct OpaqueArtifact {
     pub file_id: FilePathId,
     pub content_hash: Hash256,
     pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text_preview: Option<String>,
 }
 
 /// A file tracked at C2 shallow syntax tier.
@@ -90,6 +94,10 @@ pub struct ShallowTrackedFile {
     pub import_count: usize,
     pub syntax_hash: Hash256,
     pub signature_hash: Option<Hash256>,
+    #[serde(default)]
+    pub declaration_names: Vec<String>,
+    #[serde(default)]
+    pub import_paths: Vec<String>,
 }
 
 #[cfg(test)]
@@ -110,6 +118,7 @@ mod tests {
             file_id: FilePathId::new("image.png"),
             content_hash: Hash256::from_bytes([0; 32]),
             mime_type: Some("image/png".to_string()),
+            text_preview: None,
         });
         let json = serde_json::to_string(&opaque).unwrap();
         let parsed: TrackedFile = serde_json::from_str(&json).unwrap();
