@@ -54,6 +54,8 @@ impl From<ArtifactId> for RetrievalKey {
     }
 }
 
+impl kin_vector::VectorId for RetrievalKey {}
+
 /// Reverse-map contract for display surfaces that need a file anchor.
 pub trait RetrievalKeyFileResolver {
     fn file_path_for_retrieval_key(&self, key: RetrievalKey) -> Option<FilePathId>;
@@ -83,8 +85,8 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_key_satisfies_generic_index_bounds() {
-        fn assert_bounds<T>()
+    fn retrieval_key_satisfies_search_and_vector_bounds() {
+        fn assert_search_bounds<T>()
         where
             T: Copy
                 + Eq
@@ -98,7 +100,10 @@ mod tests {
         {
         }
 
-        assert_bounds::<ArtifactId>();
-        assert_bounds::<RetrievalKey>();
+        fn assert_vector_id<T: kin_vector::VectorId>() {}
+
+        assert_search_bounds::<ArtifactId>();
+        assert_search_bounds::<RetrievalKey>();
+        assert_vector_id::<RetrievalKey>();
     }
 }
