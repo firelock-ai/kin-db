@@ -25,6 +25,7 @@ pub mod relation;
 pub mod review;
 pub mod session;
 pub mod spec;
+pub mod stats;
 pub mod timestamp;
 pub mod verification;
 pub mod work;
@@ -71,6 +72,7 @@ pub use review::{
     ReviewId, ReviewNote, ReviewNoteId, RiskLevel, RiskSummary,
 };
 pub use spec::Spec;
+pub use stats::GraphStats;
 pub use timestamp::Timestamp;
 
 pub use provenance::{
