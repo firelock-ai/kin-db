@@ -81,6 +81,10 @@ pub trait EntityStore: Send + Sync {
         &self,
         shallow: &crate::layout::ShallowTrackedFile,
     ) -> std::result::Result<(), Self::Error>;
+    fn get_shallow_file(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::ShallowTrackedFile>, Self::Error>;
     fn list_shallow_files(
         &self,
     ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error>;
@@ -88,6 +92,10 @@ pub trait EntityStore: Send + Sync {
         &self,
         artifact: &crate::layout::StructuredArtifact,
     ) -> std::result::Result<(), Self::Error>;
+    fn get_structured_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::StructuredArtifact>, Self::Error>;
     fn list_structured_artifacts(
         &self,
     ) -> std::result::Result<Vec<crate::layout::StructuredArtifact>, Self::Error>;
@@ -99,6 +107,10 @@ pub trait EntityStore: Send + Sync {
         &self,
         artifact: &crate::layout::OpaqueArtifact,
     ) -> std::result::Result<(), Self::Error>;
+    fn get_opaque_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::OpaqueArtifact>, Self::Error>;
     fn list_opaque_artifacts(
         &self,
     ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
@@ -597,6 +609,12 @@ impl<G: EntityStore> EntityStore for &G {
     ) -> std::result::Result<(), Self::Error> {
         (**self).upsert_shallow_file(shallow)
     }
+    fn get_shallow_file(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::ShallowTrackedFile>, Self::Error> {
+        (**self).get_shallow_file(file_id)
+    }
     fn list_shallow_files(
         &self,
     ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error> {
@@ -607,6 +625,12 @@ impl<G: EntityStore> EntityStore for &G {
         artifact: &crate::layout::StructuredArtifact,
     ) -> std::result::Result<(), Self::Error> {
         (**self).upsert_structured_artifact(artifact)
+    }
+    fn get_structured_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::StructuredArtifact>, Self::Error> {
+        (**self).get_structured_artifact(file_id)
     }
     fn list_structured_artifacts(
         &self,
@@ -624,6 +648,12 @@ impl<G: EntityStore> EntityStore for &G {
         artifact: &crate::layout::OpaqueArtifact,
     ) -> std::result::Result<(), Self::Error> {
         (**self).upsert_opaque_artifact(artifact)
+    }
+    fn get_opaque_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> std::result::Result<Option<crate::layout::OpaqueArtifact>, Self::Error> {
+        (**self).get_opaque_artifact(file_id)
     }
     fn list_opaque_artifacts(
         &self,
