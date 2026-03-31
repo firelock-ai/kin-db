@@ -73,6 +73,7 @@ Optional feature flags in `crates/kin-db/Cargo.toml` enable Metal, CUDA, and Acc
 
 ## Design Principles
 
+- **Graph is the authority** -- Entities are identified by semantic identity and addressed by content hash. File paths are strictly secondary metadata used only as projection hints for filesystem surfaces. No query or storage operation uses file paths as a primary key.
 - **Batch write, continuous read** -- optimized for bulk indexing (like `kin commit`) followed by many reads.
 - **No query language** -- all queries are compiled Rust functions. No parsing overhead, no runtime interpretation.
 - **Static schema** -- Entity/Relation types known at compile time. No runtime schema discovery.
