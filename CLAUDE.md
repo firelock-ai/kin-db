@@ -31,6 +31,10 @@ See `docs/ARCHITECTURE.md` for the full design rationale and `docs/EVALUATION.md
 - **hashbrown::HashMap** — Faster than std HashMap for the access patterns here.
 - **No query language** — All queries are compiled Rust functions. Zero parsing overhead.
 
+### File Paths Are Secondary Metadata
+
+File paths in KinDB are strictly secondary metadata, not primary identity. Entities are identified by their semantic identity (name, kind, signature hash) and addressed by content hash. File paths exist only as projection hints for surfaces that need to map graph entities back to filesystem locations. No query, traversal, or storage operation uses file paths as a primary key. This is by design: the graph is the authority, and filesystems are derived views.
+
 ## Testing
 
 ```bash
