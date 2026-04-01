@@ -42,8 +42,8 @@ pub use context::{
 };
 pub use contract::{Contract, ContractKind};
 pub use entity::{
-    Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, ParseState, SemanticFingerprint,
-    SourceSpan, Visibility,
+    Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
+    SemanticFingerprint, SourceSpan, Visibility,
 };
 pub use error::{ModelError, Result};
 pub use evidence::{Evidence, TestResult};

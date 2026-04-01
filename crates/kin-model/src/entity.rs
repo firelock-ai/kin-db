@@ -21,6 +21,8 @@ pub struct Entity {
     pub span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Visibility,
+    #[serde(default)]
+    pub role: EntityRole,
     pub doc_summary: Option<String>,
     pub metadata: EntityMetadata,
     pub lineage_parent: Option<EntityId>,
@@ -79,6 +81,24 @@ pub enum Visibility {
     Private,
     Internal,
     Crate,
+}
+
+/// Role of a semantic entity within the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityRole {
+    Source,
+    Test,
+    External,
+    Docs,
+    Generated,
+    Vendored,
+}
+
+impl Default for EntityRole {
+    fn default() -> Self {
+        EntityRole::Source
+    }
 }
 
 /// Extensible metadata bag for entities.
@@ -160,5 +180,60 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let parsed: Visibility = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, v);
+    }
+
+    #[test]
+    fn entity_role_default_is_source() {
+        assert_eq!(EntityRole::default(), EntityRole::Source);
+    }
+
+    #[test]
+    fn entity_role_all_variants_roundtrip() {
+        let variants = vec![
+            EntityRole::Source,
+            EntityRole::Test,
+            EntityRole::External,
+            EntityRole::Docs,
+            EntityRole::Generated,
+            EntityRole::Vendored,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let parsed: EntityRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, v);
+        }
+    }
+
+    #[test]
+    fn entity_role_serde_default_on_missing() {
+        // Build a valid Entity, serialize it, strip the role field, then deserialize.
+        // This proves that old snapshots (without role) default to Source.
+        let entity = Entity {
+            id: EntityId(uuid::Uuid::nil()),
+            kind: EntityKind::Function,
+            name: "f".into(),
+            language: crate::ids::LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_blobs::Hash256::from_bytes([0; 32]),
+                signature_hash: kin_blobs::Hash256::from_bytes([0; 32]),
+                behavior_hash: kin_blobs::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: "fn f()".into(),
+            visibility: Visibility::Public,
+            role: EntityRole::Test, // set non-default to prove the strip works
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        let mut json_val: serde_json::Value = serde_json::to_value(&entity).unwrap();
+        json_val.as_object_mut().unwrap().remove("role");
+        let deserialized: Entity = serde_json::from_value(json_val).unwrap();
+        assert_eq!(deserialized.role, EntityRole::Source);
     }
 }

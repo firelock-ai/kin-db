@@ -3,7 +3,7 @@
 
 use crate::branch::Branch;
 use crate::change::SemanticChange;
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
 use crate::review::{
@@ -516,6 +516,7 @@ pub struct EntityFilter {
     pub languages: Option<Vec<LanguageId>>,
     pub name_pattern: Option<String>,
     pub file_path: Option<FilePathId>,
+    pub roles: Option<Vec<EntityRole>>,
 }
 
 // ===========================================================================
