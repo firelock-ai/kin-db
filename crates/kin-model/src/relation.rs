@@ -127,6 +127,8 @@ pub enum RelationOrigin {
     Parsed,
     Inferred,
     Manual,
+    /// Discovered via Language Server Protocol (type-resolved).
+    Lsp,
 }
 
 #[cfg(test)]

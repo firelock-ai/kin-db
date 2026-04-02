@@ -260,6 +260,7 @@ impl From<RelationOrigin> for RemoteRelationOrigin {
             RelationOrigin::Parsed => Self::Parsed,
             RelationOrigin::Inferred => Self::Inferred,
             RelationOrigin::Manual => Self::Manual,
+            RelationOrigin::Lsp => Self::Inferred, // LSP maps to Inferred for remote federation
         }
     }
 }
