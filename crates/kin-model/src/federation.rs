@@ -183,6 +183,12 @@ pub enum RemoteRelationKind {
     References,
     Implements,
     Extends,
+    Overrides,
+    Instantiates,
+    UsesType,
+    SubscribesTo,
+    SendsMessage,
+    Spawns,
     Tests,
     DependsOn,
     CoChanges,
@@ -216,6 +222,12 @@ impl From<RelationKind> for RemoteRelationKind {
             RelationKind::Covers => Self::Covers,
             RelationKind::DerivedFrom => Self::DerivedFrom,
             RelationKind::OwnedByFile => Self::OwnedByFile,
+            RelationKind::Overrides => Self::Overrides,
+            RelationKind::Instantiates => Self::Instantiates,
+            RelationKind::UsesType => Self::UsesType,
+            RelationKind::SubscribesTo => Self::SubscribesTo,
+            RelationKind::SendsMessage => Self::SendsMessage,
+            RelationKind::Spawns => Self::Spawns,
         }
     }
 }
@@ -240,6 +252,12 @@ impl From<RemoteRelationKind> for RelationKind {
             RemoteRelationKind::Covers => Self::Covers,
             RemoteRelationKind::DerivedFrom => Self::DerivedFrom,
             RemoteRelationKind::OwnedByFile => Self::OwnedByFile,
+            RemoteRelationKind::Overrides => Self::Overrides,
+            RemoteRelationKind::Instantiates => Self::Instantiates,
+            RemoteRelationKind::UsesType => Self::UsesType,
+            RemoteRelationKind::SubscribesTo => Self::SubscribesTo,
+            RemoteRelationKind::SendsMessage => Self::SendsMessage,
+            RemoteRelationKind::Spawns => Self::Spawns,
         }
     }
 }
