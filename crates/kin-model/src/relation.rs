@@ -102,23 +102,42 @@ pub struct Relation {
 /// Classification of a relation edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum RelationKind {
-    Calls,
-    Imports,
-    Contains,
-    References,
-    Implements,
-    Extends,
-    Tests,
-    DependsOn,
-    CoChanges,
-    DefinesContract,
-    ConsumesContract,
-    EmitsEvent,
-    OwnedBy,
-    DocumentedBy,
-    Covers,
-    DerivedFrom,
-    OwnedByFile,
+    // ── Structural ──────────────────────────────
+    Contains,          // parent encloses child (class→method, enum→variant)
+    Extends,           // inherits implementation (class inheritance)
+    Implements,        // satisfies type contract (interface/trait/protocol)
+    Overrides,         // method replaces parent method
+
+    // ── Usage ───────────────────────────────────
+    Calls,             // invokes at runtime
+    Instantiates,      // constructs an instance (new Foo(), Foo::new())
+    References,        // non-call reference (field access, constant use)
+    UsesType,          // type dependency in signature/body
+
+    // ── Dependencies ────────────────────────────
+    Imports,           // file-level import/use/require
+    DependsOn,         // package/crate-level dependency
+
+    // ── Behavioral ──────────────────────────────
+    EmitsEvent,        // publishes named event
+    SubscribesTo,      // listens/subscribes to named event
+    DefinesContract,   // defines API/schema contract
+    ConsumesContract,  // consumes API/schema contract
+
+    // ── Concurrency ─────────────────────────────
+    SendsMessage,      // sends on typed channel/queue/mailbox
+    Spawns,            // creates concurrent execution context
+
+    // ── Lifecycle ───────────────────────────────
+    Tests,             // test entity verifies target
+    Covers,            // test provides runtime coverage
+    CoChanges,         // entities change together in commits
+    DerivedFrom,       // generated/derived from another entity
+
+    // ── Metadata ────────────────────────────────
+    DocumentedBy,      // entity has documentation
+    OwnedBy,           // entity has responsible owner/team
+    OwnedByFile,       // entity associated with file
 }
 
 /// How a relation was established.
