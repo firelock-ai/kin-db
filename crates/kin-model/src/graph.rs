@@ -130,6 +130,27 @@ pub trait EntityStore: Send + Sync {
         file_id: &FilePathId,
     ) -> std::result::Result<Option<Hash256>, Self::Error>;
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
+
+    /// Batch-insert entities with a single lock acquisition and one deferred
+    /// text-index refresh.  The default falls back to per-entity `upsert_entity`.
+    fn upsert_entities_batch(&self, entities: &[Entity]) -> std::result::Result<(), Self::Error> {
+        for entity in entities {
+            self.upsert_entity(entity)?;
+        }
+        Ok(())
+    }
+
+    /// Batch-insert relations with a single lock acquisition and one deferred
+    /// text-index refresh.  The default falls back to per-relation `upsert_relation`.
+    fn upsert_relations_batch(
+        &self,
+        relations: &[Relation],
+    ) -> std::result::Result<(), Self::Error> {
+        for relation in relations {
+            self.upsert_relation(relation)?;
+        }
+        Ok(())
+    }
 }
 
 /// Semantic change DAG and branch operations.
