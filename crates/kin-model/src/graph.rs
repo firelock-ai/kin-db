@@ -151,6 +151,18 @@ pub trait EntityStore: Send + Sync {
         }
         Ok(())
     }
+
+    /// Batch-remove relations with a single lock acquisition and one deferred
+    /// text-index rebuild. The default falls back to per-relation `remove_relation`.
+    fn remove_relations_batch(
+        &self,
+        ids: &[&RelationId],
+    ) -> std::result::Result<(), Self::Error> {
+        for id in ids {
+            self.remove_relation(id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Semantic change DAG and branch operations.
