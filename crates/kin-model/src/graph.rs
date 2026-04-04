@@ -163,6 +163,34 @@ pub trait EntityStore: Send + Sync {
         }
         Ok(())
     }
+
+    /// Atomically replace all relations of a given kind with a new set.
+    /// Default impl falls back to remove_relations_batch + upsert_relations_batch.
+    fn replace_relations_of_kind(
+        &self,
+        kind: RelationKind,
+        new_relations: Vec<Relation>,
+    ) -> std::result::Result<(), Self::Error> {
+        // Default: scan all entities for relations of this kind, remove, then insert
+        let existing: Vec<RelationId> = self
+            .query_entities(&EntityFilter::default())?
+            .iter()
+            .flat_map(|e| {
+                self.get_all_relations_for_entity(&e.id)
+                    .unwrap_or_default()
+            })
+            .filter(|r| r.kind == kind)
+            .map(|r| r.id)
+            .collect();
+        let refs: Vec<_> = existing.iter().collect();
+        if !refs.is_empty() {
+            self.remove_relations_batch(&refs)?;
+        }
+        if !new_relations.is_empty() {
+            self.upsert_relations_batch(&new_relations)?;
+        }
+        Ok(())
+    }
 }
 
 /// Semantic change DAG and branch operations.
