@@ -154,10 +154,7 @@ pub trait EntityStore: Send + Sync {
 
     /// Batch-remove relations with a single lock acquisition and one deferred
     /// text-index rebuild. The default falls back to per-relation `remove_relation`.
-    fn remove_relations_batch(
-        &self,
-        ids: &[&RelationId],
-    ) -> std::result::Result<(), Self::Error> {
+    fn remove_relations_batch(&self, ids: &[&RelationId]) -> std::result::Result<(), Self::Error> {
         for id in ids {
             self.remove_relation(id)?;
         }
@@ -175,10 +172,7 @@ pub trait EntityStore: Send + Sync {
         let existing: Vec<RelationId> = self
             .query_entities(&EntityFilter::default())?
             .iter()
-            .flat_map(|e| {
-                self.get_all_relations_for_entity(&e.id)
-                    .unwrap_or_default()
-            })
+            .flat_map(|e| self.get_all_relations_for_entity(&e.id).unwrap_or_default())
             .filter(|r| r.kind == kind)
             .map(|r| r.id)
             .collect();
