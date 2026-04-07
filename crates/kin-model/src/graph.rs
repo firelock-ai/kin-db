@@ -694,30 +694,32 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
     store: &G,
     head: &SemanticChangeId,
 ) -> std::result::Result<Vec<SemanticChange>, G::Error> {
-    fn visit<G: ChangeStore + ?Sized>(
-        store: &G,
-        id: &SemanticChangeId,
-        visited: &mut HashSet<SemanticChangeId>,
-        ordered: &mut Vec<SemanticChange>,
-    ) -> std::result::Result<(), G::Error> {
-        if !visited.insert(*id) {
-            return Ok(());
-        }
-        let Some(change) = store.get_change(id)? else {
-            return Ok(());
-        };
-
-        for parent in &change.parents {
-            visit(store, parent, visited, ordered)?;
-        }
-
-        ordered.push(change);
-        Ok(())
-    }
-
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
-    visit(store, head, &mut visited, &mut ordered)?;
+    enum Frame {
+        Visit(SemanticChangeId),
+        Emit(SemanticChange),
+    }
+
+    let mut stack = vec![Frame::Visit(*head)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(id) => {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let Some(change) = store.get_change(&id)? else {
+                    continue;
+                };
+
+                stack.push(Frame::Emit(change.clone()));
+                for parent in change.parents.iter().rev() {
+                    stack.push(Frame::Visit(*parent));
+                }
+            }
+            Frame::Emit(change) => ordered.push(change),
+        }
+    }
     Ok(ordered)
 }
 
