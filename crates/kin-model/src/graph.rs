@@ -255,6 +255,13 @@ pub trait ChangeStore: Send + Sync {
         let changes = collect_changes_topologically(self, head)?;
         Ok(replay_graph_state(changes))
     }
+    fn resolve_file_tree_at(
+        &self,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<HashMap<FilePathId, Hash256>, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        Ok(replay_file_tree(changes))
+    }
     fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
     fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
     fn update_branch_head(
@@ -696,6 +703,31 @@ where
     }
 
     state
+}
+
+fn replay_file_tree<I>(changes: I) -> HashMap<FilePathId, Hash256>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut file_tree = HashMap::new();
+
+    for change in changes {
+        for delta in change.artifact_deltas {
+            match delta.kind {
+                crate::change::ArtifactDeltaKind::Added
+                | crate::change::ArtifactDeltaKind::Modified => {
+                    if let Some(hash) = delta.new_hash {
+                        file_tree.insert(delta.file_id, hash);
+                    }
+                }
+                crate::change::ArtifactDeltaKind::Removed => {
+                    file_tree.remove(&delta.file_id);
+                }
+            }
+        }
+    }
+
+    file_tree
 }
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
