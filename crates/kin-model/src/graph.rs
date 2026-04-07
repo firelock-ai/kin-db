@@ -125,7 +125,7 @@ pub trait EntityStore: Send + Sync {
         file_id: &FilePathId,
     ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
     fn list_file_layouts(&self)
-    -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
+        -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
     fn get_file_hash(
         &self,
         file_id: &FilePathId,
