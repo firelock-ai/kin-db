@@ -101,8 +101,7 @@ impl PartialEq for RelationRevision {
             && self.introduced_by == other.introduced_by
             && self.previous_revision == other.previous_revision
             && self.ended_by == other.ended_by
-            && serde_json::to_vec(&self.relation).ok()
-                == serde_json::to_vec(&other.relation).ok()
+            && serde_json::to_vec(&self.relation).ok() == serde_json::to_vec(&other.relation).ok()
     }
 }
 
