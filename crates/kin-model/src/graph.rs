@@ -16,7 +16,7 @@ use crate::work::{
     WorkStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ===========================================================================
 // Domain sub-traits — narrower interfaces for consumers that only need a
@@ -210,6 +210,51 @@ pub trait ChangeStore: Send + Sync {
         base: &SemanticChangeId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn get_entity_history_at(
+        &self,
+        id: &EntityId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        Ok(changes
+            .into_iter()
+            .filter(|change| entity_is_touched_by_change(change, id))
+            .collect())
+    }
+    fn resolve_entity_at(
+        &self,
+        id: &EntityId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Option<Entity>, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        let mut entity = None;
+
+        for change in changes {
+            for delta in change.entity_deltas {
+                match delta {
+                    crate::change::EntityDelta::Added(current) if current.id == *id => {
+                        entity = Some(current);
+                    }
+                    crate::change::EntityDelta::Modified { new, .. } if new.id == *id => {
+                        entity = Some(new);
+                    }
+                    crate::change::EntityDelta::Removed(removed_id) if removed_id == *id => {
+                        entity = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(entity)
+    }
+    fn resolve_graph_at(
+        &self,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<ResolvedGraphState, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        Ok(replay_graph_state(changes))
+    }
     fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
     fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
     fn update_branch_head(
@@ -564,6 +609,15 @@ pub struct SubGraph {
     pub relations: Vec<Relation>,
 }
 
+/// Immutable committed graph state resolved at a specific semantic ref.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResolvedGraphState {
+    #[serde(default)]
+    pub entities: HashMap<EntityId, Entity>,
+    #[serde(default)]
+    pub relations: HashMap<RelationId, Relation>,
+}
+
 /// Filter for querying entities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityFilter {
@@ -572,6 +626,91 @@ pub struct EntityFilter {
     pub name_pattern: Option<String>,
     pub file_path: Option<FilePathId>,
     pub roles: Option<Vec<EntityRole>>,
+}
+
+fn collect_changes_topologically<G: ChangeStore + ?Sized>(
+    store: &G,
+    head: &SemanticChangeId,
+) -> std::result::Result<Vec<SemanticChange>, G::Error> {
+    fn visit<G: ChangeStore + ?Sized>(
+        store: &G,
+        id: &SemanticChangeId,
+        visited: &mut HashSet<SemanticChangeId>,
+        ordered: &mut Vec<SemanticChange>,
+    ) -> std::result::Result<(), G::Error> {
+        if !visited.insert(*id) {
+            return Ok(());
+        }
+        let Some(change) = store.get_change(id)? else {
+            return Ok(());
+        };
+
+        for parent in &change.parents {
+            visit(store, parent, visited, ordered)?;
+        }
+
+        ordered.push(change);
+        Ok(())
+    }
+
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::new();
+    visit(store, head, &mut visited, &mut ordered)?;
+    Ok(ordered)
+}
+
+fn replay_graph_state<I>(changes: I) -> ResolvedGraphState
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut state = ResolvedGraphState::default();
+
+    for change in changes {
+        for delta in change.entity_deltas {
+            match delta {
+                crate::change::EntityDelta::Added(entity) => {
+                    state.entities.insert(entity.id, entity);
+                }
+                crate::change::EntityDelta::Modified { new, .. } => {
+                    state.entities.insert(new.id, new);
+                }
+                crate::change::EntityDelta::Removed(entity_id) => {
+                    state.entities.remove(&entity_id);
+                    state
+                        .relations
+                        .retain(|_, relation| !relation_mentions_entity(relation, entity_id));
+                }
+            }
+        }
+
+        for delta in change.relation_deltas {
+            match delta {
+                crate::change::RelationDelta::Added(relation) => {
+                    state.relations.insert(relation.id, relation);
+                }
+                crate::change::RelationDelta::Removed(relation_id) => {
+                    state.relations.remove(&relation_id);
+                }
+            }
+        }
+    }
+
+    state
+}
+
+fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
+    change.entity_deltas.iter().any(|delta| match delta {
+        crate::change::EntityDelta::Added(entity) => entity.id == *entity_id,
+        crate::change::EntityDelta::Modified { old, new } => {
+            old.id == *entity_id || new.id == *entity_id
+        }
+        crate::change::EntityDelta::Removed(removed_id) => removed_id == entity_id,
+    })
+}
+
+fn relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
+    matches!(relation.src, GraphNodeId::Entity(id) if id == entity_id)
+        || matches!(relation.dst, GraphNodeId::Entity(id) if id == entity_id)
 }
 
 // ===========================================================================
