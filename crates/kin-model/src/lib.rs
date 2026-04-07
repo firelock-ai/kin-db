@@ -27,6 +27,7 @@ pub mod review;
 pub mod session;
 pub mod spec;
 pub mod stats;
+pub mod temporal;
 pub mod timestamp;
 pub mod verification;
 pub mod work;
@@ -56,8 +57,9 @@ pub use graph::{
     SubGraph, VerificationStore, WorkStore,
 };
 pub use ids::{
-    AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId, FilePathId,
-    Hash256, IntentId, LanguageId, RelationId, SemanticChangeId, SessionId, SpecId,
+    ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId,
+    EntityRevisionId, EvidenceId, FilePathId, Hash256, IntentId, LanguageId, RelationId,
+    RelationRevisionId, SemanticChangeId, SessionId, SpecId,
 };
 pub use layout::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
@@ -75,6 +77,7 @@ pub use review::{
 };
 pub use spec::Spec;
 pub use stats::GraphStats;
+pub use temporal::{ArtifactRevision, EntityRevision, RelationRevision};
 pub use timestamp::Timestamp;
 
 pub use provenance::{

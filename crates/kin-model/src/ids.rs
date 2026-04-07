@@ -58,6 +58,22 @@ impl fmt::Display for RelationId {
     }
 }
 
+/// Content-addressed identifier for an immutable relation revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct RelationRevisionId(pub Hash256);
+
+impl RelationRevisionId {
+    pub fn from_hash(hash: Hash256) -> Self {
+        Self(hash)
+    }
+}
+
+impl fmt::Display for RelationRevisionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Content-addressed identifier for a SemanticChange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticChangeId(pub Hash256);
@@ -74,6 +90,22 @@ impl fmt::Display for SemanticChangeId {
     }
 }
 
+/// Content-addressed identifier for an immutable entity revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct EntityRevisionId(pub Hash256);
+
+impl EntityRevisionId {
+    pub fn from_hash(hash: Hash256) -> Self {
+        Self(hash)
+    }
+}
+
+impl fmt::Display for EntityRevisionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// File path identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct FilePathId(pub String);
@@ -85,6 +117,22 @@ impl FilePathId {
 }
 
 impl fmt::Display for FilePathId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Content-addressed identifier for an immutable tracked-file revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactRevisionId(pub Hash256);
+
+impl ArtifactRevisionId {
+    pub fn from_hash(hash: Hash256) -> Self {
+        Self(hash)
+    }
+}
+
+impl fmt::Display for ArtifactRevisionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -367,5 +415,29 @@ mod tests {
         let json = serde_json::to_string(&hash).unwrap();
         let parsed: Hash256 = serde_json::from_str(&json).unwrap();
         assert_eq!(hash, parsed);
+    }
+
+    #[test]
+    fn entity_revision_id_display_roundtrip() {
+        let revision_id = EntityRevisionId::from_hash(Hash256::from_bytes([0x7a; 32]));
+        let printed = revision_id.to_string();
+        let parsed = Hash256::from_hex(&printed).unwrap();
+        assert_eq!(revision_id, EntityRevisionId::from_hash(parsed));
+    }
+
+    #[test]
+    fn relation_revision_id_display_roundtrip() {
+        let revision_id = RelationRevisionId::from_hash(Hash256::from_bytes([0x6b; 32]));
+        let printed = revision_id.to_string();
+        let parsed = Hash256::from_hex(&printed).unwrap();
+        assert_eq!(revision_id, RelationRevisionId::from_hash(parsed));
+    }
+
+    #[test]
+    fn artifact_revision_id_display_roundtrip() {
+        let revision_id = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x4c; 32]));
+        let printed = revision_id.to_string();
+        let parsed = Hash256::from_hex(&printed).unwrap();
+        assert_eq!(revision_id, ArtifactRevisionId::from_hash(parsed));
     }
 }
