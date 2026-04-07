@@ -10,6 +10,7 @@ use crate::review::{
     Review, ReviewAssignment, ReviewComment, ReviewDecision, ReviewDecisionState, ReviewDiscussion,
     ReviewDiscussionId, ReviewDiscussionState, ReviewFilter, ReviewId, ReviewNote, ReviewNoteId,
 };
+use crate::temporal::{ArtifactRevision, EntityRevision, RelationRevision};
 use crate::verification::{ContractCoverageSummary, MockHint, VerificationRun, VerificationRunId};
 use crate::work::{
     Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink, WorkScope,
@@ -124,7 +125,7 @@ pub trait EntityStore: Send + Sync {
         file_id: &FilePathId,
     ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
     fn list_file_layouts(&self)
-        -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
+    -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
     fn get_file_hash(
         &self,
         file_id: &FilePathId,
@@ -195,6 +196,15 @@ pub trait ChangeStore: Send + Sync {
         &self,
         id: &EntityId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    fn get_entity_revisions(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
+        let changes = self.get_entity_history(id)?;
+        Ok(derive_entity_revisions_from_changes(changes)
+            .remove(id)
+            .unwrap_or_default())
+    }
     fn find_merge_bases(
         &self,
         a: &SemanticChangeId,
@@ -221,32 +231,73 @@ pub trait ChangeStore: Send + Sync {
             .filter(|change| entity_is_touched_by_change(change, id))
             .collect())
     }
+    fn get_entity_revisions_at(
+        &self,
+        id: &EntityId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
+        let changes = self.get_entity_history_at(id, head)?;
+        Ok(derive_entity_revisions_from_changes(changes)
+            .remove(id)
+            .unwrap_or_default())
+    }
+    fn resolve_entity_revision_at(
+        &self,
+        id: &EntityId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Option<EntityRevision>, Self::Error> {
+        Ok(self
+            .get_entity_revisions_at(id, head)?
+            .into_iter()
+            .rev()
+            .find(|revision| revision.ended_by.is_none()))
+    }
+    fn get_relation_revisions_at(
+        &self,
+        id: &RelationId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<RelationRevision>, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        Ok(replay_relation_revisions(changes, id))
+    }
+    fn resolve_relation_revision_at(
+        &self,
+        id: &RelationId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Option<RelationRevision>, Self::Error> {
+        Ok(self
+            .get_relation_revisions_at(id, head)?
+            .into_iter()
+            .rev()
+            .find(|revision| revision.ended_by.is_none()))
+    }
+    fn get_artifact_revisions_at(
+        &self,
+        file_id: &FilePathId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<ArtifactRevision>, Self::Error> {
+        let changes = collect_changes_topologically(self, head)?;
+        Ok(replay_artifact_revisions(changes, file_id))
+    }
+    fn resolve_artifact_revision_at(
+        &self,
+        file_id: &FilePathId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Option<ArtifactRevision>, Self::Error> {
+        Ok(self
+            .get_artifact_revisions_at(file_id, head)?
+            .into_iter()
+            .rev()
+            .find(|revision| revision.ended_by.is_none()))
+    }
     fn resolve_entity_at(
         &self,
         id: &EntityId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Option<Entity>, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
-        let mut entity = None;
-
-        for change in changes {
-            for delta in change.entity_deltas {
-                match delta {
-                    crate::change::EntityDelta::Added(current) if current.id == *id => {
-                        entity = Some(current);
-                    }
-                    crate::change::EntityDelta::Modified { new, .. } if new.id == *id => {
-                        entity = Some(new);
-                    }
-                    crate::change::EntityDelta::Removed(removed_id) if removed_id == *id => {
-                        entity = None;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(entity)
+        Ok(self
+            .resolve_entity_revision_at(id, head)?
+            .map(|revision| revision.entity))
     }
     fn resolve_graph_at(
         &self,
@@ -623,6 +674,10 @@ pub struct ResolvedGraphState {
     pub entities: HashMap<EntityId, Entity>,
     #[serde(default)]
     pub relations: HashMap<RelationId, Relation>,
+    #[serde(default)]
+    pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
+    #[serde(default)]
+    pub file_tree: HashMap<FilePathId, Hash256>,
 }
 
 /// Filter for querying entities.
@@ -673,15 +728,49 @@ where
     let mut state = ResolvedGraphState::default();
 
     for change in changes {
+        let change_id = change.id;
         for delta in change.entity_deltas {
             match delta {
                 crate::change::EntityDelta::Added(entity) => {
+                    let previous_revision = mark_matching_entity_revision_ended(
+                        &mut state.entity_revisions,
+                        &entity,
+                        change_id,
+                    );
+                    state
+                        .entity_revisions
+                        .entry(entity.id)
+                        .or_default()
+                        .push(EntityRevision::new(
+                            entity.clone(),
+                            change_id,
+                            previous_revision,
+                        ));
                     state.entities.insert(entity.id, entity);
                 }
-                crate::change::EntityDelta::Modified { new, .. } => {
+                crate::change::EntityDelta::Modified { old, new } => {
+                    let previous_revision = mark_matching_entity_revision_ended(
+                        &mut state.entity_revisions,
+                        &old,
+                        change_id,
+                    );
+                    state
+                        .entity_revisions
+                        .entry(new.id)
+                        .or_default()
+                        .push(EntityRevision::new(
+                            new.clone(),
+                            change_id,
+                            previous_revision,
+                        ));
                     state.entities.insert(new.id, new);
                 }
                 crate::change::EntityDelta::Removed(entity_id) => {
+                    if let Some(entries) = state.entity_revisions.get_mut(&entity_id) {
+                        if let Some(previous) = entries.last_mut() {
+                            previous.mark_ended(change_id);
+                        }
+                    }
                     state.entities.remove(&entity_id);
                     state
                         .relations
@@ -700,9 +789,119 @@ where
                 }
             }
         }
+
+        for delta in change.artifact_deltas {
+            match delta.kind {
+                crate::change::ArtifactDeltaKind::Added
+                | crate::change::ArtifactDeltaKind::Modified => {
+                    if let Some(hash) = delta.new_hash {
+                        state.file_tree.insert(delta.file_id, hash);
+                    }
+                }
+                crate::change::ArtifactDeltaKind::Removed => {
+                    state.file_tree.remove(&delta.file_id);
+                }
+            }
+        }
     }
 
     state
+}
+
+pub fn derive_entity_revisions_from_changes<I>(changes: I) -> HashMap<EntityId, Vec<EntityRevision>>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    replay_graph_state(changes).entity_revisions
+}
+
+fn replay_relation_revisions<I>(changes: I, relation_id: &RelationId) -> Vec<RelationRevision>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut revisions: Vec<RelationRevision> = Vec::new();
+    let mut active_revision: Option<usize> = None;
+
+    for change in changes {
+        let change_id = change.id;
+        for delta in change.relation_deltas {
+            match delta {
+                crate::change::RelationDelta::Added(relation) if relation.id == *relation_id => {
+                    let previous_revision = active_revision
+                        .and_then(|index| revisions.get_mut(index))
+                        .map(|revision| {
+                            revision.mark_ended(change_id);
+                            revision.revision_id
+                        });
+                    revisions.push(RelationRevision::new(
+                        relation,
+                        change_id,
+                        previous_revision,
+                    ));
+                    active_revision = Some(revisions.len() - 1);
+                }
+                crate::change::RelationDelta::Removed(removed_id) if removed_id == *relation_id => {
+                    if let Some(index) = active_revision.take() {
+                        if let Some(revision) = revisions.get_mut(index) {
+                            revision.mark_ended(change_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    revisions
+}
+
+fn replay_artifact_revisions<I>(changes: I, file_id: &FilePathId) -> Vec<ArtifactRevision>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut revisions: Vec<ArtifactRevision> = Vec::new();
+    let mut active_revision: Option<usize> = None;
+
+    for change in changes {
+        let change_id = change.id;
+        for delta in change.artifact_deltas {
+            if delta.file_id != *file_id {
+                continue;
+            }
+
+            match delta.kind {
+                crate::change::ArtifactDeltaKind::Added
+                | crate::change::ArtifactDeltaKind::Modified => {
+                    let Some(hash) = delta.new_hash else {
+                        continue;
+                    };
+                    let previous_revision = active_revision
+                        .and_then(|index| revisions.get_mut(index))
+                        .map(|revision| {
+                            revision.mark_ended(change_id);
+                            revision.revision_id
+                        });
+                    revisions.push(ArtifactRevision::new(
+                        delta.file_id,
+                        hash,
+                        delta.kind,
+                        change_id,
+                        previous_revision,
+                    ));
+                    active_revision = Some(revisions.len() - 1);
+                }
+                crate::change::ArtifactDeltaKind::Removed => {
+                    if let Some(index) = active_revision.take() {
+                        if let Some(revision) = revisions.get_mut(index) {
+                            revision.mark_ended(change_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    revisions
 }
 
 fn replay_file_tree<I>(changes: I) -> HashMap<FilePathId, Hash256>
@@ -738,6 +937,47 @@ fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) ->
         }
         crate::change::EntityDelta::Removed(removed_id) => removed_id == entity_id,
     })
+}
+
+fn mark_matching_entity_revision_ended(
+    revisions: &mut HashMap<EntityId, Vec<EntityRevision>>,
+    entity: &Entity,
+    ended_by: SemanticChangeId,
+) -> Option<EntityRevisionId> {
+    revisions
+        .get_mut(&entity.id)
+        .and_then(|entries| {
+            let match_index = entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, revision)| entities_match_for_revision(&revision.entity, entity))
+                .map(|(index, _)| index)
+                .or_else(|| entries.len().checked_sub(1));
+            match_index.and_then(|index| entries.get_mut(index))
+        })
+        .map(|revision| {
+            revision.mark_ended(ended_by);
+            revision.revision_id
+        })
+}
+
+fn entities_match_for_revision(left: &Entity, right: &Entity) -> bool {
+    left.id == right.id
+        && left.kind == right.kind
+        && left.name == right.name
+        && left.language == right.language
+        && left.fingerprint.ast_hash == right.fingerprint.ast_hash
+        && left.fingerprint.signature_hash == right.fingerprint.signature_hash
+        && left.fingerprint.behavior_hash == right.fingerprint.behavior_hash
+        && left.file_origin == right.file_origin
+        && left.span == right.span
+        && left.signature == right.signature
+        && left.visibility == right.visibility
+        && left.role == right.role
+        && left.doc_summary == right.doc_summary
+        && left.metadata.extra == right.metadata.extra
+        && left.lineage_parent == right.lineage_parent
 }
 
 fn relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
