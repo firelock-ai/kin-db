@@ -5,6 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use std::collections::HashMap;
+
 use crate::{
     ArtifactDeltaKind, ArtifactRevisionId, Entity, EntityId, EntityRevisionId, FilePathId, Hash256,
     Relation, RelationId, RelationRevisionId, SemanticChangeId,
@@ -177,6 +179,41 @@ impl ArtifactRevisionId {
     }
 }
 
+/// Check whether an entity (or relation/artifact revision) was active at a
+/// given reference change, using the topological ordinal map.
+///
+/// Returns `true` when:
+/// - `introduced_ord <= ref_ord`, AND
+/// - `ended_by` is `None` OR `ended_ord > ref_ord`
+///
+/// Returns `false` if any of the provided change IDs are missing from
+/// `change_order` (unknown/out-of-scope change).
+pub fn is_active_at(
+    introduced_by: &SemanticChangeId,
+    ended_by: Option<&SemanticChangeId>,
+    ref_change: &SemanticChangeId,
+    change_order: &HashMap<SemanticChangeId, u64>,
+) -> bool {
+    let Some(&introduced_ord) = change_order.get(introduced_by) else {
+        return false;
+    };
+    let Some(&ref_ord) = change_order.get(ref_change) else {
+        return false;
+    };
+    if introduced_ord > ref_ord {
+        return false;
+    }
+    if let Some(ended) = ended_by {
+        let Some(&ended_ord) = change_order.get(ended) else {
+            return false;
+        };
+        if ended_ord <= ref_ord {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +285,68 @@ mod tests {
         revision.mark_ended(later);
 
         assert_eq!(revision.ended_by, Some(remove));
+    }
+
+    fn make_change_order() -> (
+        SemanticChangeId,
+        SemanticChangeId,
+        SemanticChangeId,
+        HashMap<SemanticChangeId, u64>,
+    ) {
+        let c0 = SemanticChangeId::from_hash(Hash256::from_bytes([0xA0; 32]));
+        let c1 = SemanticChangeId::from_hash(Hash256::from_bytes([0xA1; 32]));
+        let c2 = SemanticChangeId::from_hash(Hash256::from_bytes([0xA2; 32]));
+        let mut order = HashMap::new();
+        order.insert(c0, 0);
+        order.insert(c1, 1);
+        order.insert(c2, 2);
+        (c0, c1, c2, order)
+    }
+
+    #[test]
+    fn is_active_at_introduced_before_ref() {
+        let (c0, c1, _c2, order) = make_change_order();
+        assert!(super::is_active_at(&c0, None, &c1, &order));
+    }
+
+    #[test]
+    fn is_active_at_introduced_at_ref() {
+        let (c0, _c1, _c2, order) = make_change_order();
+        assert!(super::is_active_at(&c0, None, &c0, &order));
+    }
+
+    #[test]
+    fn is_active_at_introduced_after_ref() {
+        let (_c0, c1, _c2, order) = make_change_order();
+        assert!(!super::is_active_at(&c1, None, &_c0, &order));
+    }
+
+    #[test]
+    fn is_active_at_ended_before_ref() {
+        let (c0, c1, c2, order) = make_change_order();
+        // introduced at c0, ended at c1, queried at c2 => not active
+        assert!(!super::is_active_at(&c0, Some(&c1), &c2, &order));
+    }
+
+    #[test]
+    fn is_active_at_ended_at_ref() {
+        let (c0, c1, _c2, order) = make_change_order();
+        // introduced at c0, ended at c1, queried at c1 => not active (ended_ord <= ref_ord)
+        assert!(!super::is_active_at(&c0, Some(&c1), &c1, &order));
+    }
+
+    #[test]
+    fn is_active_at_ended_after_ref() {
+        let (c0, c1, c2, order) = make_change_order();
+        // introduced at c0, ended at c2, queried at c1 => active
+        assert!(super::is_active_at(&c0, Some(&c2), &c1, &order));
+    }
+
+    #[test]
+    fn is_active_at_unknown_change_returns_false() {
+        let (c0, _c1, _c2, order) = make_change_order();
+        let unknown = SemanticChangeId::from_hash(Hash256::from_bytes([0xFF; 32]));
+        assert!(!super::is_active_at(&unknown, None, &c0, &order));
+        assert!(!super::is_active_at(&c0, None, &unknown, &order));
     }
 }
