@@ -77,7 +77,7 @@ pub use review::{
 };
 pub use spec::Spec;
 pub use stats::GraphStats;
-pub use temporal::{ArtifactRevision, EntityRevision, RelationRevision};
+pub use temporal::{is_active_at, ArtifactRevision, EntityRevision, RelationRevision};
 pub use timestamp::Timestamp;
 
 pub use provenance::{

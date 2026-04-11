@@ -225,7 +225,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
+        let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(changes
             .into_iter()
             .filter(|change| entity_is_touched_by_change(change, id))
@@ -257,7 +257,7 @@ pub trait ChangeStore: Send + Sync {
         id: &RelationId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<RelationRevision>, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
+        let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(replay_relation_revisions(changes, id))
     }
     fn resolve_relation_revision_at(
@@ -276,7 +276,7 @@ pub trait ChangeStore: Send + Sync {
         file_id: &FilePathId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<ArtifactRevision>, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
+        let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(replay_artifact_revisions(changes, file_id))
     }
     fn resolve_artifact_revision_at(
@@ -303,15 +303,27 @@ pub trait ChangeStore: Send + Sync {
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedGraphState, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
+        let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(replay_graph_state(changes))
     }
     fn resolve_file_tree_at(
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<HashMap<FilePathId, Hash256>, Self::Error> {
-        let changes = collect_changes_topologically(self, head)?;
+        let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(replay_file_tree(changes))
+    }
+    /// Build a topological ordinal map for all changes reachable from `head`.
+    ///
+    /// Maps each `SemanticChangeId` to its ordinal position in the DAG
+    /// (0 = oldest/genesis, N = newest/head). Used by temporal scope queries
+    /// to determine whether an entity was active at a given ref.
+    fn build_change_order_at(
+        &self,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<HashMap<SemanticChangeId, u64>, Self::Error> {
+        let (_changes, order) = collect_changes_topologically(self, head)?;
+        Ok(order)
     }
     fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
     fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
@@ -699,10 +711,15 @@ pub struct EntityFilter {
     pub roles: Option<Vec<EntityRole>>,
 }
 
+/// Topologically ordered changes with an ordinal position map.
+///
+/// The ordinal map assigns 0 to the oldest (genesis) change and N to the
+/// newest (head). This total order allows temporal queries over the DAG
+/// even though `SemanticChangeId` is a content hash with no natural ordering.
 fn collect_changes_topologically<G: ChangeStore + ?Sized>(
     store: &G,
     head: &SemanticChangeId,
-) -> std::result::Result<Vec<SemanticChange>, G::Error> {
+) -> std::result::Result<(Vec<SemanticChange>, HashMap<SemanticChangeId, u64>), G::Error> {
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
     enum Frame {
@@ -729,7 +746,14 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
             Frame::Emit(change) => ordered.push(change),
         }
     }
-    Ok(ordered)
+
+    let change_order: HashMap<SemanticChangeId, u64> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, change)| (change.id, i as u64))
+        .collect();
+
+    Ok((ordered, change_order))
 }
 
 fn replay_graph_state<I>(changes: I) -> ResolvedGraphState
