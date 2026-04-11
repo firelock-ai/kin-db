@@ -678,6 +678,15 @@ pub struct ResolvedGraphState {
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
     #[serde(default)]
     pub file_tree: HashMap<FilePathId, Hash256>,
+    /// Entities that were explicitly removed by a semantic change.
+    /// Maps entity ID to the removed entity and the change that removed it.
+    #[serde(default)]
+    pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
+    /// Relations that were explicitly removed by a semantic change or pruned
+    /// because a referenced entity was removed.
+    /// Maps relation ID to the removed relation and the change that caused removal.
+    #[serde(default)]
+    pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
 }
 
 /// Filter for querying entities.
@@ -773,10 +782,21 @@ where
                             previous.mark_ended(change_id);
                         }
                     }
-                    state.entities.remove(&entity_id);
-                    state
+                    if let Some(entity) = state.entities.remove(&entity_id) {
+                        state.entity_tombstones.insert(entity_id, (entity, change_id));
+                    }
+                    // Prune dangling relations and tombstone them.
+                    let dangling: Vec<RelationId> = state
                         .relations
-                        .retain(|_, relation| !relation_mentions_entity(relation, entity_id));
+                        .iter()
+                        .filter(|(_, rel)| relation_mentions_entity(rel, entity_id))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for rel_id in dangling {
+                        if let Some(relation) = state.relations.remove(&rel_id) {
+                            state.relation_tombstones.insert(rel_id, (relation, change_id));
+                        }
+                    }
                 }
             }
         }
@@ -787,7 +807,9 @@ where
                     state.relations.insert(relation.id, relation);
                 }
                 crate::change::RelationDelta::Removed(relation_id) => {
-                    state.relations.remove(&relation_id);
+                    if let Some(relation) = state.relations.remove(&relation_id) {
+                        state.relation_tombstones.insert(relation_id, (relation, change_id));
+                    }
                 }
             }
         }
@@ -1674,4 +1696,228 @@ impl<G: SessionStore> SessionStore for &G {
 /// This allows `&InMemoryGraph` (from Arc::deref) to satisfy `G: GraphStore` bounds.
 impl<G: GraphStore> GraphStore for &G {
     type Error = <G as GraphStore>::Error;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change::{EntityDelta, RelationDelta, SemanticChange};
+    use crate::entity::{
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+    };
+    use crate::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use crate::timestamp::Timestamp;
+
+    fn make_change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    fn make_entity(id: EntityId, name: &str) -> Entity {
+        Entity {
+            id,
+            kind: EntityKind::Function,
+            name: name.into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: Default::default(),
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn make_relation(id: RelationId, src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id,
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        }
+    }
+
+    fn make_semantic_change(
+        id: SemanticChangeId,
+        parents: Vec<SemanticChangeId>,
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> SemanticChange {
+        SemanticChange {
+            id,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId("test".into()),
+            message: "test change".into(),
+            entity_deltas,
+            relation_deltas,
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    #[test]
+    fn entity_tombstone_on_removal() {
+        let c1 = make_change_id(1);
+        let c2 = make_change_id(2);
+        let c3 = make_change_id(3);
+
+        let entity_a_id = EntityId::new();
+        let entity_b_id = EntityId::new();
+        let entity_a = make_entity(entity_a_id, "a");
+        let entity_b = make_entity(entity_b_id, "b");
+
+        let changes = vec![
+            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a.clone())], vec![]),
+            make_semantic_change(c2, vec![c1], vec![EntityDelta::Added(entity_b.clone())], vec![]),
+            make_semantic_change(c3, vec![c2], vec![EntityDelta::Removed(entity_a_id)], vec![]),
+        ];
+
+        let state = replay_graph_state(changes);
+
+        assert!(
+            !state.entities.contains_key(&entity_a_id),
+            "entity A should be removed from entities"
+        );
+        assert!(
+            state.entities.contains_key(&entity_b_id),
+            "entity B should still be in entities"
+        );
+        assert!(
+            state.entity_tombstones.contains_key(&entity_a_id),
+            "entity A should be in tombstones"
+        );
+        let (tombstoned_entity, removal_change) =
+            state.entity_tombstones.get(&entity_a_id).unwrap();
+        assert_eq!(tombstoned_entity.name, "a");
+        assert_eq!(*removal_change, c3);
+        assert!(
+            state.entity_tombstones.is_empty()
+                || !state.entity_tombstones.contains_key(&entity_b_id),
+            "entity B should NOT be in tombstones"
+        );
+    }
+
+    #[test]
+    fn no_tombstones_before_removal() {
+        let c1 = make_change_id(1);
+        let c2 = make_change_id(2);
+
+        let entity_a_id = EntityId::new();
+        let entity_b_id = EntityId::new();
+        let entity_a = make_entity(entity_a_id, "a");
+        let entity_b = make_entity(entity_b_id, "b");
+
+        let changes = vec![
+            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(c2, vec![c1], vec![EntityDelta::Added(entity_b)], vec![]),
+        ];
+
+        let state = replay_graph_state(changes);
+
+        assert!(state.entities.contains_key(&entity_a_id));
+        assert!(state.entities.contains_key(&entity_b_id));
+        assert!(state.entity_tombstones.is_empty());
+        assert!(state.relation_tombstones.is_empty());
+    }
+
+    #[test]
+    fn relation_tombstone_on_explicit_removal() {
+        let c1 = make_change_id(1);
+        let c2 = make_change_id(2);
+        let c3 = make_change_id(3);
+
+        let entity_a_id = EntityId::new();
+        let entity_b_id = EntityId::new();
+        let rel_id = RelationId::new();
+
+        let entity_a = make_entity(entity_a_id, "a");
+        let entity_b = make_entity(entity_b_id, "b");
+        let relation = make_relation(rel_id, entity_a_id, entity_b_id);
+
+        let changes = vec![
+            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c2,
+                vec![c1],
+                vec![EntityDelta::Added(entity_b)],
+                vec![RelationDelta::Added(relation)],
+            ),
+            make_semantic_change(c3, vec![c2], vec![], vec![RelationDelta::Removed(rel_id)]),
+        ];
+
+        let state = replay_graph_state(changes);
+
+        assert!(
+            !state.relations.contains_key(&rel_id),
+            "relation should be removed from active relations"
+        );
+        assert!(
+            state.relation_tombstones.contains_key(&rel_id),
+            "relation should be in tombstones"
+        );
+        let (tombstoned_rel, removal_change) = state.relation_tombstones.get(&rel_id).unwrap();
+        assert_eq!(tombstoned_rel.id, rel_id);
+        assert_eq!(*removal_change, c3);
+    }
+
+    #[test]
+    fn dangling_relation_tombstoned_on_entity_removal() {
+        let c1 = make_change_id(1);
+        let c2 = make_change_id(2);
+        let c3 = make_change_id(3);
+
+        let entity_a_id = EntityId::new();
+        let entity_b_id = EntityId::new();
+        let rel_id = RelationId::new();
+
+        let entity_a = make_entity(entity_a_id, "a");
+        let entity_b = make_entity(entity_b_id, "b");
+        let relation = make_relation(rel_id, entity_a_id, entity_b_id);
+
+        let changes = vec![
+            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c2,
+                vec![c1],
+                vec![EntityDelta::Added(entity_b)],
+                vec![RelationDelta::Added(relation)],
+            ),
+            make_semantic_change(c3, vec![c2], vec![EntityDelta::Removed(entity_a_id)], vec![]),
+        ];
+
+        let state = replay_graph_state(changes);
+
+        assert!(
+            state.entity_tombstones.contains_key(&entity_a_id),
+            "entity A should be tombstoned"
+        );
+        assert!(
+            state.relation_tombstones.contains_key(&rel_id),
+            "relation should be tombstoned because entity A was removed"
+        );
+        let (_, removal_change) = state.relation_tombstones.get(&rel_id).unwrap();
+        assert_eq!(
+            *removal_change, c3,
+            "dangling relation tombstone should reference the change that removed the entity"
+        );
+    }
 }
