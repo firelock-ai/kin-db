@@ -807,7 +807,9 @@ where
                         }
                     }
                     if let Some(entity) = state.entities.remove(&entity_id) {
-                        state.entity_tombstones.insert(entity_id, (entity, change_id));
+                        state
+                            .entity_tombstones
+                            .insert(entity_id, (entity, change_id));
                     }
                     // Prune dangling relations and tombstone them.
                     let dangling: Vec<RelationId> = state
@@ -818,7 +820,9 @@ where
                         .collect();
                     for rel_id in dangling {
                         if let Some(relation) = state.relations.remove(&rel_id) {
-                            state.relation_tombstones.insert(rel_id, (relation, change_id));
+                            state
+                                .relation_tombstones
+                                .insert(rel_id, (relation, change_id));
                         }
                     }
                 }
@@ -832,7 +836,9 @@ where
                 }
                 crate::change::RelationDelta::Removed(relation_id) => {
                     if let Some(relation) = state.relations.remove(&relation_id) {
-                        state.relation_tombstones.insert(relation_id, (relation, change_id));
+                        state
+                            .relation_tombstones
+                            .insert(relation_id, (relation, change_id));
                     }
                 }
             }
@@ -1810,9 +1816,24 @@ mod tests {
         let entity_b = make_entity(entity_b_id, "b");
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a.clone())], vec![]),
-            make_semantic_change(c2, vec![c1], vec![EntityDelta::Added(entity_b.clone())], vec![]),
-            make_semantic_change(c3, vec![c2], vec![EntityDelta::Removed(entity_a_id)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added(entity_a.clone())],
+                vec![],
+            ),
+            make_semantic_change(
+                c2,
+                vec![c1],
+                vec![EntityDelta::Added(entity_b.clone())],
+                vec![],
+            ),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                vec![EntityDelta::Removed(entity_a_id)],
+                vec![],
+            ),
         ];
 
         let state = replay_graph_state(changes);
@@ -1925,7 +1946,12 @@ mod tests {
                 vec![EntityDelta::Added(entity_b)],
                 vec![RelationDelta::Added(relation)],
             ),
-            make_semantic_change(c3, vec![c2], vec![EntityDelta::Removed(entity_a_id)], vec![]),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                vec![EntityDelta::Removed(entity_a_id)],
+                vec![],
+            ),
         ];
 
         let state = replay_graph_state(changes);
