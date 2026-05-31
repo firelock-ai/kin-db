@@ -10,7 +10,9 @@ use uuid::Uuid;
 pub use kin_blobs::Hash256;
 
 /// Unique identifier for an Entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct EntityId(pub Uuid);
 
 impl EntityId {
