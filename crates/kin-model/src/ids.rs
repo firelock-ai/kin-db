@@ -19,6 +19,20 @@ impl EntityId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Deterministically derive an entity ID from its semantic identity so the
+    /// same code entity gets the same ID across re-index and re-init. This is
+    /// the graph-first contract: entities are addressed by content, not by a
+    /// random per-process UUID. The key combines the locating fields that
+    /// uniquely identify an entity within a repo snapshot.
+    pub fn from_content(file_path: &str, name: &str, kind: &str, start_line: u32) -> Self {
+        const NAMESPACE: Uuid = Uuid::from_bytes([
+            0x6b, 0x69, 0x6e, 0x2d, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x2d, 0x69, 0x64, 0x76,
+            0x35, 0x00,
+        ]);
+        let key = format!("{file_path}\u{1f}{kind}\u{1f}{name}\u{1f}{start_line}");
+        Self(Uuid::new_v5(&NAMESPACE, key.as_bytes()))
+    }
 }
 
 impl Default for EntityId {
@@ -45,6 +59,19 @@ impl RelationId {
     /// Create a RelationId from raw bytes (for deterministic ID generation).
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Uuid::from_bytes(bytes))
+    }
+
+    /// Deterministically derive a relation ID from its semantic identity
+    /// (source id, destination id, kind) so the same edge gets the same ID
+    /// across re-index and re-init — the graph-first content-addressed
+    /// contract, mirroring `EntityId::from_content`.
+    pub fn from_content(src: &str, dst: &str, kind: &str) -> Self {
+        const NAMESPACE: Uuid = Uuid::from_bytes([
+            0x6b, 0x69, 0x6e, 0x2d, 0x72, 0x65, 0x6c, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x69, 0x64,
+            0x76, 0x35,
+        ]);
+        let key = format!("{src}\u{1f}{dst}\u{1f}{kind}");
+        Self(Uuid::new_v5(&NAMESPACE, key.as_bytes()))
     }
 }
 
