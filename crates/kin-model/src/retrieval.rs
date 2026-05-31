@@ -13,7 +13,9 @@ const ARTIFACT_NAMESPACE: Uuid = Uuid::from_u128(0x91c11f2ce3d14f8b8a9f0fb8b1972
 ///
 /// Artifact IDs are derived from graph-owned file paths so the same tracked
 /// artifact produces the same retrieval ID across re-index and re-init.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ArtifactId(pub Uuid);
 
 impl ArtifactId {
@@ -36,7 +38,9 @@ impl ArtifactId {
 ///   and can contribute lexical, semantic, or file-projection evidence.
 /// - Raw filesystem paths, projection outputs, and storage-only records are not
 ///   admitted. Retrieval remains graph-first and projection-second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub enum RetrievalKey {
     Entity(EntityId),
     Artifact(ArtifactId),
