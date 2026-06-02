@@ -1,3 +1,5 @@
+> **Umbrella guidance:** the workspace-root `AGENTS.md` is the source of truth for cross-repo thesis, boundaries, and rules. This file is the repo-specific authority for `kin-db`.
+
 # KinDB
 
 Purpose-built, embeddable code graph database in Rust. Designed for kin — a semantic VCS that replaces file-based version control with a graph of entities and relationships.
