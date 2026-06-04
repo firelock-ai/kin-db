@@ -34,7 +34,9 @@ pub mod work;
 
 // Re-export all public types at crate root for convenience.
 pub use branch::{Branch, GraphOverlay, MergeState, WorkingCopy};
-pub use change::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};
+pub use change::{
+    ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange, TransactionDelta,
+};
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
     AnnotationEntry, ArtifactContextEntry, ArtifactContextKind, ContextEntry, ContextPack,

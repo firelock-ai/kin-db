@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use crate::branch::Branch;
-use crate::change::SemanticChange;
+use crate::change::{SemanticChange, TransactionDelta};
 use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
@@ -131,6 +131,37 @@ pub trait EntityStore: Send + Sync {
         file_id: &FilePathId,
     ) -> std::result::Result<Option<Hash256>, Self::Error>;
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
+
+    /// Apply multiple transactional mutations atomically to the graph store.
+    fn apply_transaction_delta(
+        &self,
+        delta: &TransactionDelta,
+    ) -> std::result::Result<(), Self::Error> {
+        for ent_delta in &delta.entity_deltas {
+            match ent_delta {
+                crate::change::EntityDelta::Added(entity) => {
+                    self.upsert_entity(entity)?;
+                }
+                crate::change::EntityDelta::Modified { old: _, new } => {
+                    self.upsert_entity(new)?;
+                }
+                crate::change::EntityDelta::Removed(id) => {
+                    self.remove_entity(id)?;
+                }
+            }
+        }
+        for rel_delta in &delta.relation_deltas {
+            match rel_delta {
+                crate::change::RelationDelta::Added(relation) => {
+                    self.upsert_relation(relation)?;
+                }
+                crate::change::RelationDelta::Removed(id) => {
+                    self.remove_relation(id)?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Batch-insert entities with a single lock acquisition and one deferred
     /// text-index refresh.  The default falls back to per-entity `upsert_entity`.
