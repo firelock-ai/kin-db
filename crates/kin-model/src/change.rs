@@ -48,6 +48,14 @@ pub enum RelationDelta {
     Removed(RelationId),
 }
 
+/// Delta for a batch of transactional graph changes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TransactionDelta {
+    pub entity_deltas: Vec<EntityDelta>,
+    pub relation_deltas: Vec<RelationDelta>,
+}
+
+
 /// Delta for a non-entity file within a SemanticChange.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactDelta {
