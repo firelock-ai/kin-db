@@ -75,7 +75,14 @@ pub trait EntityStore: Send + Sync {
     fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
     fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
     fn remove_entity(&self, id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn remove_entities_batch(&self, ids: &[EntityId]) -> std::result::Result<(), Self::Error> {
+        for id in ids {
+            self.remove_entity(id)?;
+        }
+        Ok(())
+    }
     fn remove_relation(&self, id: &RelationId) -> std::result::Result<(), Self::Error>;
+
 
     // Shallow file tracking (C2 tier)
     fn upsert_shallow_file(
@@ -1152,7 +1159,11 @@ impl<G: EntityStore> EntityStore for &G {
     fn remove_entity(&self, id: &EntityId) -> std::result::Result<(), Self::Error> {
         (**self).remove_entity(id)
     }
+    fn remove_entities_batch(&self, ids: &[EntityId]) -> std::result::Result<(), Self::Error> {
+        (**self).remove_entities_batch(ids)
+    }
     fn remove_relation(&self, id: &RelationId) -> std::result::Result<(), Self::Error> {
+
         (**self).remove_relation(id)
     }
     fn upsert_shallow_file(
