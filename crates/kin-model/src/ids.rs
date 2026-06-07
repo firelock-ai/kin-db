@@ -120,7 +120,7 @@ impl fmt::Display for SemanticChangeId {
 }
 
 /// Content-addressed identifier for an immutable entity revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 pub struct EntityRevisionId(pub Hash256);
 
 impl EntityRevisionId {
@@ -152,7 +152,7 @@ impl fmt::Display for FilePathId {
 }
 
 /// Content-addressed identifier for an immutable tracked-file revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactRevisionId(pub Hash256);
 
 impl ArtifactRevisionId {

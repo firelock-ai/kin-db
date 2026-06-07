@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ids::{EntityId, FilePathId};
+use crate::ids::{ArtifactRevisionId, EntityId, EntityRevisionId, FilePathId};
 
 const ARTIFACT_NAMESPACE: Uuid = Uuid::from_u128(0x91c11f2ce3d14f8b8a9f0fb8b1972b3a);
 
@@ -36,6 +36,8 @@ impl ArtifactId {
 /// - `Artifact` admits graph-owned non-entity file objects that already exist in
 ///   graph state (`ShallowTrackedFile`, `StructuredArtifact`, `OpaqueArtifact`)
 ///   and can contribute lexical, semantic, or file-projection evidence.
+/// - `EntityRevision` admits deterministic content-addressed revisions of semantic entities.
+/// - `ArtifactRevision` admits deterministic content-addressed revisions of files/artifacts.
 /// - Raw filesystem paths, projection outputs, and storage-only records are not
 ///   admitted. Retrieval remains graph-first and projection-second.
 #[derive(
@@ -44,6 +46,8 @@ impl ArtifactId {
 pub enum RetrievalKey {
     Entity(EntityId),
     Artifact(ArtifactId),
+    EntityRevision(EntityRevisionId),
+    ArtifactRevision(ArtifactRevisionId),
 }
 
 impl From<EntityId> for RetrievalKey {
@@ -55,6 +59,18 @@ impl From<EntityId> for RetrievalKey {
 impl From<ArtifactId> for RetrievalKey {
     fn from(value: ArtifactId) -> Self {
         Self::Artifact(value)
+    }
+}
+
+impl From<EntityRevisionId> for RetrievalKey {
+    fn from(value: EntityRevisionId) -> Self {
+        Self::EntityRevision(value)
+    }
+}
+
+impl From<ArtifactRevisionId> for RetrievalKey {
+    fn from(value: ArtifactRevisionId) -> Self {
+        Self::ArtifactRevision(value)
     }
 }
 
