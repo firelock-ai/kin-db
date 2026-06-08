@@ -53,6 +53,7 @@ pub enum EntityKind {
     EnumVariant,
     Constant,
     StaticVar,
+    Macro,
 }
 
 /// Kin's identity moat. Survives renames, moves, formatting.
@@ -166,6 +167,7 @@ mod tests {
             EntityKind::EnumVariant,
             EntityKind::Constant,
             EntityKind::StaticVar,
+            EntityKind::Macro,
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
