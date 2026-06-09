@@ -179,8 +179,10 @@ fn default_fence_epoch() -> u64 {
 pub enum RemoteRelationKind {
     Calls,
     Imports,
+    Includes,
     Contains,
     References,
+    UsesMacro,
     Implements,
     Extends,
     Overrides,
@@ -207,8 +209,10 @@ impl From<RelationKind> for RemoteRelationKind {
         match value {
             RelationKind::Calls => Self::Calls,
             RelationKind::Imports => Self::Imports,
+            RelationKind::Includes => Self::Includes,
             RelationKind::Contains => Self::Contains,
             RelationKind::References => Self::References,
+            RelationKind::UsesMacro => Self::UsesMacro,
             RelationKind::Implements => Self::Implements,
             RelationKind::Extends => Self::Extends,
             RelationKind::Tests => Self::Tests,
@@ -237,8 +241,10 @@ impl From<RemoteRelationKind> for RelationKind {
         match value {
             RemoteRelationKind::Calls => Self::Calls,
             RemoteRelationKind::Imports => Self::Imports,
+            RemoteRelationKind::Includes => Self::Includes,
             RemoteRelationKind::Contains => Self::Contains,
             RemoteRelationKind::References => Self::References,
+            RemoteRelationKind::UsesMacro => Self::UsesMacro,
             RemoteRelationKind::Implements => Self::Implements,
             RemoteRelationKind::Extends => Self::Extends,
             RemoteRelationKind::Tests => Self::Tests,

@@ -83,7 +83,6 @@ pub trait EntityStore: Send + Sync {
     }
     fn remove_relation(&self, id: &RelationId) -> std::result::Result<(), Self::Error>;
 
-
     // Shallow file tracking (C2 tier)
     fn upsert_shallow_file(
         &self,
@@ -1163,7 +1162,6 @@ impl<G: EntityStore> EntityStore for &G {
         (**self).remove_entities_batch(ids)
     }
     fn remove_relation(&self, id: &RelationId) -> std::result::Result<(), Self::Error> {
-
         (**self).remove_relation(id)
     }
     fn upsert_shallow_file(
@@ -1820,6 +1818,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         }
     }
 

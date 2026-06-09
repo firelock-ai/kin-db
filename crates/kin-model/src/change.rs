@@ -55,7 +55,6 @@ pub struct TransactionDelta {
     pub relation_deltas: Vec<RelationDelta>,
 }
 
-
 /// Delta for a non-entity file within a SemanticChange.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactDelta {
