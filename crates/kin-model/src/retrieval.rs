@@ -19,11 +19,20 @@ const ARTIFACT_NAMESPACE: Uuid = Uuid::from_u128(0x91c11f2ce3d14f8b8a9f0fb8b1972
 pub struct ArtifactId(pub Uuid);
 
 impl ArtifactId {
+    /// Create a new graph-assigned artifact ID.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
     /// Deterministically derive an artifact ID from a graph-owned file path.
+    /// DEPRECATED: Use graph-assigned IDs via the artifact index lookup.
+    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
     pub fn from_path(path: &str) -> Self {
         Self(Uuid::new_v5(&ARTIFACT_NAMESPACE, path.as_bytes()))
     }
 
+    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
     pub fn from_file_id(file_id: &FilePathId) -> Self {
         Self::from_path(&file_id.0)
     }
@@ -82,6 +91,7 @@ pub trait RetrievalKeyFileResolver {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{ArtifactId, RetrievalKey};
 
