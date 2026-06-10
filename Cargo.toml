@@ -2,7 +2,7 @@
 # Copyright 2026 Firelock, LLC
 
 [workspace]
-members = ["crates/kin-db", "crates/kin-model"]
+members = ["crates/kin-db", ]
 resolver = "2"
 
 [workspace.package]
