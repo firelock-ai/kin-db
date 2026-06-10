@@ -6,6 +6,9 @@ cd "$repo_root"
 
 registry_url="${KINLAB_CARGO_REGISTRY_URL:-https://kinlab.ai}"
 registry_url="${registry_url%/}"
+# The kin cargo registry now REQUIRES this token to publish: the daemon fails
+# closed (rejects publishes) when its KIN_REGISTRY_CARGO_TOKEN is unset, and the
+# token sent here must match it. Reads remain open. Provided in CI via secret.
 registry_token="${KINLAB_CARGO_TOKEN:-${KINLAB_TOKEN:-}}"
 tag_name="${TAG_NAME:-${GITHUB_REF_NAME:-}}"
 dry_run="${DRY_RUN:-0}"
