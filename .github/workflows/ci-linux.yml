@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Linux build + test for the kin-db graph engine.
+#
+# kin-db is the pure-Rust semantic engine (graph storage, snapshots, indexing,
+# text + vector search). Its default feature set (`vector` + `embeddings`) runs
+# transformer inference on CPU via kin-infer, so the whole workspace builds and
+# tests on Linux. The macOS-only `metal` feature is deliberately NOT enabled
+# here: it pulls the `metal`/`objc2`/`block` crates, which only exist on
+# cfg(target_os = "macos") and fail to compile on Linux (unresolved crate).
+#
+# This is a dedicated, additive workflow (it does not modify ci.yml). It exists
+# because agents and CI runners live on Linux, so the engine must have a green
+# Linux signal of its own.
+name: CI (Linux)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-build-test:
+    name: Linux Build & Test (no Metal)
+    runs-on: ubuntu-latest
+    steps:
+      # kin-db's committed .cargo/config.toml patches the kin-registry crates
+      # (kin-infer / kin-vector / kin-search / kin-blobs) to ../kin-* sibling
+      # checkouts. Lay the repos out as sibling directories so those patch paths
+      # resolve without needing access to the private cargo registry.
+      - name: Checkout kin-db
+        uses: actions/checkout@v4
+        with:
+          path: kin-db
+
+      - name: Checkout kin-infer
+        uses: actions/checkout@v4
+        with:
+          repository: firelock-ai/kin-infer
+          path: kin-infer
+
+      - name: Checkout kin-vector
+        uses: actions/checkout@v4
+        with:
+          repository: firelock-ai/kin-vector
+          path: kin-vector
+
+      - name: Checkout kin-search
+        uses: actions/checkout@v4
+        with:
+          repository: firelock-ai/kin-search
+          path: kin-search
+
+      - name: Checkout kin-blobs
+        uses: actions/checkout@v4
+        with:
+          repository: firelock-ai/kin-blobs
+          path: kin-blobs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kin-db/target
+          key: ${{ runner.os }}-cargo-linux-${{ hashFiles('kin-db/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-linux-
+
+      # Default features only (vector + embeddings, CPU inference). No `metal`.
+      - name: Build
+        working-directory: kin-db
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        working-directory: kin-db
+        run: cargo test --workspace
