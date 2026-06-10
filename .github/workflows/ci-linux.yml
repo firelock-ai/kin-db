@@ -81,6 +81,14 @@ jobs:
         working-directory: kin-db
         run: cargo build --workspace --all-targets
 
+      # HF_HUB_OFFLINE keeps the run deterministic and offline. The only tests
+      # that construct a real embedder (embed_oom_cpu_fallback, embedding_sanity)
+      # are written to self-skip when the model can't be loaded, so they skip
+      # cleanly here instead of pulling weights from HuggingFace. Metal-only
+      # tests are already #[ignore]. Everything else (graph/storage/search/
+      # vector/text) is pure-Rust and runs.
       - name: Test
         working-directory: kin-db
+        env:
+          HF_HUB_OFFLINE: "1"
         run: cargo test --workspace
