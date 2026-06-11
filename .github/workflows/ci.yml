@@ -11,7 +11,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  # -A deprecated: the Build/Test steps (and clippy) otherwise deny the rustc
+  # `deprecated` lint, which fires on kin-db's use of the kin-model
+  # ArtifactId::from_file_id API (deprecated in the pinned rev; migration is a
+  # behavior-adjacent change, FORBIDDEN during the freeze). Allow it here
+  # (CI-config only) — exactly the kin-repo CI pattern — so kin-db goes FULLY
+  # green the instant the Troy-gated kin-model auth resolves, with no further push.
+  # Burn down with the from_file_id migration post-freeze.
+  RUSTFLAGS: -Dwarnings -A deprecated
 
 jobs:
   dco:
