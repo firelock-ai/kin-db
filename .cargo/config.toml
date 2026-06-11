@@ -1,11 +1,14 @@
-# KinLab Cargo registry — all kin-* crates are published here.
-# Local patches point to sibling checkouts for cross-repo development.
+# Kin Cargo registry for public and local builds.
+#
+# Keep this file free of local path patches and credentials so a fresh public
+# clone can resolve Kin crates from public source. Put machine-local overrides
+# in Cargo's user-level config instead of this tracked file.
 
 [registries.kin]
 index = "sparse+https://kinlab.ai/registry/cargo/"
 
 [patch.kin]
-kin-blobs = { path = "../kin-blobs" }
-kin-vector = { path = "../kin-vector" }
-kin-search = { path = "../kin-search" }
-kin-infer = { path = "../kin-infer" }
+kin-infer = { git = "https://github.com/firelock-ai/kin-infer.git", rev = "ff1a60c46aa51487b8a492c499b0841592102447" }
+kin-model = { git = "https://github.com/firelock-ai/kin-model.git", rev = "99344c94e961efbfff40d5e5350d8e4943bc7913" }
+kin-search = { git = "https://github.com/firelock-ai/kin-search.git", rev = "cb0680b82f38c8477a0facd33b4cdefde3fa6dfc" }
+kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "dd743d741c6832e15179ac60720b5218558e10fb" }
