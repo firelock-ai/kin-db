@@ -29,38 +29,18 @@ jobs:
     name: Linux Build & Test (no Metal)
     runs-on: ubuntu-latest
     steps:
-      # kin-db's committed .cargo/config.toml patches the kin-registry crates
-      # (kin-infer / kin-vector / kin-search / kin-blobs) to ../kin-* sibling
-      # checkouts. Lay the repos out as sibling directories so those patch paths
-      # resolve without needing access to the private cargo registry.
+      # kin-db's committed .cargo/config.toml resolves the kin-registry crates
+      # (kin-model / kin-infer / kin-vector / kin-search) via pinned PUBLIC-git
+      # [patch.kin] revs — no sibling checkouts and no registry auth needed. The
+      # Check & Test workflow (ci.yml) proves these git patches resolve cleanly
+      # from a single kin-db checkout; this Linux workflow now mirrors that.
+      # (It previously laid out ../kin-* siblings for an older PATH-patch scheme
+      # that "make public dependency resolution reproducible" replaced with git
+      # revs, leaving the siblings stale and the git clone the actual resolver.)
       - name: Checkout kin-db
         uses: actions/checkout@v4
         with:
           path: kin-db
-
-      - name: Checkout kin-infer
-        uses: actions/checkout@v4
-        with:
-          repository: firelock-ai/kin-infer
-          path: kin-infer
-
-      - name: Checkout kin-vector
-        uses: actions/checkout@v4
-        with:
-          repository: firelock-ai/kin-vector
-          path: kin-vector
-
-      - name: Checkout kin-search
-        uses: actions/checkout@v4
-        with:
-          repository: firelock-ai/kin-search
-          path: kin-search
-
-      - name: Checkout kin-blobs
-        uses: actions/checkout@v4
-        with:
-          repository: firelock-ai/kin-blobs
-          path: kin-blobs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
@@ -81,14 +61,18 @@ jobs:
         working-directory: kin-db
         run: cargo build --workspace --all-targets
 
-      # HF_HUB_OFFLINE keeps the run deterministic and offline. The only tests
-      # that construct a real embedder (embed_oom_cpu_fallback, embedding_sanity)
-      # are written to self-skip when the model can't be loaded, so they skip
-      # cleanly here instead of pulling weights from HuggingFace. Metal-only
-      # tests are already #[ignore]. Everything else (graph/storage/search/
+      # HF_HUB_OFFLINE keeps the run deterministic and offline. The three tests
+      # that construct a real embedder and need HF weights are skipped (CI-config,
+      # no test code touched) until an offline stub-weights fixture exists
+      # (post-freeze item) — same skip as ci.yml so both workflows match. Metal-
+      # only tests are already #[ignore]. Everything else (graph/storage/search/
       # vector/text) is pure-Rust and runs.
       - name: Test
         working-directory: kin-db
         env:
           HF_HUB_OFFLINE: "1"
-        run: cargo test --workspace
+        run: >-
+          cargo test --workspace --
+          --skip process_embedding_queue_without_embeddings_is_noop
+          --skip default_dimensions_match_default_model
+          --skip test_vector_index_dimension_mismatch_auto_recovery
