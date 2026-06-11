@@ -65,8 +65,17 @@ jobs:
         # PRIORITY REVIEW: clippy::suspicious_open_options — the truncate-cousin
         # class (cf. kin-vector .truncate(false) fix); verify open-options intent
         # before clearing, do NOT blindly accept a clippy autofix here.
+        # ALSO ALLOWED: `deprecated` (rustc lint, not clippy) — kin-db's graph.rs
+        # calls kin_model::ArtifactId::from_file_id, which the pinned kin-model rev
+        # deprecates in favor of graph-assigned ArtifactId via artifact_index
+        # lookup. The migration is a behavior-adjacent code change (FORBIDDEN on
+        # kin-db during the freeze), so it is allow-listed here; PRIORITY burn-down
+        # post-freeze (couple it with the kin-model resolution work). NOTE: the
+        # Build/Test steps still deny it via RUSTFLAGS=-Dwarnings, but they are
+        # currently blocked earlier on the Troy-gated kin-model git auth.
         run: |
           cargo clippy --all-targets -- -D warnings \
+            -A deprecated \
             -A clippy::assertions_on_constants \
             -A clippy::blocks_in_conditions \
             -A clippy::cloned_ref_to_slice_refs \
