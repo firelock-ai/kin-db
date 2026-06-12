@@ -57,7 +57,7 @@ directories = "6"
 half = "2"
 rkyv = { version = "0.8", features = ["std", "bytecheck"], optional = true }
 rayon = "1"
-sysinfo = "0.38"
+sysinfo = "0.39"
 tempfile = "3"
 tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
