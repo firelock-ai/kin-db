@@ -11,14 +11,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # -A deprecated: the Build/Test steps (and clippy) otherwise deny the rustc
-  # `deprecated` lint, which fires on kin-db's use of the kin-model
-  # ArtifactId::from_file_id API (deprecated in the pinned rev; migration is a
-  # behavior-adjacent change, FORBIDDEN during the freeze). Allow it here
-  # (CI-config only) — exactly the kin-repo CI pattern — so kin-db goes FULLY
-  # green the instant the Troy-gated kin-model auth resolves, with no further push.
-  # Burn down with the from_file_id migration post-freeze.
-  RUSTFLAGS: -Dwarnings -A deprecated
+  # `deprecated` is now ENFORCED (FIR-855): all kin-db call sites of
+  # kin-model's deprecated ArtifactId::from_path / ::from_file_id were migrated
+  # to the graph-assigned id via the `artifact_index` lookup. The only remaining
+  # uses are deterministic legacy-link/migration seed paths carrying local
+  # `#[allow(deprecated)]` with justification, so -Dwarnings can deny the lint.
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   dco:
@@ -72,17 +70,11 @@ jobs:
         # PRIORITY REVIEW: clippy::suspicious_open_options — the truncate-cousin
         # class (cf. kin-vector .truncate(false) fix); verify open-options intent
         # before clearing, do NOT blindly accept a clippy autofix here.
-        # ALSO ALLOWED: `deprecated` (rustc lint, not clippy) — kin-db's graph.rs
-        # calls kin_model::ArtifactId::from_file_id, which the pinned kin-model rev
-        # deprecates in favor of graph-assigned ArtifactId via artifact_index
-        # lookup. The migration is a behavior-adjacent code change (FORBIDDEN on
-        # kin-db during the freeze), so it is allow-listed here; PRIORITY burn-down
-        # post-freeze (couple it with the kin-model resolution work). NOTE: the
-        # Build/Test steps still deny it via RUSTFLAGS=-Dwarnings, but they are
-        # currently blocked earlier on the Troy-gated kin-model git auth.
+        # NOTE: the rustc `deprecated` lint is no longer allow-listed (FIR-855):
+        # all kin-db call sites were migrated to the graph-assigned ArtifactId via
+        # the `artifact_index` lookup, so -D warnings now denies it here too.
         run: |
           cargo clippy --all-targets -- -D warnings \
-            -A deprecated \
             -A clippy::assertions_on_constants \
             -A clippy::blocks_in_conditions \
             -A clippy::cloned_ref_to_slice_refs \
