@@ -123,5 +123,4 @@ publish_package() {
   esac
 }
 
-publish_package "kin-model"
 publish_package "kin-db"
