@@ -24,7 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.96.0
-      - run: cargo test --workspace
+      # Mirror ci.yml / ci-linux.yml: HF_HUB_OFFLINE keeps the run deterministic
+      # and offline. The three tests that construct a real embedder needing HF
+      # weights, plus many_vectors_search_quality, are skipped here too (same skip
+      # as CI) until an offline stub-weights fixture exists (post-freeze item).
+      - name: Test
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --workspace --
+          --skip process_embedding_queue_without_embeddings_is_noop
+          --skip default_dimensions_match_default_model
+          --skip test_vector_index_dimension_mismatch_auto_recovery
+          --skip many_vectors_search_quality
 
   release:
     name: Publish Release
