@@ -22,6 +22,9 @@ embeddings = [
     "dep:reqwest",
 ]
 metal = ["embeddings", "kin-infer/metal"]
+# Apple Accelerate CPU BLAS for the embed/rerank path (auto-selected at runtime
+# by kin-infer; force pure-Rust with KIN_INFER_CPU_BACKEND=pure-rust).
+accelerate = ["embeddings", "kin-infer/accelerate"]
 archive = ["rkyv"]
 gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
