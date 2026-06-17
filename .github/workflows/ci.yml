@@ -29,7 +29,32 @@ jobs:
           fetch-depth: 0
 
       - name: Check DCO sign-off
-        uses: christophebedard/dco-check@v1.2.0
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          range="${BASE_SHA}..${HEAD_SHA}"
+          echo "Checking DCO sign-off for commits in ${range}"
+          for sha in $(git rev-list --no-merges "${range}"); do
+            author_name=$(git show -s --format='%an' "${sha}")
+            author_email=$(git show -s --format='%ae' "${sha}")
+            expected="Signed-off-by: ${author_name} <${author_email}>"
+            if git show -s --format='%(trailers:key=Signed-off-by)' "${sha}" \
+                | grep -qiF "${expected}"; then
+              echo "OK   ${sha} ${expected}"
+            else
+              echo "FAIL ${sha} missing or mismatched sign-off (expected: ${expected})"
+              git show -s --format='  author: %an <%ae>%n  trailers:%n%(trailers:key=Signed-off-by)' "${sha}"
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::One or more commits are missing a matching 'Signed-off-by' trailer (DCO). Re-commit with 'git commit -s'."
+            exit 1
+          fi
+          echo "All commits carry a matching DCO sign-off."
 
   check:
     name: Check & Test
