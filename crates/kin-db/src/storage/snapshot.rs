@@ -738,12 +738,29 @@ impl SnapshotManager {
 
         let metadata_path = vector_index_metadata_path_for(path);
         let metadata = read_vector_index_metadata(&metadata_path)?;
+        // FIR-1051: validate the sidecar against the CANONICAL recompute of the
+        // loaded graph, not the passed-in `graph_root_hash`. That root can be the
+        // continuously-maintained live root (or a persisted copy of it) which has
+        // drifted from canonical (FIR-930/FIR-955); when it drifts the gate
+        // silently rejects a perfectly good sidecar, leaving a dormant 0-indexed
+        // vector index on reopen (the prepared-state-reuse-not-trustworthy bug).
+        // The stamp side now also writes the canonical root, so a valid sidecar
+        // always matches here, while a genuinely-stale sidecar (a different graph)
+        // still fails the canonical comparison.
+        let canonical_root_hash = graph.recompute_root_hash();
+        if canonical_root_hash != graph_root_hash {
+            tracing::debug!(
+                canonical = %hex::encode(canonical_root_hash),
+                passed = %hex::encode(graph_root_hash),
+                "FIR-1051: kvec gate using canonical graph root (passed root had drifted)"
+            );
+        }
         // FIR-901: A .kvec present with no .kvec.meta.json must NOT default to
         // load — that bypassed the root-hash gate entirely. Absent sidecar ⇒
         // stale: clear out-of-date vectors and queue a clean rebuild.
         let should_load = metadata
             .as_ref()
-            .map(|m| vector_metadata_matches_graph(m, graph_root_hash, expected_embedder_identity))
+            .map(|m| vector_metadata_matches_graph(m, canonical_root_hash, expected_embedder_identity))
             .unwrap_or(false);
 
         if !should_load {
@@ -773,7 +790,8 @@ impl SnapshotManager {
         let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields();
         let expected = crate::vector::IndexDescriptor {
             model_id: runtime_model_id,
-            graph_root: Some(hex::encode(graph_root_hash)),
+            // FIR-1051: defense-in-depth model check uses the same canonical root.
+            graph_root: Some(hex::encode(canonical_root_hash)),
         };
 
         let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
@@ -1427,10 +1445,15 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        // FIR-955: the live graph maintains a continuously-current root. Stamp
-        // that root instead of forcing a full Merkle recompute on every vector
-        // sidecar flush.
-        let graph_root_hash = graph.compute_root_hash();
+        // FIR-1051: the kvec sidecar's graph_root_hash MUST be computed the same
+        // way the reopen gate validates it (`compute_graph_root_hash`, a canonical
+        // fresh Merkle recompute — see `vector_metadata_matches_graph` /
+        // `graph_from_locate_snapshot`). The continuously-maintained live root
+        // (`compute_root_hash`) can drift from canonical (FIR-930/FIR-955), and
+        // when it does the reopen silently rejects a perfectly good kvec, leaving
+        // a dormant (0-indexed) vector index. Stamp the canonical root so a valid
+        // sidecar always reloads.
+        let graph_root_hash = graph.recompute_root_hash();
         Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
 
