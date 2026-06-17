@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Bounded fuzz-smoke tier (FIR-1031).
+#
+# cargo-fuzz / libFuzzer coverage for kin-db's binary ingestion and
+# semantic-entity-graph build paths. This is a SMOKE tier: each target runs for
+# a short, bounded wall-clock budget so it can gate PRs without becoming a
+# long-running soak. Deeper soak fuzzing is the weekly scheduled run.
+#
+# A crash fails the job and uploads the reproducing input as an artifact.
+
+name: Fuzz Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Only the parser/ingestion/storage surface the targets exercise.
+      - "crates/kin-db/fuzz/**"
+      - "crates/kin-db/src/storage/**"
+      - "crates/kin-db/src/engine/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Weekly deeper run (Mondays 07:00 UTC).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-smoke:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_snapshot_deser
+          - fuzz_delta_deser
+          - fuzz_delta_apply
+          - fuzz_graph_ingest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run bounded fuzz (${{ matrix.target }})
+        working-directory: crates/kin-db
+        # 120s on PRs; the scheduled soak gets a longer budget. -rss_limit_mb
+        # guards against unbounded-allocation findings being killed by the OOM
+        # killer instead of reported as a crash. TARGET/EVENT come in via env
+        # (trusted matrix allowlist + controlled event enum) per workflow
+        # injection hygiene.
+        env:
+          TARGET: ${{ matrix.target }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          DURATION=120
+          if [ "$EVENT" = "schedule" ]; then DURATION=600; fi
+          cargo +nightly fuzz run "$TARGET" -- \
+            -max_total_time="${DURATION}" \
+            -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/kin-db/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
