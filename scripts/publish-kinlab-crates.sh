@@ -10,20 +10,26 @@ registry_url="${registry_url%/}"
 # closed (rejects publishes) when its KIN_REGISTRY_CARGO_TOKEN is unset, and the
 # token sent here must match it. Reads remain open. Provided in CI via secret.
 registry_token="${KINLAB_CARGO_TOKEN:-${KINLAB_TOKEN:-}}"
-tag_name="${TAG_NAME:-${GITHUB_REF_NAME:-}}"
 dry_run="${DRY_RUN:-0}"
 
-if [[ -z "$tag_name" ]]; then
-  echo "TAG_NAME or GITHUB_REF_NAME is required" >&2
-  exit 1
+# Version source of truth is Cargo.toml (cargo metadata), so a version-bump
+# merge to main auto-publishes without a git tag. TAG_NAME / GITHUB_REF_NAME is
+# accepted as an OPTIONAL consistency check: when invoked from a tag push it
+# must match the Cargo version. A non-tag GITHUB_REF_NAME (a branch name on a
+# push-to-main publish) is ignored.
+tag_name="${TAG_NAME:-}"
+if [[ -z "$tag_name" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+  tag_name="${GITHUB_REF_NAME:-}"
 fi
 
-if [[ "$tag_name" != v* ]]; then
-  echo "Release tag must start with 'v' (got: $tag_name)" >&2
-  exit 1
+expected_version=""
+if [[ -n "$tag_name" ]]; then
+  if [[ "$tag_name" != v* ]]; then
+    echo "Release tag must start with 'v' (got: $tag_name)" >&2
+    exit 1
+  fi
+  expected_version="${tag_name#v}"
 fi
-
-expected_version="${tag_name#v}"
 
 if command -v cargo >/dev/null 2>&1; then
   cargo_bin="$(command -v cargo)"
@@ -63,7 +69,7 @@ publish_package() {
   local package_version
   package_version="$(resolve_version "$package_name")"
 
-  if [[ "$package_version" != "$expected_version" ]]; then
+  if [[ -n "$expected_version" && "$package_version" != "$expected_version" ]]; then
     echo "Version mismatch for $package_name: tag expects $expected_version but Cargo metadata resolved $package_version" >&2
     exit 1
   fi
