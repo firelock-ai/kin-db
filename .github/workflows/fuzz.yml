@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Bounded fuzz-smoke tier (FIR-1031).
+# Bounded fuzz tier (FIR-1031).
 #
 # cargo-fuzz / libFuzzer coverage for kin-db's binary ingestion and
-# semantic-entity-graph build paths. This is a SMOKE tier: each target runs for
-# a short, bounded wall-clock budget so it can gate PRs without becoming a
-# long-running soak. Deeper soak fuzzing is the weekly scheduled run.
+# semantic-entity-graph build paths.
+#
+# - On PRs: DETERMINISTIC regression — replay the committed seed corpus only
+#   (-runs=0, no mutation). This gates PRs on known-bad inputs (e.g. the
+#   body_len overflow seed) without the flakiness of mutation-based fuzzing
+#   blocking unrelated PRs.
+# - On the weekly schedule / manual dispatch: bounded MUTATION fuzzing
+#   (-max_total_time) for discovery. New crashes are uploaded as artifacts and
+#   triaged per fuzz/README.md (committed as a corpus seed, then fixed or
+#   child-ticketed under FIR-894).
 #
 # A crash fails the job and uploads the reproducing input as an artifact.
 
@@ -50,22 +57,22 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Run bounded fuzz (${{ matrix.target }})
+      - name: Run fuzz (${{ matrix.target }})
         working-directory: crates/kin-db
-        # 120s on PRs; the scheduled soak gets a longer budget. -rss_limit_mb
-        # guards against unbounded-allocation findings being killed by the OOM
-        # killer instead of reported as a crash. TARGET/EVENT come in via env
-        # (trusted matrix allowlist + controlled event enum) per workflow
+        # PRs: deterministic corpus replay (-runs=0). schedule/dispatch: bounded
+        # mutation fuzzing. -rss_limit_mb guards unbounded-allocation findings so
+        # they surface as a crash rather than an OOM kill. TARGET/EVENT come in
+        # via env (trusted matrix allowlist + controlled event enum) per workflow
         # injection hygiene.
         env:
           TARGET: ${{ matrix.target }}
           EVENT: ${{ github.event_name }}
         run: |
-          DURATION=120
-          if [ "$EVENT" = "schedule" ]; then DURATION=600; fi
-          cargo +nightly fuzz run "$TARGET" -- \
-            -max_total_time="${DURATION}" \
-            -rss_limit_mb=4096
+          if [ "$EVENT" = "pull_request" ]; then
+            cargo +nightly fuzz run "$TARGET" -- -runs=0 -rss_limit_mb=4096
+          else
+            cargo +nightly fuzz run "$TARGET" -- -max_total_time=600 -rss_limit_mb=4096
+          fi
 
       - name: Upload crash artifacts
         if: failure()

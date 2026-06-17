@@ -51,10 +51,28 @@ corpus is intentionally **not** committed; only the hand-authored seeds are.
 
 ## CI
 
-`.github/workflows/fuzz.yml` runs every target for a bounded `-max_total_time`
-on PRs that touch the parser/ingestion/storage surface, on a weekly schedule,
-and on manual dispatch. A crash fails the job and uploads the reproducing
-artifact.
+`.github/workflows/fuzz.yml`:
+
+- **On PRs** (touching the parser/ingestion/storage surface): deterministic
+  regression — replays the committed seed corpus only (`-runs=0`, no mutation),
+  so a PR is gated on known-bad inputs (e.g. `seed_body_len_overflow`) without
+  mutation-based flakiness blocking unrelated changes.
+- **Weekly schedule + manual dispatch**: bounded mutation fuzzing
+  (`-max_total_time=600`) for discovery.
+
+A crash fails the job and uploads the reproducing artifact.
+
+> Found by this harness: `seed_body_len_overflow` — a header `body_len` near
+> `usize::MAX` wrapped `16 + body_len` and panicked on the body slice in both
+> the snapshot and delta decoders. Fixed with checked arithmetic (FIR-1031);
+> the seed is committed as a permanent regression guard.
+
+### Reproduce the seed corpus locally
+
+```sh
+cd crates/kin-db
+cargo +nightly fuzz run fuzz_snapshot_deser -- -runs=0   # replay seeds, no mutation
+```
 
 ## Triage
 
