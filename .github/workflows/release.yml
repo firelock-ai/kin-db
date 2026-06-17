@@ -50,15 +50,66 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
 
   publish_registry:
-    name: Publish crates to KinLab
+    name: Publish kin-db to KinLab registry
     needs: release
     runs-on: ubuntu-latest
+    # TROY-GATED: protected environment holds the publish token + required
+    # reviewer. The kin daemon also fails closed without the token.
+    environment: registry-publish
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.96.0
-      - name: Publish kin-model and kin-db
+      # Dependency-ordered preflight + checksum-verified, idempotent publish.
+      # TAG_NAME is an optional consistency check against the Cargo version.
+      - name: Publish kin-db (dependency-ordered + checksum-verified)
         run: bash ./scripts/publish-kinlab-crates.sh
         env:
           TAG_NAME: ${{ github.ref_name }}
           KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
           KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
+
+  registry_consumer_smoke:
+    name: Registry-only consumer smoke (post-publish)
+    needs: publish_registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Resolve published kin-db version
+        id: ver
+        run: |
+          V="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="kin-db"))')"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Stage consumer crate out-of-tree (no repo .cargo patches inherited)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/consumer"
+          rm -rf "$dest"
+          cp -r ci/registry-smoke "$dest"
+          mkdir -p "$dest/.cargo"
+          cat > "$dest/.cargo/config.toml" <<'EOF'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          EOF
+          python3 - "$dest/Cargo.toml" "$VERSION" <<'PY'
+          import re, sys
+          path, version = sys.argv[1], sys.argv[2]
+          with open(path, "r", encoding="utf-8") as fh:
+              text = fh.read()
+          text = re.sub(r'(kin-db\s*=\s*\{\s*version\s*=\s*")[^"]*(")',
+                        lambda m: m.group(1) + version + m.group(2), text, count=1)
+          with open(path, "w", encoding="utf-8") as fh:
+              fh.write(text)
+          print("pinned consumer to kin-db", version)
+          PY
+
+      - name: Build consumer from the kin registry only (fresh cache)
+        working-directory: ${{ runner.temp }}/consumer
+        env:
+          CARGO_HOME: ${{ runner.temp }}/fresh-cargo-home
+        run: cargo build --locked || cargo build
