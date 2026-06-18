@@ -760,7 +760,9 @@ impl SnapshotManager {
         // stale: clear out-of-date vectors and queue a clean rebuild.
         let should_load = metadata
             .as_ref()
-            .map(|m| vector_metadata_matches_graph(m, canonical_root_hash, expected_embedder_identity))
+            .map(|m| {
+                vector_metadata_matches_graph(m, canonical_root_hash, expected_embedder_identity)
+            })
             .unwrap_or(false);
 
         if !should_load {
