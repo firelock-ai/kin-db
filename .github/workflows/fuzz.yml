@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Bounded fuzz tier (FIR-1031).
+#
+# cargo-fuzz / libFuzzer coverage for kin-db's binary ingestion and
+# semantic-entity-graph build paths.
+#
+# - On PRs: DETERMINISTIC regression — replay the committed seed corpus only
+#   (-runs=0, no mutation). This gates PRs on known-bad inputs (e.g. the
+#   body_len overflow seed) without the flakiness of mutation-based fuzzing
+#   blocking unrelated PRs.
+# - On the weekly schedule / manual dispatch: bounded MUTATION fuzzing
+#   (-max_total_time) for discovery. New crashes are uploaded as artifacts and
+#   triaged per fuzz/README.md (committed as a corpus seed, then fixed or
+#   child-ticketed under FIR-894).
+#
+# A crash fails the job and uploads the reproducing input as an artifact.
+
+name: Fuzz Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Only the parser/ingestion/storage surface the targets exercise.
+      - "crates/kin-db/fuzz/**"
+      - "crates/kin-db/src/storage/**"
+      - "crates/kin-db/src/engine/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Weekly deeper run (Mondays 07:00 UTC).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-smoke:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_snapshot_deser
+          - fuzz_delta_deser
+          - fuzz_delta_apply
+          - fuzz_graph_ingest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz (${{ matrix.target }})
+        working-directory: crates/kin-db
+        # PRs: deterministic corpus replay (-runs=0). schedule/dispatch: bounded
+        # mutation fuzzing. -rss_limit_mb guards unbounded-allocation findings so
+        # they surface as a crash rather than an OOM kill. TARGET/EVENT come in
+        # via env (trusted matrix allowlist + controlled event enum) per workflow
+        # injection hygiene.
+        env:
+          TARGET: ${{ matrix.target }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            cargo +nightly fuzz run "$TARGET" -- -runs=0 -rss_limit_mb=4096
+          else
+            cargo +nightly fuzz run "$TARGET" -- -max_total_time=600 -rss_limit_mb=4096
+          fi
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/kin-db/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
