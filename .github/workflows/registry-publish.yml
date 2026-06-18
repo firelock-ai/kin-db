@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Registry safety net + idempotent auto-publish.
+# Registry safety net + dependency-aware, idempotent auto-publish (FIR-1021).
 #
 # registry_smoke: builds the crate against the PUBLISHED Kin registry only —
 # every local `[patch.kin]` redirect in .cargo/config.toml is stripped first.
@@ -9,11 +9,23 @@
 # crate that cannot resolve from the registry (the exact version-skew failure
 # this workflow exists to prevent). Runs on PRs and on main.
 #
-# registry_publish: on a push to main, packages the crate and POSTs it to the
-# registry. The version is read from Cargo.toml (cargo metadata), so a
-# version-bump merge auto-publishes without a git tag. A 409 (already
-# published) is treated as success, so re-running on an unchanged version is a
-# no-op. It only runs after registry_smoke passes.
+# registry_publish: on a push to main, runs a dependency-ordered preflight
+# (kin-db's required registry deps — notably the pinned kin-model version —
+# must already be published), packages the crate, and POSTs it to the registry.
+# The version is read from Cargo.toml (cargo metadata), so a version-bump merge
+# auto-publishes without a git tag. An existing version (HTTP 409) is accepted
+# only when its index checksum is byte-identical to the freshly packaged crate;
+# a mismatch fails loudly. After publish it asserts download == index ==
+# packaged checksum. It only runs after registry_smoke passes.
+#
+# TROY-GATED: registry_publish is pinned to the protected `registry-publish`
+# GitHub Environment (configure required reviewer = Troy + scope the
+# KINLAB_CARGO_TOKEN secret to it). The kin daemon also fails closed without the
+# token, so a publish cannot proceed unattended.
+#
+# registry_consumer_smoke: after publish, builds an out-of-tree throwaway crate
+# that depends on kin-db ONLY via `registry = "kin"` (no patches) with a fresh
+# CARGO_HOME — proving the published crate is self-consistent and downloadable.
 
 name: Registry Publish
 
@@ -62,14 +74,71 @@ jobs:
     needs: registry_smoke
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # TROY-GATED: protected environment holds the publish token + required
+    # reviewer. Without it the kin daemon fails closed on publish anyway.
+    environment: registry-publish
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
 
-      - name: Publish kin-db
+      - name: Publish kin-db (dependency-ordered + checksum-verified)
         run: bash ./scripts/publish-kinlab-crates.sh
         env:
           KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
           KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
+
+  registry_consumer_smoke:
+    name: Registry-only consumer smoke (post-publish)
+    needs: registry_publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Resolve published kin-db version
+        id: ver
+        run: |
+          V="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="kin-db"))')"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Stage consumer crate out-of-tree (no repo .cargo patches inherited)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/consumer"
+          rm -rf "$dest"
+          cp -r ci/registry-smoke "$dest"
+          mkdir -p "$dest/.cargo"
+          # Registry alias ONLY — no [patch.*] redirects, so kin-db and its deps
+          # must resolve from the published registry.
+          cat > "$dest/.cargo/config.toml" <<'EOF'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          EOF
+          # Pin the consumer to the exact just-published kin-db version.
+          python3 - "$dest/Cargo.toml" "$VERSION" <<'PY'
+          import re, sys
+          path, version = sys.argv[1], sys.argv[2]
+          with open(path, "r", encoding="utf-8") as fh:
+              text = fh.read()
+          text = re.sub(r'(kin-db\s*=\s*\{\s*version\s*=\s*")[^"]*(")',
+                        lambda m: m.group(1) + version + m.group(2), text, count=1)
+          with open(path, "w", encoding="utf-8") as fh:
+              fh.write(text)
+          print("pinned consumer to kin-db", version)
+          PY
+
+      - name: Build consumer from the kin registry only (fresh cache)
+        working-directory: ${{ runner.temp }}/consumer
+        env:
+          # Fresh CARGO_HOME forces a clean download from the registry rather
+          # than reusing any cached sibling artifacts.
+          CARGO_HOME: ${{ runner.temp }}/fresh-cargo-home
+        run: cargo build --locked || cargo build

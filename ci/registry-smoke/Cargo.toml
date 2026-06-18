@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Registry-only consumer smoke (FIR-1021).
+#
+# A throwaway crate that depends on kin-db ONLY through the published "kin"
+# registry — no path/git patches. Building it after a publish proves the
+# published kin-db crate is self-consistent and downloadable by a third party:
+# its declared registry dependencies (kin-model, kin-search, kin-vector at the
+# pinned versions) must all resolve and compile from the registry alone.
+#
+# `[workspace]` makes this its OWN workspace so it is never pulled into the
+# kin-db workspace. The kin-db version below is a placeholder; the registry
+# consumer-smoke CI job rewrites it to the exact just-published version before
+# building.
+
+[package]
+name = "kin-db-registry-smoke"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Resolved ONLY from the kin registry. default-features = false + features =
+# ["vector"] mirrors the consumer feature set that broke in the version-skew
+# incident (kin-db pulled into kin/kin-bench without the embeddings stack), so
+# this smoke covers the historically fragile resolve, not just the fat default.
+kin-db = { version = "0.0.0", registry = "kin", default-features = false, features = ["vector"] }
