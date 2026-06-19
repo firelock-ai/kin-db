@@ -1,0 +1,7 @@
+{
+  "downstreams": [
+    { "repo": "firelock-ai/kin" },
+    { "repo": "firelock-ai/kin-bench" },
+    { "repo": "firelock-ai/kin-vfs" }
+  ]
+}
