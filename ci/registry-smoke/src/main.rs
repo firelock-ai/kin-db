@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 //
-// Registry-only consumer smoke (FIR-1021). Exercises a few kin-db public APIs
+// Registry-only consumer smoke. Exercises a few kin-db public APIs
 // so the published crate is actually compiled and LINKED — not merely resolved
 // — when built against the registry. If the published kin-db references a
 // dependency version that is not in the registry, this binary fails to build.
