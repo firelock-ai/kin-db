@@ -3,7 +3,7 @@
 # Copyright 2026 Firelock, LLC
 #
 # Hardened, dependency-aware publish of kin-db to the private "kin" cargo
-# registry (FIR-1021).
+# registry.
 #
 # Guarantees layered on top of the first-cut auto-publish:
 #
