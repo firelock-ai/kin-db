@@ -23,7 +23,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       # Mirror ci.yml / ci-linux.yml: HF_HUB_OFFLINE keeps the run deterministic
       # and offline. The three tests that construct a real embedder needing HF
       # weights, plus many_vectors_search_quality, are skipped here too (same skip
@@ -58,7 +58,7 @@ jobs:
     environment: registry-publish
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       # Dependency-ordered preflight + checksum-verified, idempotent publish.
       # TAG_NAME is an optional consistency check against the Cargo version.
       - name: Publish kin-db (dependency-ordered + checksum-verified)
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Resolve published kin-db version
         id: ver
