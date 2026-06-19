@@ -11,7 +11,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `deprecated` is now ENFORCED (FIR-855): all kin-db call sites of
+  # `deprecated` is now enforced: all kin-db call sites of
   # kin-model's deprecated ArtifactId::from_path / ::from_file_id were migrated
   # to the graph-assigned id via the `artifact_index` lookup. The only remaining
   # uses are deterministic legacy-link/migration seed paths carrying local
@@ -95,7 +95,7 @@ jobs:
         # PRIORITY REVIEW: clippy::suspicious_open_options — the truncate-cousin
         # class (cf. kin-vector .truncate(false) fix); verify open-options intent
         # before clearing, do NOT blindly accept a clippy autofix here.
-        # NOTE: the rustc `deprecated` lint is no longer allow-listed (FIR-855):
+        # NOTE: the rustc `deprecated` lint is no longer allow-listed:
         # all kin-db call sites were migrated to the graph-assigned ArtifactId via
         # the `artifact_index` lookup, so -D warnings now denies it here too.
         run: |

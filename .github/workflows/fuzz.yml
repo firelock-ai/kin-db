@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Bounded fuzz tier (FIR-1031).
+# Bounded fuzz tier.
 #
 # cargo-fuzz / libFuzzer coverage for kin-db's binary ingestion and
 # semantic-entity-graph build paths.
@@ -13,7 +13,7 @@
 # - On the weekly schedule / manual dispatch: bounded MUTATION fuzzing
 #   (-max_total_time) for discovery. New crashes are uploaded as artifacts and
 #   triaged per fuzz/README.md (committed as a corpus seed, then fixed or
-#   child-ticketed under FIR-894).
+#   tracked as parser/ingestion hardening work).
 #
 # A crash fails the job and uploads the reproducing input as an artifact.
 

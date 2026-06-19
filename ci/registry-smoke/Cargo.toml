@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Registry-only consumer smoke (FIR-1021).
+# Registry-only consumer smoke.
 #
 # A throwaway crate that depends on kin-db ONLY through the published "kin"
 # registry — no path/git patches. Building it after a publish proves the
