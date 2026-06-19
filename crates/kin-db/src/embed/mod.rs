@@ -1680,8 +1680,13 @@ fn throughput_embedding_plan(backend: GpuBackend) -> &'static kin_infer::resourc
             reserve_device_bytes: None,
             allow_cpu_fallback: true,
         };
-        ResourcePlan::for_profile(Profile::Throughput, &detect_host(), &accel, &detect_memory())
-            .embedding
+        ResourcePlan::for_profile(
+            Profile::Throughput,
+            &detect_host(),
+            &accel,
+            &detect_memory(),
+        )
+        .embedding
     })
 }
 
