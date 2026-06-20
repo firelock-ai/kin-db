@@ -12218,6 +12218,46 @@ mod tests {
         assert!(g.prepare_pending_embedding_batch(100).is_empty());
     }
 
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_formats_revision_and_preserves_skipped_recency() {
+        let g = InMemoryGraph::new();
+        let entity = test_entity_with_id(0x92, "rev_target");
+        let (_rev_old, rev_new) = two_revision_entity(&g, &entity);
+        let missing = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xdead_beef)));
+
+        {
+            let mut queue = g.embedding_queue.lock();
+            queue.clear();
+            queue.insert(missing, EmbedRecency::ChangedThisSync);
+            queue.insert(
+                RetrievalKey::EntityRevision(rev_new),
+                EmbedRecency::Backfill,
+            );
+        }
+
+        let prepared = g.prepare_pending_embedding_batch(100);
+        assert_eq!(
+            prepared.keys,
+            vec![RetrievalKey::EntityRevision(rev_new)],
+            "only retrievable graph-backed keys should be prepared"
+        );
+        assert_eq!(prepared.texts.len(), 1);
+        assert!(
+            prepared.texts[0].contains("rev_target"),
+            "revision text must be formatted from the revision entity"
+        );
+        assert_eq!(
+            prepared.recency.get(&missing),
+            Some(&EmbedRecency::ChangedThisSync),
+            "recency metadata is retained for skipped keys so error requeue can preserve priority"
+        );
+        assert_eq!(
+            prepared.recency.get(&RetrievalKey::EntityRevision(rev_new)),
+            Some(&EmbedRecency::Backfill)
+        );
+    }
+
     /// CPU microbench for the embed hot-path changes. Ignored by default;
     /// run with `cargo test -p kin-db --lib embed_hot_path_microbench -- --ignored --nocapture`.
     #[cfg(all(feature = "embeddings", feature = "vector"))]

@@ -3849,6 +3849,72 @@ mod tests {
         assert_ne!(base.runtime_revision(), tuned.runtime_revision());
     }
 
+    #[cfg(feature = "embeddings")]
+    fn test_openai_embedder(query_prefix: &str, document_prefix: &str) -> OpenAiCompatEmbedder {
+        OpenAiCompatEmbedder {
+            client: BlockingHttpClient::new(),
+            endpoint: "http://localhost:1234/v1/embeddings".into(),
+            model_id: "test-embed".into(),
+            api_key: None,
+            dimensions: 2,
+            request_overrides: serde_json::Map::new(),
+            query_prefix: query_prefix.into(),
+            document_prefix: document_prefix.into(),
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_embedder_prepare_inputs_borrows_without_prefixes() {
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder("", "")),
+            dimensions: 2,
+            cache: None,
+        };
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let prepared = embedder.prepare_inputs(&texts, EmbeddingInputRole::Document);
+        match prepared {
+            Cow::Borrowed(slice) => assert!(std::ptr::eq(slice.as_ptr(), texts.as_ptr())),
+            Cow::Owned(_) => panic!("unprefixed document inputs should be borrowed"),
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_embedder_prepare_inputs_owns_prefixed_roles() {
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder(
+                "search_query: ",
+                "search_document: ",
+            )),
+            dimensions: 2,
+            cache: None,
+        };
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let queries = embedder.prepare_inputs(&texts, EmbeddingInputRole::Query);
+        assert!(matches!(queries, Cow::Owned(_)));
+        assert_eq!(
+            queries.as_ref(),
+            &[
+                "search_query: alpha".to_string(),
+                "search_query: beta".to_string()
+            ]
+        );
+
+        let documents = embedder.prepare_inputs(&texts, EmbeddingInputRole::Document);
+        assert!(matches!(documents, Cow::Owned(_)));
+        assert_eq!(
+            documents.as_ref(),
+            &[
+                "search_document: alpha".to_string(),
+                "search_document: beta".to_string()
+            ]
+        );
+        assert_eq!(texts, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
     // ── no-absolute-path guard ───────────────────────────────────────────────
 
     /// Guard test (durable artifact): a machine-absolute path in file_origin
