@@ -2219,6 +2219,7 @@ fn disabled_error() -> KinDbError {
 struct EmbeddingCache {
     root: PathBuf,
     dimensions: usize,
+    memory_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -2244,7 +2245,11 @@ impl EmbeddingCache {
             .join(EMBEDDING_CACHE_SCHEMA_VERSION)
             .join(namespace);
         std::fs::create_dir_all(&root).ok()?;
-        Some(Self { root, dimensions })
+        Some(Self {
+            root,
+            dimensions,
+            memory_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
     }
 
     fn key_for_text(&self, text: &str) -> String {
@@ -2254,7 +2259,20 @@ impl EmbeddingCache {
     }
 
     fn get_by_key(&self, key: &str) -> Option<Vec<f32>> {
-        read_cached_vector(&self.path_for_key(key), self.dimensions)
+        if let Some(cached) = self.memory_cache.lock().unwrap().get(key) {
+            return Some(cached.clone());
+        }
+
+        if let Some(vector) = read_cached_vector(&self.path_for_key(key), self.dimensions) {
+            let mut cache = self.memory_cache.lock().unwrap();
+            if cache.len() > 8192 {
+                cache.clear();
+            }
+            cache.insert(key.to_string(), vector.clone());
+            Some(vector)
+        } else {
+            None
+        }
     }
 
     fn put_by_key(&self, key: &str, vector: &[f32]) {
@@ -2271,6 +2289,15 @@ impl EmbeddingCache {
         if vector.iter().all(|v| *v == 0.0) {
             return;
         }
+
+        {
+            let mut cache = self.memory_cache.lock().unwrap();
+            if cache.len() > 8192 {
+                cache.clear();
+            }
+            cache.insert(key.to_string(), vector.to_vec());
+        }
+
         let _ = write_cached_vector(&self.path_for_key(key), vector);
     }
 
