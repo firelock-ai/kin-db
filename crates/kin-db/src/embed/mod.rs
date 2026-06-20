@@ -242,6 +242,8 @@ impl CodeEmbedder {
     pub fn new() -> Result<Self, KinDbError> {
         let _span = tracing::info_span!("kindb.embedder.new").entered();
         #[cfg(feature = "embeddings")]
+        kin_infer::init_performance_threads();
+        #[cfg(feature = "embeddings")]
         {
             let provider = configured_embedding_provider();
             return match provider {

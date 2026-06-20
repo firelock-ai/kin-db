@@ -2213,9 +2213,9 @@ impl InMemoryGraph {
                 .collect()
         };
 
-        for (entity, extra_fields) in docs {
-            let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
-        }
+        let batch: Vec<(&Entity, &[(String, f32)])> = docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
+        let _ = ti.upsert_with_extra_fields_batch(batch);
+
         if !entity_ids.is_empty() {
             self.text_dirty.store(true, Ordering::Release);
         }
