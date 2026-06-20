@@ -206,6 +206,143 @@ pub mod hybrid_metrics {
     }
 }
 
+/// Adaptive GPU/CPU split ratio for the throughput-profile hybrid.
+///
+/// The right CPU-twin share depends on the GPU's per-entity speed advantage at
+/// the batch's sequence length, which varies (the GPU pulls far ahead on long
+/// sequences). A hardcoded ratio over-feeds the slow CPU arm on long code
+/// entities, so the GPU finishes early and idles waiting for the twin — net
+/// slower than GPU-only. This measures the actual GPU-vs-CPU token throughput
+/// from each concurrent dispatch and steers the ratio toward the value that
+/// balances the two arms. It bootstraps GPU-heavy (never over-feed the twin
+/// before measuring), rides UP toward GPU-only when the twin can't keep up
+/// (long sequences), and DOWN toward a real split when it can (short sequences).
+/// An explicit `KIN_EMBED_HYBRID_GPU_TPUT_RATIO` disables adaptation.
+#[cfg(feature = "embeddings")]
+pub mod adaptive_split {
+    use std::sync::Mutex;
+
+    /// Ratio used before any measurement, when the twin is engaged.
+    const BOOTSTRAP_RATIO: f64 = 16.0;
+    const RATIO_MIN: f64 = 1.0;
+    const RATIO_MAX: f64 = 4096.0;
+    const EWMA_ALPHA: f64 = 0.4;
+    /// Probe the twin on the first few batches (to seed a measurement) and then
+    /// every `PROBE_INTERVAL` batches (to track sequence-length drift), forcing it
+    /// a small share even while the steady decision is GPU-only.
+    const PROBE_EARLY: u64 = 3;
+    const PROBE_INTERVAL: u64 = 48;
+    /// Entities handed to the twin on a probe batch (the shortest available).
+    pub(crate) const PROBE_CPU_ENTITIES: usize = 2;
+
+    /// What the next throughput-hybrid batch should do.
+    pub(crate) enum SplitPlan {
+        /// Embed the whole batch on the GPU — at this sequence length the twin's
+        /// per-entity latency exceeds the GPU's batch time, so any CPU share only
+        /// makes the GPU wait. This is the explicit "hybrid not beneficial" record.
+        GpuOnly,
+        /// Split GPU/CPU at `ratio`; `min_cpu_probe > 0` forces a measurement.
+        Balanced { ratio: f64, min_cpu_probe: usize },
+    }
+
+    struct State {
+        ratio: f64,
+        /// Last measurement showed the CPU arm finishing within the GPU arm's time
+        /// (so engaging the twin speeds the batch up rather than stalling the GPU).
+        cpu_beneficial: bool,
+        samples: u64,
+        batches: u64,
+        last_gpu_tokens_per_sec: f64,
+        last_cpu_tokens_per_sec: f64,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        ratio: BOOTSTRAP_RATIO,
+        cpu_beneficial: false,
+        samples: 0,
+        batches: 0,
+        last_gpu_tokens_per_sec: 0.0,
+        last_cpu_tokens_per_sec: 0.0,
+    });
+
+    fn lock() -> std::sync::MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Plan the next adaptive dispatch. Defaults to GPU-only; engages the twin
+    /// only when the latest probe showed it keeps up, and periodically probes to
+    /// re-check as sequence lengths drift.
+    pub(crate) fn plan() -> SplitPlan {
+        let mut s = lock();
+        s.batches += 1;
+        let probe = s.batches <= PROBE_EARLY || s.batches.is_multiple_of(PROBE_INTERVAL);
+        if probe {
+            SplitPlan::Balanced {
+                ratio: s.ratio,
+                min_cpu_probe: PROBE_CPU_ENTITIES,
+            }
+        } else if s.cpu_beneficial {
+            SplitPlan::Balanced {
+                ratio: s.ratio,
+                min_cpu_probe: 0,
+            }
+        } else {
+            SplitPlan::GpuOnly
+        }
+    }
+
+    /// Fold one concurrent dispatch's measured arm throughput into the ratio and
+    /// the beneficial decision.
+    pub(crate) fn record(gpu_tokens: u64, gpu_secs: f64, cpu_tokens: u64, cpu_secs: f64) {
+        if gpu_tokens == 0 || cpu_tokens == 0 || gpu_secs <= 0.0 || cpu_secs <= 0.0 {
+            return;
+        }
+        let gpu_tps = gpu_tokens as f64 / gpu_secs;
+        let cpu_tps = cpu_tokens as f64 / cpu_secs;
+        if !gpu_tps.is_finite() || !cpu_tps.is_finite() || cpu_tps <= 0.0 {
+            return;
+        }
+        let measured = (gpu_tps / cpu_tps).clamp(RATIO_MIN, RATIO_MAX);
+        let mut s = lock();
+        s.ratio = if s.samples == 0 {
+            measured
+        } else {
+            ((1.0 - EWMA_ALPHA) * s.ratio + EWMA_ALPHA * measured).clamp(RATIO_MIN, RATIO_MAX)
+        };
+        // The CPU arm is worth running only if it finished within the GPU arm's
+        // wall time — otherwise it is the batch's bottleneck and the GPU idled.
+        s.cpu_beneficial = cpu_secs <= gpu_secs;
+        s.samples += 1;
+        s.last_gpu_tokens_per_sec = gpu_tps;
+        s.last_cpu_tokens_per_sec = cpu_tps;
+    }
+
+    /// Current `(ratio, gpu_tokens_per_sec, cpu_tokens_per_sec, cpu_beneficial, samples)`.
+    pub fn snapshot() -> (f64, f64, f64, bool, u64) {
+        let s = lock();
+        (
+            s.ratio,
+            s.last_gpu_tokens_per_sec,
+            s.last_cpu_tokens_per_sec,
+            s.cpu_beneficial,
+            s.samples,
+        )
+    }
+
+    /// Reset to the bootstrap state (test/diagnostic harnesses).
+    pub fn reset() {
+        let mut s = lock();
+        *s = State {
+            ratio: BOOTSTRAP_RATIO,
+            cpu_beneficial: false,
+            samples: 0,
+            batches: 0,
+            last_gpu_tokens_per_sec: 0.0,
+            last_cpu_tokens_per_sec: 0.0,
+        };
+    }
+}
+
 /// Default HuggingFace model ID.
 ///
 /// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
@@ -818,29 +955,69 @@ impl BertEmbedder {
                     .ids
                     .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
                 let (short, long) = batch.as_slice().split_at(split);
-                self.dispatch_concurrent(short, long, dimensions, budget)?
+                self.dispatch_concurrent(short, long, dimensions, budget, false)?
             }
             HybridMode::Balanced { gpu_tput_ratio } => {
-                let (metal_subset, cpu_subset) =
-                    balanced_partition(batch.as_slice(), gpu_tput_ratio);
-                let metal_tokens: usize = metal_subset.ids.iter().map(|ids| ids.len()).sum();
-                let cpu_tokens: usize = cpu_subset.ids.iter().map(|ids| ids.len()).sum();
-                tracing::info!(
-                    target: "kindb.embed.dispatch",
-                    metal_entities = metal_subset.len(),
-                    cpu_entities = cpu_subset.len(),
-                    metal_tokens = metal_tokens,
-                    cpu_tokens = cpu_tokens,
-                    gpu_tput_ratio = gpu_tput_ratio,
-                    cpu_threads = rayon::current_num_threads(),
-                    "embed_hybrid_balance"
-                );
-                self.dispatch_concurrent(
-                    metal_subset.as_slice(),
-                    cpu_subset.as_slice(),
-                    dimensions,
-                    budget,
-                )?
+                // An explicit env ratio pins a balanced split; otherwise the plan
+                // is adaptive — GPU-only unless a probe shows the twin keeps up.
+                let (plan, adaptive) = match gpu_tput_ratio {
+                    Some(fixed) => (
+                        adaptive_split::SplitPlan::Balanced {
+                            ratio: fixed,
+                            min_cpu_probe: 0,
+                        },
+                        false,
+                    ),
+                    None => (adaptive_split::plan(), true),
+                };
+                match plan {
+                    adaptive_split::SplitPlan::GpuOnly => {
+                        // The twin is not pulling its weight at this sequence
+                        // length: embed the whole batch on the GPU and record the
+                        // decision rather than fake-balancing a dragging split.
+                        let entities = batch.len() as u64;
+                        let tokens: u64 = batch.ids.iter().map(|ids| ids.len() as u64).sum();
+                        hybrid_metrics::record_single_side_batch();
+                        hybrid_metrics::record_gpu(entities, tokens);
+                        tracing::info!(
+                            target: "kindb.embed.dispatch",
+                            routing = "gpu_only_adaptive",
+                            gpu_entities = entities,
+                            gpu_tokens = tokens,
+                            cpu_twin_used = false,
+                            "embed_hybrid_dispatch"
+                        );
+                        self.process_encoded_subset(batch.as_slice(), dimensions, budget, None)?
+                    }
+                    adaptive_split::SplitPlan::Balanced {
+                        ratio,
+                        min_cpu_probe,
+                    } => {
+                        let (metal_subset, cpu_subset) =
+                            balanced_partition(batch.as_slice(), ratio, min_cpu_probe);
+                        let metal_tokens: usize =
+                            metal_subset.ids.iter().map(|ids| ids.len()).sum();
+                        let cpu_tokens: usize = cpu_subset.ids.iter().map(|ids| ids.len()).sum();
+                        tracing::info!(
+                            target: "kindb.embed.dispatch",
+                            metal_entities = metal_subset.len(),
+                            cpu_entities = cpu_subset.len(),
+                            metal_tokens = metal_tokens,
+                            cpu_tokens = cpu_tokens,
+                            gpu_tput_ratio = ratio,
+                            adaptive = adaptive,
+                            cpu_threads = rayon::current_num_threads(),
+                            "embed_hybrid_balance"
+                        );
+                        self.dispatch_concurrent(
+                            metal_subset.as_slice(),
+                            cpu_subset.as_slice(),
+                            dimensions,
+                            budget,
+                            adaptive,
+                        )?
+                    }
+                }
             }
         };
 
@@ -1079,6 +1256,7 @@ impl BertEmbedder {
         cpu_side: EncodedSlice<'_>,
         dimensions: usize,
         budget: BatchBudget,
+        record_adaptive: bool,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
         let tokens =
             |side: EncodedSlice<'_>| -> u64 { side.ids.iter().map(|ids| ids.len() as u64).sum() };
@@ -1186,28 +1364,56 @@ impl BertEmbedder {
             cpu_twin_used = true,
             "embed_hybrid_dispatch"
         );
-        let (metal_res, cpu_res) = rayon::join(
+        let (metal_timed, cpu_timed) = rayon::join(
             || {
-                self.process_encoded_subset(
+                let started = std::time::Instant::now();
+                let result = self.process_encoded_subset(
                     metal_side,
                     dimensions,
                     budget,
                     Some(EmbedBackendChoice::Metal {
                         reason: "hybrid_metal",
                     }),
-                )
+                );
+                (result, started.elapsed())
             },
             || {
-                self.process_encoded_subset(
+                let started = std::time::Instant::now();
+                let result = self.process_encoded_subset(
                     cpu_side,
                     dimensions,
                     budget,
                     Some(EmbedBackendChoice::Cpu {
                         reason: "hybrid_cpu",
                     }),
-                )
+                );
+                (result, started.elapsed())
             },
         );
+        let (metal_res, metal_secs) = metal_timed;
+        let (cpu_res, cpu_secs) = cpu_timed;
+
+        // Feed the measured per-arm throughput back into the adaptive ratio so the
+        // next split tracks the real GPU-vs-CPU speed at this sequence length.
+        if record_adaptive {
+            adaptive_split::record(
+                metal_tokens,
+                metal_secs.as_secs_f64(),
+                cpu_tokens,
+                cpu_secs.as_secs_f64(),
+            );
+            let (ratio, gpu_tps, cpu_tps, cpu_beneficial, samples) = adaptive_split::snapshot();
+            tracing::info!(
+                target: "kindb.embed.dispatch",
+                gpu_tokens_per_sec = gpu_tps,
+                cpu_tokens_per_sec = cpu_tps,
+                adaptive_ratio = ratio,
+                cpu_beneficial = cpu_beneficial,
+                samples = samples,
+                "embed_hybrid_adaptive"
+            );
+        }
+
         let mut merged = metal_res?;
         merged.extend(cpu_res?);
         Ok(merged)
@@ -1966,14 +2172,16 @@ enum EmbedBackendChoice {
 }
 
 #[cfg(feature = "embeddings")]
-const HYBRID_DEFAULT_GPU_TPUT_RATIO: f64 = 4.0;
-
-#[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HybridMode {
     Off,
     SeqFloor,
-    Balanced { gpu_tput_ratio: f64 },
+    /// `gpu_tput_ratio` is `Some` only when `KIN_EMBED_HYBRID_GPU_TPUT_RATIO`
+    /// pins it explicitly; otherwise it is `None` and the split ratio is measured
+    /// adaptively per batch (see [`adaptive_split`]).
+    Balanced {
+        gpu_tput_ratio: Option<f64>,
+    },
 }
 
 #[cfg(feature = "embeddings")]
@@ -1981,8 +2189,7 @@ fn balanced_from_ratio_env() -> HybridMode {
     let gpu_tput_ratio = std::env::var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(HYBRID_DEFAULT_GPU_TPUT_RATIO);
+        .filter(|v| v.is_finite() && *v > 0.0);
     HybridMode::Balanced { gpu_tput_ratio }
 }
 
@@ -2123,10 +2330,15 @@ impl<'a> EncodedSlice<'a> {
 /// they must raise the GPU's share of the short work, not reduce it — a `− long`
 /// form would drive the target negative on long-heavy corpora and empty the GPU
 /// subset.
+///
+/// `min_cpu_probe` forces the twin at least that many of the SHORTEST entities
+/// even when the ratio would give it none — used by the adaptive probe to take a
+/// fresh throughput measurement (shortest entities minimize the probe's cost).
 #[cfg(feature = "embeddings")]
 fn balanced_partition(
     batch: EncodedSlice<'_>,
     gpu_tput_ratio: f64,
+    min_cpu_probe: usize,
 ) -> (EncodedBatch, EncodedBatch) {
     let ceiling_split = batch
         .ids
@@ -2158,6 +2370,23 @@ fn balanced_partition(
             metal_work += w;
             metal_count += 1;
             to_metal[pos] = true;
+        }
+    }
+
+    // Adaptive probe: ensure the twin gets at least `min_cpu_probe` entities by
+    // moving the shortest GPU-assigned ones over (the batch is length-sorted
+    // ascending, so low positions are shortest = cheapest to run on the CPU).
+    if min_cpu_probe > 0 {
+        let mut cpu_count = batch.len() - metal_count;
+        for on_metal in to_metal.iter_mut() {
+            if cpu_count >= min_cpu_probe {
+                break;
+            }
+            if *on_metal {
+                *on_metal = false;
+                metal_count -= 1;
+                cpu_count += 1;
+            }
         }
     }
 
@@ -3031,6 +3260,11 @@ mod tests {
     #[cfg(feature = "embeddings")]
     static RESOURCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the tests that mutate the process-global `adaptive_split` state
+    /// so the parallel test runner can't interleave their reset/record/plan calls.
+    #[cfg(feature = "embeddings")]
+    static ADAPTIVE_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Serializes process-env access for the resource-profile tests and snapshots
     /// the relevant vars, restoring them on drop so the suite never leaks state.
     #[cfg(feature = "embeddings")]
@@ -3207,8 +3441,9 @@ mod tests {
         let expected = match throughput_embedding_plan(GpuBackend::Metal).hybrid_mode {
             kin_infer::resource::HybridMode::Off => HybridMode::Off,
             kin_infer::resource::HybridMode::SequentialFloor => HybridMode::SeqFloor,
+            // No explicit ratio env, so the split is adaptive (None).
             kin_infer::resource::HybridMode::Balanced => HybridMode::Balanced {
-                gpu_tput_ratio: HYBRID_DEFAULT_GPU_TPUT_RATIO,
+                gpu_tput_ratio: None,
             },
         };
         assert_eq!(hybrid_mode(GpuBackend::Metal), expected);
@@ -3228,10 +3463,11 @@ mod tests {
     fn hybrid_mode_explicit_balanced_wins_without_profile() {
         let _env = ResourceEnvGuard::acquire();
         std::env::set_var("KIN_EMBED_HYBRID", "1");
+        // Hybrid forced on, but no explicit ratio → adaptive (None).
         assert_eq!(
             hybrid_mode(GpuBackend::Metal),
             HybridMode::Balanced {
-                gpu_tput_ratio: HYBRID_DEFAULT_GPU_TPUT_RATIO,
+                gpu_tput_ratio: None
             }
         );
     }
@@ -3287,7 +3523,7 @@ mod tests {
         let mut lengths: Vec<usize> = (0..200).map(|_| 128).collect();
         lengths.extend((0..20).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // > threshold
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
 
         assert!(
             metal.len() > 0,
@@ -3305,7 +3541,7 @@ mod tests {
         let mut lengths: Vec<usize> = (0..10).map(|_| 200).collect(); // short
         lengths.extend((0..10).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // long, heavy
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
 
         assert_eq!(
             metal.len(),
@@ -3340,7 +3576,7 @@ mod tests {
     fn balanced_partition_no_long_splits_short_by_ratio() {
         let lengths: Vec<usize> = (0..100).map(|_| 100).collect();
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
 
         assert!(metal.len() > 0 && cpu.len() > 0, "both arms must run");
         let metal_frac = metal.len() as f64 / lengths.len() as f64;
@@ -3370,11 +3606,111 @@ mod tests {
             lengths.push(len);
         }
         let batch = encoded_batch_from_lengths(&lengths);
-        let (m1, c1) = balanced_partition(batch.as_slice(), 3.5);
-        let (m2, c2) = balanced_partition(batch.as_slice(), 3.5);
+        let (m1, c1) = balanced_partition(batch.as_slice(), 3.5, 0);
+        let (m2, c2) = balanced_partition(batch.as_slice(), 3.5, 0);
         assert_eq!(m1.idx, m2.idx, "GPU assignment must be deterministic");
         assert_eq!(c1.idx, c2.idx, "CPU assignment must be deterministic");
         covers_all_indices(&m1, &c1, lengths.len());
+    }
+
+    // The adaptive ratio rides toward GPU-only when the CPU twin is much slower
+    // (long sequences) and settles low when the CPU keeps up (short sequences) —
+    // exactly what stops the twin from dragging the GPU on long code corpora.
+    // (Only this test mutates the process-global adaptive state.)
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn adaptive_ratio_tracks_measured_throughput() {
+        let _guard = ADAPTIVE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // CPU ~100× slower: GPU 100k tok in 0.1s (1M tok/s), CPU 5k tok in 0.5s (10k tok/s).
+        adaptive_split::reset();
+        for _ in 0..12 {
+            adaptive_split::record(100_000, 0.1, 5_000, 0.5);
+        }
+        let (slow_cpu_ratio, _, _, _, samples) = adaptive_split::snapshot();
+        assert!(samples >= 12);
+        assert!(
+            slow_cpu_ratio > 40.0,
+            "ratio must ride up toward GPU-only when the CPU drags, got {slow_cpu_ratio}"
+        );
+
+        // CPU keeps up: GPU 1M tok/s, CPU 900k tok/s → ratio ~1.1.
+        adaptive_split::reset();
+        for _ in 0..12 {
+            adaptive_split::record(100_000, 0.1, 90_000, 0.1);
+        }
+        let (fast_cpu_ratio, _, _, _, _) = adaptive_split::snapshot();
+        assert!(
+            fast_cpu_ratio < 2.0,
+            "ratio must settle low when the CPU keeps up, got {fast_cpu_ratio}"
+        );
+        adaptive_split::reset();
+    }
+
+    // A high ratio gives the twin zero, but the probe must still hand it the
+    // minimum (shortest) entities so the next batch yields a fresh measurement.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn adaptive_probe_forces_min_cpu_share() {
+        let lengths: Vec<usize> = (0..40).map(|i| 100 + i).collect();
+        let batch = encoded_batch_from_lengths(&lengths);
+        // Without a probe, a near-infinite ratio sends ~everything to the GPU.
+        let (_, cpu_no_probe) = balanced_partition(batch.as_slice(), 1.0e6, 0);
+        assert!(
+            cpu_no_probe.len() <= 1,
+            "high ratio with no probe → ~GPU-only, got {}",
+            cpu_no_probe.len()
+        );
+        // With a probe of 2, the twin gets at least its minimum share.
+        let (metal, cpu) = balanced_partition(batch.as_slice(), 1.0e6, 2);
+        assert!(
+            cpu.len() >= 2,
+            "probe must hand the twin its minimum share, got {}",
+            cpu.len()
+        );
+        assert!(
+            cpu.ids.iter().all(|ids| ids.len() <= 102),
+            "probe must pick the shortest entities (cheapest CPU cost)"
+        );
+        covers_all_indices(&metal, &cpu, lengths.len());
+    }
+
+    // After the early-probe window the plan engages the twin ONLY when the last
+    // measurement showed it finishing within the GPU arm's time — otherwise it
+    // stays GPU-only rather than fake-balancing a dragging split.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn adaptive_plan_engages_twin_only_when_beneficial() {
+        use adaptive_split::SplitPlan;
+        let _guard = ADAPTIVE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // CPU drags (cpu_secs 0.5 > gpu_secs 0.1) → GPU-only after the probe window.
+        adaptive_split::reset();
+        adaptive_split::record(100_000, 0.1, 5_000, 0.5);
+        let mut plan = None;
+        for _ in 0..5 {
+            plan = Some(adaptive_split::plan());
+        }
+        assert!(
+            matches!(plan, Some(SplitPlan::GpuOnly)),
+            "a dragging CPU must yield GPU-only after the probe window"
+        );
+
+        // CPU keeps up (cpu_secs 0.1 <= gpu_secs 0.1) → engage the twin.
+        adaptive_split::reset();
+        adaptive_split::record(100_000, 0.1, 90_000, 0.1);
+        let mut plan = None;
+        for _ in 0..5 {
+            plan = Some(adaptive_split::plan());
+        }
+        assert!(
+            matches!(plan, Some(SplitPlan::Balanced { .. })),
+            "a CPU that keeps up must engage a balanced split"
+        );
+        adaptive_split::reset();
     }
 
     // The SeqFloor split (slice `split_at`, zero-clone) likewise covers every index
