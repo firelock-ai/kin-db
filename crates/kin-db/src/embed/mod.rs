@@ -124,6 +124,7 @@ pub mod hybrid_metrics {
     static HYBRID_BATCHES: AtomicU64 = AtomicU64::new(0);
     static SINGLE_SIDE_BATCHES: AtomicU64 = AtomicU64::new(0);
     static TWIN_UNAVAILABLE_BATCHES: AtomicU64 = AtomicU64::new(0);
+    static CPU_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
 
     /// A point-in-time read of the hybrid dispatch counters.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +144,9 @@ pub mod hybrid_metrics {
         /// Batches that fell back to serial primary-model dispatch because the
         /// CPU twin could not be built.
         pub twin_unavailable_batches: u64,
+        /// CPU subsets embedded with their sub-batches spread concurrently across
+        /// cores — non-zero proves the idle cores ran in parallel.
+        pub cpu_parallel_batches: u64,
     }
 
     pub(crate) fn record_gpu(entities: u64, tokens: u64) {
@@ -167,6 +171,10 @@ pub mod hybrid_metrics {
         TWIN_UNAVAILABLE_BATCHES.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_cpu_parallel_batch() {
+        CPU_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the current counters.
     pub fn snapshot() -> HybridDispatchStats {
         HybridDispatchStats {
@@ -177,6 +185,7 @@ pub mod hybrid_metrics {
             hybrid_batches: HYBRID_BATCHES.load(Ordering::Relaxed),
             single_side_batches: SINGLE_SIDE_BATCHES.load(Ordering::Relaxed),
             twin_unavailable_batches: TWIN_UNAVAILABLE_BATCHES.load(Ordering::Relaxed),
+            cpu_parallel_batches: CPU_PARALLEL_BATCHES.load(Ordering::Relaxed),
         }
     }
 
@@ -190,6 +199,7 @@ pub mod hybrid_metrics {
             &HYBRID_BATCHES,
             &SINGLE_SIDE_BATCHES,
             &TWIN_UNAVAILABLE_BATCHES,
+            &CPU_PARALLEL_BATCHES,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -844,151 +854,223 @@ impl BertEmbedder {
         budget: BatchBudget,
         backend_override: Option<EmbedBackendChoice>,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
-        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
+        // Pack the length-sorted run into sub-batch ranges up front.
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
         let mut start = 0usize;
         while start < batch.len() {
             let (end, longest) = budget.next_batch(batch.ids, start);
-
-            // Zero-copy sub-batch: borrow the contiguous ranges instead of
-            // re-cloning the token buffers each iteration.
-            let token_ids = &batch.ids[start..end];
-            let attention_masks = &batch.masks[start..end];
-            let indices = &batch.idx[start..end];
-            let count = end - start;
-
-            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
-            let vectors = match backend_choice {
-                EmbedBackendChoice::Metal { reason } => {
-                    tracing::info!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = count,
-                        max_seq = longest,
-                        backend = "metal",
-                        reason = reason,
-                        "embed_dispatch"
-                    );
-                    let _span = tracing::info_span!(
-                        "kindb.embedder.forward_batch",
-                        batch = count,
-                        longest = longest
-                    )
-                    .entered();
-                    let metal_forward = if metal_oom_injection_armed() {
-                        Err(kin_infer::InferError::OutOfMemory(
-                            "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
-                        ))
-                    } else {
-                        self.model.forward_batched(token_ids, attention_masks)
-                    };
-                    match metal_forward {
-                        Ok(v) => v,
-                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
-                            // Metal ran out of device memory mid-forward. Rather
-                            // than failing the index, degrade this batch to the
-                            // CPU twin (which create_compute builds under
-                            // KIN_INFER_FORCE_CPU) and retry once.
-                            tracing::warn!(
-                                target: "kindb.embed.dispatch",
-                                error = %msg,
-                                batch_size = count,
-                                max_seq = longest,
-                                "metal embed out-of-memory; retrying batch on CPU"
-                            );
-                            let cpu_model = match self.cpu_model() {
-                                Ok(m) => Some(m),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "cpu_model unavailable after metal OOM; retrying on primary model"
-                                    );
-                                    None
-                                }
-                            };
-                            let model = cpu_model.unwrap_or(&self.model);
-                            model
-                                .forward_batched(token_ids, attention_masks)
-                                .map_err(|e| {
-                                    KinDbError::IndexError(format!(
-                                        "inference failed (cpu retry after metal OOM): {e}"
-                                    ))
-                                })?
-                        }
-                        Err(e) => {
-                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
-                        }
-                    }
-                }
-                EmbedBackendChoice::Cpu { reason } => {
-                    tracing::info!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = count,
-                        max_seq = longest,
-                        backend = "cpu",
-                        reason = reason,
-                        "embed_dispatch"
-                    );
-                    let _span = tracing::info_span!(
-                        "kindb.embedder.forward_cpu_path",
-                        batch = count,
-                        longest = longest
-                    )
-                    .entered();
-                    let cpu_model = match self.cpu_model() {
-                        Ok(m) => Some(m),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "cpu_model unavailable; falling back to primary model for this chunk"
-                            );
-                            None
-                        }
-                    };
-                    let model = cpu_model.unwrap_or(&self.model);
-                    model
-                        .forward_batched(token_ids, attention_masks)
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
-                }
-            };
-
-            // Defense in depth: if the dispatched path still returned any
-            // non-finite vectors, retry per-sample through the single-input
-            // forward path before the outer sanitizer handles any remaining
-            // bad vectors.
-            let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
-                tracing::warn!(
-                    batch = count,
-                    longest = longest,
-                    "dispatched path produced non-finite vectors; retrying via single-input forward path"
-                );
-                let mut retried = Vec::with_capacity(count);
-                for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
-                    let out = self
-                        .model
-                        .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
-                    retried.push(out.into_iter().next().ok_or_else(|| {
-                        KinDbError::IndexError("forward returned empty batch".into())
-                    })?);
-                }
-                retried
-            } else {
-                vectors
-            };
-
-            for (original_idx, vector) in indices.iter().zip(vectors) {
-                if vector.len() != dimensions {
-                    return Err(KinDbError::IndexError(format!(
-                        "embedding returned {} dimensions, expected {}",
-                        vector.len(),
-                        dimensions
-                    )));
-                }
-                placed.push((*original_idx, vector));
-            }
+            ranges.push((start, end, longest));
             start = end;
         }
 
+        // Parallel CPU dispatch: when the work is pinned to the CPU twin under the
+        // throughput profile, embed the sub-batches concurrently across the idle
+        // cores rather than one at a time on a single thread (the case that pegs a
+        // single core on all-long code corpora). Each sub-batch forward is
+        // independent and deterministic, and results are scattered by original
+        // index, so the output is identical to the serial path. Requires the twin
+        // to be available so every forward runs on the CPU model — never a
+        // concurrent submission to the shared Metal model. Width is the ambient
+        // rayon pool (sized to the resource plan's rayon_threads by the host
+        // binary), so this does not oversubscribe and is not hardcoded.
+        let parallel_cpu = ranges.len() > 1
+            && matches!(backend_override, Some(EmbedBackendChoice::Cpu { .. }))
+            && resource_profile_is_throughput()
+            && self.cpu_model().is_ok();
+
+        if parallel_cpu {
+            hybrid_metrics::record_cpu_parallel_batch();
+            tracing::info!(
+                target: "kindb.embed.dispatch",
+                routing = "cpu_parallel",
+                sub_batches = ranges.len(),
+                entities = batch.len(),
+                rayon_threads = rayon::current_num_threads(),
+                "embed_cpu_parallel"
+            );
+            let backend_choice = EmbedBackendChoice::Cpu {
+                reason: "hybrid_cpu_parallel",
+            };
+            let chunks = ranges
+                .par_iter()
+                .map(|&(s, e, longest)| {
+                    self.process_chunk(
+                        backend_choice,
+                        &batch.ids[s..e],
+                        &batch.masks[s..e],
+                        &batch.idx[s..e],
+                        longest,
+                        dimensions,
+                    )
+                })
+                .collect::<Result<Vec<_>, KinDbError>>()?;
+            let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
+            for chunk in chunks {
+                placed.extend(chunk);
+            }
+            return Ok(placed);
+        }
+
+        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
+        for &(s, e, longest) in &ranges {
+            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
+            placed.extend(self.process_chunk(
+                backend_choice,
+                &batch.ids[s..e],
+                &batch.masks[s..e],
+                &batch.idx[s..e],
+                longest,
+                dimensions,
+            )?);
+        }
         Ok(placed)
+    }
+
+    /// Embed one sub-batch on the chosen backend and return its `(original_idx,
+    /// vector)` pairs.
+    ///
+    /// The non-finite retry runs on the SAME model that produced the batch, so a
+    /// CPU-twin sub-batch never falls back onto the shared Metal model — which is
+    /// what makes concurrent dispatch of CPU sub-batches safe.
+    fn process_chunk(
+        &self,
+        backend_choice: EmbedBackendChoice,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+        indices: &[usize],
+        longest: usize,
+        dimensions: usize,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        let count = token_ids.len();
+        let (vectors, forward_model): (Vec<Vec<f32>>, &BertModel) = match backend_choice {
+            EmbedBackendChoice::Metal { reason } => {
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    batch_size = count,
+                    max_seq = longest,
+                    backend = "metal",
+                    reason = reason,
+                    "embed_dispatch"
+                );
+                let _span = tracing::info_span!(
+                    "kindb.embedder.forward_batch",
+                    batch = count,
+                    longest = longest
+                )
+                .entered();
+                let metal_forward = if metal_oom_injection_armed() {
+                    Err(kin_infer::InferError::OutOfMemory(
+                        "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
+                    ))
+                } else {
+                    self.model.forward_batched(token_ids, attention_masks)
+                };
+                let vectors = match metal_forward {
+                    Ok(v) => v,
+                    Err(kin_infer::InferError::OutOfMemory(msg)) => {
+                        // Metal ran out of device memory mid-forward. Rather than
+                        // failing the index, degrade this batch to the CPU twin and
+                        // retry once.
+                        tracing::warn!(
+                            target: "kindb.embed.dispatch",
+                            error = %msg,
+                            batch_size = count,
+                            max_seq = longest,
+                            "metal embed out-of-memory; retrying batch on CPU"
+                        );
+                        let cpu_model = match self.cpu_model() {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "cpu_model unavailable after metal OOM; retrying on primary model"
+                                );
+                                None
+                            }
+                        };
+                        let model = cpu_model.unwrap_or(&self.model);
+                        model
+                            .forward_batched(token_ids, attention_masks)
+                            .map_err(|e| {
+                                KinDbError::IndexError(format!(
+                                    "inference failed (cpu retry after metal OOM): {e}"
+                                ))
+                            })?
+                    }
+                    Err(e) => {
+                        return Err(KinDbError::IndexError(format!("inference failed: {e}")));
+                    }
+                };
+                (vectors, &self.model)
+            }
+            EmbedBackendChoice::Cpu { reason } => {
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    batch_size = count,
+                    max_seq = longest,
+                    backend = "cpu",
+                    reason = reason,
+                    "embed_dispatch"
+                );
+                let _span = tracing::info_span!(
+                    "kindb.embedder.forward_cpu_path",
+                    batch = count,
+                    longest = longest
+                )
+                .entered();
+                let cpu_model = match self.cpu_model() {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "cpu_model unavailable; falling back to primary model for this chunk"
+                        );
+                        None
+                    }
+                };
+                let model = cpu_model.unwrap_or(&self.model);
+                let vectors = model
+                    .forward_batched(token_ids, attention_masks)
+                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+                (vectors, model)
+            }
+        };
+
+        // Defense in depth: if the dispatched path still returned any non-finite
+        // vectors, retry per-sample through the single-input forward path of the
+        // SAME model before the outer sanitizer handles any remaining bad vectors.
+        let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
+            tracing::warn!(
+                batch = count,
+                longest = longest,
+                "dispatched path produced non-finite vectors; retrying via single-input forward path"
+            );
+            let mut retried = Vec::with_capacity(count);
+            for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
+                let out = forward_model
+                    .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
+                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+                retried.push(out.into_iter().next().ok_or_else(|| {
+                    KinDbError::IndexError("forward returned empty batch".into())
+                })?);
+            }
+            retried
+        } else {
+            vectors
+        };
+
+        let mut chunk: Vec<(usize, Vec<f32>)> = Vec::with_capacity(count);
+        for (original_idx, vector) in indices.iter().zip(vectors) {
+            if vector.len() != dimensions {
+                return Err(KinDbError::IndexError(format!(
+                    "embedding returned {} dimensions, expected {}",
+                    vector.len(),
+                    dimensions
+                )));
+            }
+            chunk.push((*original_idx, vector));
+        }
+        Ok(chunk)
     }
 
     fn dispatch_concurrent(
@@ -1847,14 +1929,20 @@ impl BatchBudget {
     }
 }
 
-/// Seq_len partition used only by opt-in hybrid dispatch.
+/// Sequence-length ceiling above which the hybrid split keeps an entity on the
+/// CPU twin instead of the GPU.
 ///
-/// Plain `auto` no longer CPU-falls back above this threshold. The nlohmann/json
-/// backfill probe showed forced Metal cleanly embedding max_seq=2048 batches
-/// while the previous threshold routed those same long, context-augmented
-/// entities through the slow CPU path.
+/// Set to `EMBED_MAX_SEQ_LEN` — the tokenizer's hard truncation cap and the
+/// embedder's max trained sequence — so no real entity is forced to the slow CPU
+/// path. The Metal embedder produces finite, CPU-identical embeddings across the
+/// full `0..=EMBED_MAX_SEQ_LEN` range (the long-sequence NaN was a norm-dispatch
+/// bug in the inference engine, since fixed and validated batch-parity against
+/// the CPU twin up to 2048), so long code entities ride the GPU and the
+/// throughput hybrid splits work purely by the GPU/CPU throughput ratio rather
+/// than by sequence length. The `> threshold` arm remains a defensive guard for
+/// any future sequence longer than the cap.
 #[cfg(feature = "embeddings")]
-const EMBED_CPU_SEQ_THRESHOLD: usize = 1024;
+const EMBED_CPU_SEQ_THRESHOLD: usize = EMBED_MAX_SEQ_LEN;
 
 /// When auto dispatch resolves, should it prefer CPU unconditionally?
 ///
@@ -3197,7 +3285,7 @@ mod tests {
     #[test]
     fn balanced_partition_engages_both_arms_on_real_mix() {
         let mut lengths: Vec<usize> = (0..200).map(|_| 128).collect();
-        lengths.extend((0..20).map(|_| 1600)); // > EMBED_CPU_SEQ_THRESHOLD
+        lengths.extend((0..20).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // > threshold
         let batch = encoded_batch_from_lengths(&lengths);
         let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
 
@@ -3215,7 +3303,7 @@ mod tests {
     #[test]
     fn balanced_partition_long_heavy_keeps_gpu_busy() {
         let mut lengths: Vec<usize> = (0..10).map(|_| 200).collect(); // short
-        lengths.extend((0..10).map(|_| 2000)); // long, heavy
+        lengths.extend((0..10).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // long, heavy
         let batch = encoded_batch_from_lengths(&lengths);
         let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
 
@@ -3273,9 +3361,9 @@ mod tests {
     fn balanced_partition_is_deterministic_and_order_stable() {
         let mut lengths = Vec::new();
         for i in 0..300usize {
-            // Deterministic pseudo-mix of short and long sequences.
+            // Deterministic pseudo-mix of short and over-the-ceiling sequences.
             let len = if i % 7 == 0 {
-                1100 + (i % 5) * 200
+                EMBED_CPU_SEQ_THRESHOLD + 50 + (i % 5) * 200
             } else {
                 50 + (i % 31)
             };
@@ -3295,7 +3383,7 @@ mod tests {
     #[test]
     fn seqfloor_split_covers_all_indices() {
         let mut lengths: Vec<usize> = (0..50).map(|i| 100 + i).collect();
-        lengths.extend((0..15).map(|i| 1200 + i * 10));
+        lengths.extend((0..15).map(|i| EMBED_CPU_SEQ_THRESHOLD + 100 + i * 10));
         let batch = encoded_batch_from_lengths(&lengths);
         let split = batch
             .ids

@@ -25,7 +25,7 @@ use kin_db::CodeEmbedder;
 /// re-interleave their results into input order. Kept short so the forwards stay
 /// cheap in an unoptimized test build.
 fn sample_batch() -> Vec<String> {
-    (0..40)
+    (0..24)
         .map(|i| format!("fn entity_{i}(a: i32, b: i32) -> i32 {{ a * {i} + b - {i} }}"))
         .collect()
 }
@@ -61,6 +61,14 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
     };
     let texts = sample_batch();
 
+    // A small per-dispatch token budget plus an even split give the CPU subset
+    // several sub-batches — that is what makes the CPU arm exercise the
+    // concurrent-across-cores path instead of one serial dispatch. Both the
+    // reference and the hybrid run use the same budget, so per-entity vectors are
+    // directly comparable.
+    std::env::set_var("KIN_EMBED_MAX_BATCH_TOKENS", "96");
+    std::env::set_var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO", "1");
+
     // Reference: plain single-arm path (hybrid Off).
     std::env::remove_var("KIN_RESOURCE_PROFILE");
     let reference = embedder
@@ -69,17 +77,19 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
     assert_eq!(reference.len(), texts.len(), "one vector per input");
 
     // Hybrid: throughput profile splits the batch across the GPU arm and the
-    // concurrent CPU twin. Reset the dispatch counters first so the snapshot
-    // afterward reflects only this embed.
+    // concurrent CPU twin, and spreads the CPU subset's sub-batches across cores.
+    // Reset the dispatch counters first so the snapshot reflects only this embed.
     kin_db::embed::hybrid_metrics::reset();
     std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
     let hybrid = embedder
         .embed_batch(&texts)
         .expect("throughput-hybrid embed must succeed");
     std::env::remove_var("KIN_RESOURCE_PROFILE");
+    std::env::remove_var("KIN_EMBED_MAX_BATCH_TOKENS");
+    std::env::remove_var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO");
 
-    // PROVE the CPU twin actually ran a share of the batch on the idle cores —
-    // not the GPU silently absorbing everything.
+    // PROVE the CPU twin ran a share of the batch on the idle cores AND that it
+    // ran its sub-batches in parallel (not one-at-a-time on a single core).
     let stats = kin_db::embed::hybrid_metrics::snapshot();
     assert!(
         stats.cpu_twin_entities > 0,
@@ -89,11 +99,16 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
         stats.gpu_entities > 0,
         "GPU arm did zero work — the split is degenerate ({stats:?})"
     );
+    assert!(
+        stats.cpu_parallel_batches > 0,
+        "CPU subset was not embedded in parallel across cores ({stats:?})"
+    );
     println!(
-        "hybrid dispatch: gpu_entities={} cpu_twin_entities={} hybrid_batches={} single_side={} twin_unavailable={}",
+        "hybrid dispatch: gpu_entities={} cpu_twin_entities={} hybrid_batches={} cpu_parallel_batches={} single_side={} twin_unavailable={}",
         stats.gpu_entities,
         stats.cpu_twin_entities,
         stats.hybrid_batches,
+        stats.cpu_parallel_batches,
         stats.single_side_batches,
         stats.twin_unavailable_batches
     );
