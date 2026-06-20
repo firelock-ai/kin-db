@@ -6,8 +6,3 @@
 
 [registries.kin]
 index = "sparse+https://kinlab.ai/registry/cargo/"
-
-[patch.kin]
-kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git", rev = "5e8b3c3a596163fe6c4b276bcd27c02ffacd694f" }
-kin-search = { git = "https://github.com/firelock-ai/kin-search.git", rev = "cb0680b82f38c8477a0facd33b4cdefde3fa6dfc" }
-kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "dd743d741c6832e15179ac60720b5218558e10fb" }
