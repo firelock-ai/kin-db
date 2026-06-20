@@ -104,6 +104,7 @@ jobs:
             -A clippy::blocks_in_conditions \
             -A clippy::cloned_ref_to_slice_refs \
             -A clippy::field_reassign_with_default \
+            -A clippy::items_after_test_module \
             -A clippy::large_enum_variant \
             -A clippy::let_and_return \
             -A clippy::let_unit_value \
