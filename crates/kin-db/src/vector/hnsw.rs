@@ -114,7 +114,8 @@ impl VectorIndex {
         items: Vec<(RetrievalKey, Vec<f32>)>,
     ) -> Result<(), KinDbError> {
         let _span =
-            tracing::info_span!("kindb.vector_index.upsert_batch", batch_size = items.len()).entered();
+            tracing::info_span!("kindb.vector_index.upsert_batch", batch_size = items.len())
+                .entered();
         self.inner
             .upsert_batch(items)
             .map_err(|e| KinDbError::IndexError(e.to_string()))

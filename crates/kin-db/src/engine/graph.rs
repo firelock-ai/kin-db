@@ -2213,7 +2213,8 @@ impl InMemoryGraph {
                 .collect()
         };
 
-        let batch: Vec<(&Entity, &[(String, f32)])> = docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
+        let batch: Vec<(&Entity, &[(String, f32)])> =
+            docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
         let _ = ti.upsert_with_extra_fields_batch(batch);
 
         if !entity_ids.is_empty() {
@@ -3654,7 +3655,7 @@ impl InMemoryGraph {
         if take < keyed.len() {
             let (_, _, _) = keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
         }
-        
+
         let leftover = keyed.split_off(take);
         keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if !leftover.is_empty() {
@@ -3932,13 +3933,10 @@ impl InMemoryGraph {
                 .collect();
 
             if let Err(err) = vi.upsert_retrievable_batch(batch_items) {
-                let mut remaining_keys: Vec<RetrievalKey> = chunk
-                    .iter()
-                    .map(|(rest_key, _)| *rest_key)
-                    .collect();
+                let mut remaining_keys: Vec<RetrievalKey> =
+                    chunk.iter().map(|(rest_key, _)| *rest_key).collect();
 
-                let next_chunk_start =
-                    ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
+                let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
                 remaining_keys.extend(
                     entity_data[next_chunk_start..]
                         .iter()

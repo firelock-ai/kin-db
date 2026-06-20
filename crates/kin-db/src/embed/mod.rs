@@ -2765,7 +2765,9 @@ impl EmbeddingCache {
         Some(Self {
             root,
             dimensions,
-            memory_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            memory_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
