@@ -13,6 +13,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 #[cfg(feature = "embeddings")]
 use kin_infer::gpu::GpuBackend;
 #[cfg(feature = "embeddings")]
+use rayon::prelude::*;
+#[cfg(feature = "embeddings")]
 use reqwest::blocking::Client as BlockingHttpClient;
 #[cfg(feature = "embeddings")]
 use serde::{Deserialize, Serialize};
@@ -619,8 +621,13 @@ impl BertEmbedder {
                 .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?
         };
 
-        let mut encoded: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
-            .iter()
+        // Extract token ids + masks in parallel, then length-sort so the budget
+        // packs same-length entities together. The parallel collect preserves
+        // input order and the sort is stable, so equal-length entities keep their
+        // ascending original index — ordering is identical to the prior serial
+        // extraction.
+        let mut order: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
+            .into_par_iter()
             .enumerate()
             .map(|(idx, encoding)| {
                 (
@@ -630,35 +637,102 @@ impl BertEmbedder {
                 )
             })
             .collect();
-        encoded.sort_by_key(|(_, ids, _)| ids.len());
+        order.sort_by_key(|(_, ids, _)| ids.len());
+
+        // Move (not clone) the sorted tuples into parallel arrays. Holding ids and
+        // masks contiguously lets every GPU dispatch borrow a sub-range directly,
+        // so the hot loop never re-clones token buffers per sub-batch.
+        let mut batch = EncodedBatch {
+            idx: Vec::with_capacity(order.len()),
+            ids: Vec::with_capacity(order.len()),
+            masks: Vec::with_capacity(order.len()),
+        };
+        for (idx, ids, mask) in order {
+            batch.idx.push(idx);
+            batch.ids.push(ids);
+            batch.masks.push(mask);
+        }
 
         let budget = BatchBudget::from_env(self.model.backend());
 
         let mode = hybrid_mode(self.model.backend());
         if mode != HybridMode::Off {
-            return self.embed_hybrid(encoded, dimensions, budget, texts.len(), mode);
+            return self.embed_hybrid(batch, dimensions, budget, texts.len(), mode);
         }
 
-        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let placed = self.process_encoded_subset(batch.as_slice(), dimensions, budget, None)?;
+        scatter_placed(placed, texts.len())
+    }
+
+    fn embed_hybrid(
+        &self,
+        batch: EncodedBatch,
+        dimensions: usize,
+        budget: BatchBudget,
+        total: usize,
+        mode: HybridMode,
+    ) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let placed = match mode {
+            HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
+            HybridMode::SeqFloor => {
+                let split = batch
+                    .ids
+                    .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
+                let (short, long) = batch.as_slice().split_at(split);
+                self.dispatch_concurrent(short, long, dimensions, budget)?
+            }
+            HybridMode::Balanced { gpu_tput_ratio } => {
+                let (metal_subset, cpu_subset) =
+                    balanced_partition(batch.as_slice(), gpu_tput_ratio);
+                let metal_tokens: usize = metal_subset.ids.iter().map(|ids| ids.len()).sum();
+                let cpu_tokens: usize = cpu_subset.ids.iter().map(|ids| ids.len()).sum();
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    metal_entities = metal_subset.len(),
+                    cpu_entities = cpu_subset.len(),
+                    metal_tokens = metal_tokens,
+                    cpu_tokens = cpu_tokens,
+                    gpu_tput_ratio = gpu_tput_ratio,
+                    cpu_threads = rayon::current_num_threads(),
+                    "embed_hybrid_balance"
+                );
+                self.dispatch_concurrent(
+                    metal_subset.as_slice(),
+                    cpu_subset.as_slice(),
+                    dimensions,
+                    budget,
+                )?
+            }
+        };
+
+        scatter_placed(placed, total)
+    }
+
+    fn process_encoded_subset(
+        &self,
+        batch: EncodedSlice<'_>,
+        dimensions: usize,
+        budget: BatchBudget,
+        backend_override: Option<EmbedBackendChoice>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
         let mut start = 0usize;
-        while start < encoded.len() {
-            let (end, longest) = budget.next_batch(&encoded, start);
+        while start < batch.len() {
+            let (end, longest) = budget.next_batch(batch.ids, start);
 
-            let batch = &encoded[start..end];
-            let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
-            let attention_masks: Vec<Vec<u32>> =
-                batch.iter().map(|(_, _, mask)| mask.clone()).collect();
+            // Zero-copy sub-batch: borrow the contiguous ranges instead of
+            // re-cloning the token buffers each iteration.
+            let token_ids = &batch.ids[start..end];
+            let attention_masks = &batch.masks[start..end];
+            let indices = &batch.idx[start..end];
+            let count = end - start;
 
-            // TODO(metal): seq_len > ~500 produces NaN in kin-infer Metal attention
-            // kernels for the batched code path (fused_attention_batched —
-            // scale_mask_alibi_grouped.metal / softmax_rows.metal — likely softmax
-            // max-subtract missing), so long sequences route to the CPU backend.
-            let backend_choice = resolve_embed_backend(longest);
+            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
             let vectors = match backend_choice {
                 EmbedBackendChoice::Metal { reason } => {
                     tracing::info!(
                         target: "kindb.embed.dispatch",
-                        batch_size = batch.len(),
+                        batch_size = count,
                         max_seq = longest,
                         backend = "metal",
                         reason = reason,
@@ -666,7 +740,7 @@ impl BertEmbedder {
                     );
                     let _span = tracing::info_span!(
                         "kindb.embedder.forward_batch",
-                        batch = batch.len(),
+                        batch = count,
                         longest = longest
                     )
                     .entered();
@@ -675,7 +749,7 @@ impl BertEmbedder {
                             "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
                         ))
                     } else {
-                        self.model.forward_batched(&token_ids, &attention_masks)
+                        self.model.forward_batched(token_ids, attention_masks)
                     };
                     match metal_forward {
                         Ok(v) => v,
@@ -687,7 +761,7 @@ impl BertEmbedder {
                             tracing::warn!(
                                 target: "kindb.embed.dispatch",
                                 error = %msg,
-                                batch_size = batch.len(),
+                                batch_size = count,
                                 max_seq = longest,
                                 "metal embed out-of-memory; retrying batch on CPU"
                             );
@@ -703,7 +777,7 @@ impl BertEmbedder {
                             };
                             let model = cpu_model.unwrap_or(&self.model);
                             model
-                                .forward_batched(&token_ids, &attention_masks)
+                                .forward_batched(token_ids, attention_masks)
                                 .map_err(|e| {
                                     KinDbError::IndexError(format!(
                                         "inference failed (cpu retry after metal OOM): {e}"
@@ -718,7 +792,7 @@ impl BertEmbedder {
                 EmbedBackendChoice::Cpu { reason } => {
                     tracing::info!(
                         target: "kindb.embed.dispatch",
-                        batch_size = batch.len(),
+                        batch_size = count,
                         max_seq = longest,
                         backend = "cpu",
                         reason = reason,
@@ -726,7 +800,7 @@ impl BertEmbedder {
                     );
                     let _span = tracing::info_span!(
                         "kindb.embedder.forward_cpu_path",
-                        batch = batch.len(),
+                        batch = count,
                         longest = longest
                     )
                     .entered();
@@ -742,7 +816,7 @@ impl BertEmbedder {
                     };
                     let model = cpu_model.unwrap_or(&self.model);
                     model
-                        .forward_batched(&token_ids, &attention_masks)
+                        .forward_batched(token_ids, attention_masks)
                         .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
                 }
             };
@@ -753,11 +827,11 @@ impl BertEmbedder {
             // bad vectors.
             let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
                 tracing::warn!(
-                    batch = batch.len(),
+                    batch = count,
                     longest = longest,
                     "dispatched path produced non-finite vectors; retrying via single-input forward path"
                 );
-                let mut retried = Vec::with_capacity(batch.len());
+                let mut retried = Vec::with_capacity(count);
                 for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
                     let out = self
                         .model
@@ -772,203 +846,7 @@ impl BertEmbedder {
                 vectors
             };
 
-            for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
-                if vector.len() != dimensions {
-                    return Err(KinDbError::IndexError(format!(
-                        "embedding returned {} dimensions, expected {}",
-                        vector.len(),
-                        dimensions
-                    )));
-                }
-                results[*original_idx] = Some(vector);
-            }
-            start = end;
-        }
-
-        results
-            .into_iter()
-            .map(|vector| {
-                vector.ok_or_else(|| {
-                    KinDbError::IndexError("embedding batch result order mismatch".into())
-                })
-            })
-            .collect()
-    }
-
-    fn embed_hybrid(
-        &self,
-        encoded: Vec<Encoded>,
-        dimensions: usize,
-        budget: BatchBudget,
-        total: usize,
-        mode: HybridMode,
-    ) -> Result<Vec<Vec<f32>>, KinDbError> {
-        let placed = match mode {
-            HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
-            HybridMode::SeqFloor => {
-                let split =
-                    encoded.partition_point(|(_, ids, _)| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
-                let (short, long) = encoded.split_at(split);
-                self.dispatch_concurrent(short, long, dimensions, budget)?
-            }
-            HybridMode::Balanced { gpu_tput_ratio } => {
-                let (metal_subset, cpu_subset) = balanced_partition(&encoded, gpu_tput_ratio);
-                let metal_tokens: usize = metal_subset.iter().map(|(_, ids, _)| ids.len()).sum();
-                let cpu_tokens: usize = cpu_subset.iter().map(|(_, ids, _)| ids.len()).sum();
-                tracing::info!(
-                    target: "kindb.embed.dispatch",
-                    metal_entities = metal_subset.len(),
-                    cpu_entities = cpu_subset.len(),
-                    metal_tokens = metal_tokens,
-                    cpu_tokens = cpu_tokens,
-                    gpu_tput_ratio = gpu_tput_ratio,
-                    cpu_threads = rayon::current_num_threads(),
-                    "embed_hybrid_balance"
-                );
-                self.dispatch_concurrent(&metal_subset, &cpu_subset, dimensions, budget)?
-            }
-        };
-
-        let mut results: Vec<Option<Vec<f32>>> = vec![None; total];
-        for (original_idx, vector) in placed {
-            results[original_idx] = Some(vector);
-        }
-        results
-            .into_iter()
-            .map(|vector| {
-                vector.ok_or_else(|| {
-                    KinDbError::IndexError("embedding batch result order mismatch".into())
-                })
-            })
-            .collect()
-    }
-
-    fn process_encoded_subset(
-        &self,
-        encoded: &[(usize, Vec<u32>, Vec<u32>)],
-        dimensions: usize,
-        budget: BatchBudget,
-        backend_override: Option<EmbedBackendChoice>,
-    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
-        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(encoded.len());
-        let mut start = 0usize;
-        while start < encoded.len() {
-            let (end, longest) = budget.next_batch(encoded, start);
-
-            let batch = &encoded[start..end];
-            let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
-            let attention_masks: Vec<Vec<u32>> =
-                batch.iter().map(|(_, _, mask)| mask.clone()).collect();
-
-            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
-            let vectors = match backend_choice {
-                EmbedBackendChoice::Metal { reason } => {
-                    tracing::info!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = batch.len(),
-                        max_seq = longest,
-                        backend = "metal",
-                        reason = reason,
-                        "embed_dispatch"
-                    );
-                    let _span = tracing::info_span!(
-                        "kindb.embedder.forward_batch",
-                        batch = batch.len(),
-                        longest = longest
-                    )
-                    .entered();
-                    match self.model.forward_batched(&token_ids, &attention_masks) {
-                        Ok(v) => v,
-                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
-                            // Metal ran out of device memory mid-forward. Rather
-                            // than failing the index, degrade this batch to the
-                            // CPU twin (which create_compute builds under
-                            // KIN_INFER_FORCE_CPU) and retry once.
-                            tracing::warn!(
-                                target: "kindb.embed.dispatch",
-                                error = %msg,
-                                batch_size = batch.len(),
-                                max_seq = longest,
-                                "metal embed out-of-memory; retrying batch on CPU"
-                            );
-                            let cpu_model = match self.cpu_model() {
-                                Ok(m) => Some(m),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "cpu_model unavailable after metal OOM; retrying on primary model"
-                                    );
-                                    None
-                                }
-                            };
-                            let model = cpu_model.unwrap_or(&self.model);
-                            model
-                                .forward_batched(&token_ids, &attention_masks)
-                                .map_err(|e| {
-                                    KinDbError::IndexError(format!(
-                                        "inference failed (cpu retry after metal OOM): {e}"
-                                    ))
-                                })?
-                        }
-                        Err(e) => {
-                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
-                        }
-                    }
-                }
-                EmbedBackendChoice::Cpu { reason } => {
-                    tracing::info!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = batch.len(),
-                        max_seq = longest,
-                        backend = "cpu",
-                        reason = reason,
-                        "embed_dispatch"
-                    );
-                    let _span = tracing::info_span!(
-                        "kindb.embedder.forward_cpu_path",
-                        batch = batch.len(),
-                        longest = longest
-                    )
-                    .entered();
-                    let cpu_model = match self.cpu_model() {
-                        Ok(m) => Some(m),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "cpu_model unavailable; falling back to primary model for this chunk"
-                            );
-                            None
-                        }
-                    };
-                    let model = cpu_model.unwrap_or(&self.model);
-                    model
-                        .forward_batched(&token_ids, &attention_masks)
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
-                }
-            };
-
-            let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
-                tracing::warn!(
-                    batch = batch.len(),
-                    longest = longest,
-                    "dispatched path produced non-finite vectors; retrying via single-input forward path"
-                );
-                let mut retried = Vec::with_capacity(batch.len());
-                for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
-                    let out = self
-                        .model
-                        .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
-                    retried.push(out.into_iter().next().ok_or_else(|| {
-                        KinDbError::IndexError("forward returned empty batch".into())
-                    })?);
-                }
-                retried
-            } else {
-                vectors
-            };
-
-            for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
+            for (original_idx, vector) in indices.iter().zip(vectors) {
                 if vector.len() != dimensions {
                     return Err(KinDbError::IndexError(format!(
                         "embedding returned {} dimensions, expected {}",
@@ -986,13 +864,21 @@ impl BertEmbedder {
 
     fn dispatch_concurrent(
         &self,
-        metal_side: &[Encoded],
-        cpu_side: &[Encoded],
+        metal_side: EncodedSlice<'_>,
+        cpu_side: EncodedSlice<'_>,
         dimensions: usize,
         budget: BatchBudget,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
         if metal_side.is_empty() {
-            return self.process_encoded_subset(cpu_side, dimensions, budget, None);
+            // Run this work on the CPU twin (the otherwise-idle cores). Passing
+            // `None` here would defer to the auto resolver, which routes to Metal —
+            // sending a CPU-destined subset back to the GPU. There is no
+            // concurrency in this branch (single subset), so deferring to the auto
+            // resolver only when the twin is unavailable is still safe.
+            let cpu_override = self.cpu_model().is_ok().then_some(EmbedBackendChoice::Cpu {
+                reason: "hybrid_cpu_only",
+            });
+            return self.process_encoded_subset(cpu_side, dimensions, budget, cpu_override);
         }
         if cpu_side.is_empty() {
             return self.process_encoded_subset(metal_side, dimensions, budget, None);
@@ -1670,25 +1556,30 @@ fn throughput_embedding_plan(backend: GpuBackend) -> &'static kin_infer::resourc
     };
 
     cell.get_or_init(|| {
+        let memory = detect_memory();
+        // On unified-memory accelerators (Apple Silicon) the GPU shares system
+        // RAM, so surface the detected memory as the device budget too. This lets
+        // ResourcePlan size its hardware-scaled caps from real memory regardless
+        // of which accelerator field its heuristics read, so the plan tracks the
+        // host (e.g. a 128 GB box) rather than a hardcoded default.
+        let (device_total_bytes, device_available_bytes) = if unified_memory {
+            (memory.system_total_bytes, memory.system_available_bytes)
+        } else {
+            (None, None)
+        };
         let accel = AcceleratorInfo {
             backend: accel_backend,
             device_index: 0,
             unified_memory,
-            device_total_bytes: None,
-            device_available_bytes: None,
+            device_total_bytes,
+            device_available_bytes,
             recommended_working_set_bytes: None,
             max_single_buffer_bytes: None,
             max_inflight_command_buffers: 1,
             reserve_device_bytes: None,
             allow_cpu_fallback: true,
         };
-        ResourcePlan::for_profile(
-            Profile::Throughput,
-            &detect_host(),
-            &accel,
-            &detect_memory(),
-        )
-        .embedding
+        ResourcePlan::for_profile(Profile::Throughput, &detect_host(), &accel, &memory).embedding
     })
 }
 
@@ -1751,16 +1642,16 @@ impl BatchBudget {
         }
     }
 
-    /// Greedily extend a batch from `start` over length-sorted `encoded`, stopping
+    /// Greedily extend a batch from `start` over length-sorted token `ids`, stopping
     /// before either budget would be exceeded. A single entity is always admitted
     /// (the `end > start` guard) so an over-budget lone entity still gets embedded.
-    /// Returns `(end, longest)`; the batch is `encoded[start..end]` padded to
+    /// Returns `(end, longest)`; the batch is `ids[start..end]` padded to
     /// `longest` tokens.
-    fn next_batch(self, encoded: &[Encoded], start: usize) -> (usize, usize) {
+    fn next_batch(self, ids: &[Vec<u32>], start: usize) -> (usize, usize) {
         let mut end = start;
         let mut longest = 0usize;
-        while end < encoded.len() {
-            let candidate_len = encoded[end].1.len().max(1);
+        while end < ids.len() {
+            let candidate_len = ids[end].len().max(1);
             let projected_longest = longest.max(candidate_len);
             let projected_tokens = projected_longest * (end - start + 1);
             let projected_area = projected_longest * projected_tokens;
@@ -1875,36 +1766,126 @@ fn hybrid_mode(backend: GpuBackend) -> HybridMode {
     desired
 }
 
+/// A tokenized batch held as parallel, length-sorted arrays. Keeping ids and masks
+/// contiguous (rather than a `Vec` of per-entity tuples) lets each GPU dispatch
+/// borrow a sub-range directly, so the hot loop never re-clones token buffers.
+/// `idx[k]` is the original input position of the k-th entity, so results can be
+/// scattered back into input order regardless of how the batch was split.
 #[cfg(feature = "embeddings")]
-type Encoded = (usize, Vec<u32>, Vec<u32>);
+struct EncodedBatch {
+    idx: Vec<usize>,
+    ids: Vec<Vec<u32>>,
+    masks: Vec<Vec<u32>>,
+}
 
 #[cfg(feature = "embeddings")]
-fn balanced_partition(encoded: &[Encoded], gpu_tput_ratio: f64) -> (Vec<Encoded>, Vec<Encoded>) {
-    let ceiling_split = encoded.partition_point(|(_, ids, _)| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
-    let short = &encoded[..ceiling_split];
-    let long = &encoded[ceiling_split..];
+impl EncodedBatch {
+    fn len(&self) -> usize {
+        self.idx.len()
+    }
+
+    fn as_slice(&self) -> EncodedSlice<'_> {
+        EncodedSlice {
+            idx: &self.idx,
+            ids: &self.ids,
+            masks: &self.masks,
+        }
+    }
+}
+
+/// Borrowed view over a contiguous run of an [`EncodedBatch`]. `Copy` so the two
+/// hybrid arms can each capture a disjoint view inside `rayon::join` without
+/// cloning the underlying token buffers.
+#[cfg(feature = "embeddings")]
+#[derive(Clone, Copy)]
+struct EncodedSlice<'a> {
+    idx: &'a [usize],
+    ids: &'a [Vec<u32>],
+    masks: &'a [Vec<u32>],
+}
+
+#[cfg(feature = "embeddings")]
+impl<'a> EncodedSlice<'a> {
+    fn len(&self) -> usize {
+        self.idx.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.idx.is_empty()
+    }
+
+    fn split_at(&self, mid: usize) -> (EncodedSlice<'a>, EncodedSlice<'a>) {
+        let (idx_l, idx_r) = self.idx.split_at(mid);
+        let (ids_l, ids_r) = self.ids.split_at(mid);
+        let (masks_l, masks_r) = self.masks.split_at(mid);
+        (
+            EncodedSlice {
+                idx: idx_l,
+                ids: ids_l,
+                masks: masks_l,
+            },
+            EncodedSlice {
+                idx: idx_r,
+                ids: ids_r,
+                masks: masks_r,
+            },
+        )
+    }
+}
+
+/// Split a length-sorted batch into a Metal (GPU) subset and a CPU-twin subset
+/// for the Balanced hybrid mode.
+///
+/// Entities longer than `EMBED_CPU_SEQ_THRESHOLD` always run on the CPU twin (the
+/// batched Metal attention path is reserved for shorter sequences). The SHORT
+/// entities are then split so the two arms finish at roughly the same time: the
+/// GPU clears work `gpu_tput_ratio`× faster per unit, while the CPU arm also
+/// carries all the long entities. Balancing GPU time `metal / ratio` against CPU
+/// time `(short - metal) + long` gives
+///
+/// ```text
+/// metal = ratio · (short + long) / (ratio + 1)
+/// ```
+///
+/// clamped to `[0, short]`. When long work dominates this clamps to "all short on
+/// the GPU" (the CPU twin is already saturated by the long entities); with no long
+/// work it reduces to the GPU taking `ratio / (ratio + 1)` of the short work.
+/// Either way both arms get a real share, so the CPU cores never sit idle while
+/// the GPU runs. Note the `+ long` term: the long entities load the CPU side, so
+/// they must raise the GPU's share of the short work, not reduce it — a `− long`
+/// form would drive the target negative on long-heavy corpora and empty the GPU
+/// subset.
+#[cfg(feature = "embeddings")]
+fn balanced_partition(
+    batch: EncodedSlice<'_>,
+    gpu_tput_ratio: f64,
+) -> (EncodedBatch, EncodedBatch) {
+    let ceiling_split = batch
+        .ids
+        .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
 
     let work = |ids: &[u32]| ids.len().max(1) as f64;
-    let w_short: f64 = short.iter().map(|(_, ids, _)| work(ids)).sum();
-    let w_long: f64 = long.iter().map(|(_, ids, _)| work(ids)).sum();
+    let w_short: f64 = batch.ids[..ceiling_split].iter().map(|ids| work(ids)).sum();
+    let w_long: f64 = batch.ids[ceiling_split..].iter().map(|ids| work(ids)).sum();
 
     let target_metal =
-        ((gpu_tput_ratio * w_short - w_long) / (gpu_tput_ratio + 1.0)).clamp(0.0, w_short);
+        ((gpu_tput_ratio * (w_short + w_long)) / (gpu_tput_ratio + 1.0)).clamp(0.0, w_short);
 
-    let mut order: Vec<usize> = (0..short.len()).collect();
+    // Fill the GPU side from the longest short entities down; the tie-break on
+    // original index keeps the selection deterministic regardless of sort impl.
+    let mut order: Vec<usize> = (0..ceiling_split).collect();
     order.sort_by(|&a, &b| {
-        short[b]
-            .1
+        batch.ids[b]
             .len()
-            .cmp(&short[a].1.len())
-            .then(short[a].0.cmp(&short[b].0))
+            .cmp(&batch.ids[a].len())
+            .then(batch.idx[a].cmp(&batch.idx[b]))
     });
 
-    let mut to_metal = vec![false; short.len()];
+    let mut to_metal = vec![false; ceiling_split];
     let mut metal_work = 0.0;
     let mut metal_count = 0usize;
     for pos in order {
-        let w = work(&short[pos].1);
+        let w = work(&batch.ids[pos]);
         if target_metal > 0.0 && (metal_work + w <= target_metal || metal_count == 0) {
             metal_work += w;
             metal_count += 1;
@@ -1912,18 +1893,55 @@ fn balanced_partition(encoded: &[Encoded], gpu_tput_ratio: f64) -> (Vec<Encoded>
         }
     }
 
-    let mut metal_subset: Vec<Encoded> = Vec::with_capacity(metal_count);
-    let mut cpu_subset: Vec<Encoded> = Vec::with_capacity(encoded.len() - metal_count);
-    for (pos, entry) in short.iter().enumerate() {
-        if to_metal[pos] {
-            metal_subset.push(entry.clone());
+    let mut metal = EncodedBatch {
+        idx: Vec::with_capacity(metal_count),
+        ids: Vec::with_capacity(metal_count),
+        masks: Vec::with_capacity(metal_count),
+    };
+    let cpu_cap = batch.len() - metal_count;
+    let mut cpu = EncodedBatch {
+        idx: Vec::with_capacity(cpu_cap),
+        ids: Vec::with_capacity(cpu_cap),
+        masks: Vec::with_capacity(cpu_cap),
+    };
+    let push_into = |dst: &mut EncodedBatch, pos: usize| {
+        dst.idx.push(batch.idx[pos]);
+        dst.ids.push(batch.ids[pos].clone());
+        dst.masks.push(batch.masks[pos].clone());
+    };
+    for (pos, &on_metal) in to_metal.iter().enumerate() {
+        if on_metal {
+            push_into(&mut metal, pos);
         } else {
-            cpu_subset.push(entry.clone());
+            push_into(&mut cpu, pos);
         }
     }
-    cpu_subset.extend(long.iter().cloned());
+    for pos in ceiling_split..batch.len() {
+        push_into(&mut cpu, pos);
+    }
 
-    (metal_subset, cpu_subset)
+    (metal, cpu)
+}
+
+/// Scatter `(original_idx, vector)` placements back into input order, failing if
+/// any slot is missing.
+#[cfg(feature = "embeddings")]
+fn scatter_placed(
+    placed: Vec<(usize, Vec<f32>)>,
+    total: usize,
+) -> Result<Vec<Vec<f32>>, KinDbError> {
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; total];
+    for (original_idx, vector) in placed {
+        results[original_idx] = Some(vector);
+    }
+    results
+        .into_iter()
+        .map(|vector| {
+            vector.ok_or_else(|| {
+                KinDbError::IndexError("embedding batch result order mismatch".into())
+            })
+        })
+        .collect()
 }
 
 /// Pick the inference path for a chunk based on `KIN_EMBED_BACKEND` and the
@@ -2696,15 +2714,15 @@ mod tests {
         // Four entities at the EMBED_MAX_SEQ_LEN cap. attention area = 2048² × count;
         // count=2 → 8_388_608 (== cap, admitted), count=3 → 12_582_912 (> cap, split).
         // This is the exact worst-case dispatch verified to survive the GPU watchdog.
-        let entities: Vec<Encoded> = (0..4).map(|i| (i, vec![0u32; 2048], Vec::new())).collect();
-        let (end, longest) = budget.next_batch(&entities, 0);
+        let ids: Vec<Vec<u32>> = (0..4).map(|_| vec![0u32; 2048]).collect();
+        let (end, longest) = budget.next_batch(&ids, 0);
         assert_eq!(
             end, 2,
             "long-entity dispatch must cap at 2 at the 2×2048² area"
         );
         assert_eq!(longest, 2048);
         // The remaining two pack into the next dispatch the same way.
-        let (end2, _) = budget.next_batch(&entities, end);
+        let (end2, _) = budget.next_batch(&ids, end);
         assert_eq!(end2, 4);
     }
 
@@ -2718,8 +2736,8 @@ mod tests {
             max_attention_area: usize::MAX,
         };
         // 256-token entities: 16_384 / 256 = 64 per dispatch.
-        let entities: Vec<Encoded> = (0..100).map(|i| (i, vec![0u32; 256], Vec::new())).collect();
-        let (end, longest) = budget.next_batch(&entities, 0);
+        let ids: Vec<Vec<u32>> = (0..100).map(|_| vec![0u32; 256]).collect();
+        let (end, longest) = budget.next_batch(&ids, 0);
         assert_eq!(end, 64);
         assert_eq!(longest, 256);
     }
@@ -2733,11 +2751,8 @@ mod tests {
             max_tokens: 100,
             max_attention_area: 100,
         };
-        let entities: Vec<Encoded> = vec![
-            (0, vec![0u32; 2048], Vec::new()),
-            (1, vec![0u32; 2048], Vec::new()),
-        ];
-        let (end, longest) = budget.next_batch(&entities, 0);
+        let ids: Vec<Vec<u32>> = vec![vec![0u32; 2048], vec![0u32; 2048]];
+        let (end, longest) = budget.next_batch(&ids, 0);
         assert_eq!(
             end, 1,
             "over-budget lone entity admitted; next not packed with it"
@@ -2818,9 +2833,22 @@ mod tests {
     fn batch_budget_throughput_lifts_metal_tokens_keeps_area() {
         let _env = ResourceEnvGuard::acquire();
         std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        // The budget mirrors whatever the resource plan resolves for this host.
+        // ResourcePlan's throughput caps auto-scale with hardware (memory/cores),
+        // so this asserts against the plan rather than a fixed number — it only
+        // pins the invariant that throughput LIFTS the token budget above proof.
+        let plan = throughput_embedding_plan(GpuBackend::Metal);
         let budget = BatchBudget::from_env(GpuBackend::Metal);
-        assert_eq!(budget.max_tokens, 65_536);
-        assert_eq!(budget.max_attention_area, 8_388_608);
+        assert_eq!(budget.max_tokens, plan.max_batch_tokens);
+        assert!(
+            budget.max_tokens > METAL_MAX_BATCH_TOKENS,
+            "throughput must lift the token budget above the proof default"
+        );
+        let expected_area = plan
+            .max_attention_area
+            .map(|area| area as usize)
+            .unwrap_or(usize::MAX);
+        assert_eq!(budget.max_attention_area, expected_area);
     }
 
     #[cfg(feature = "embeddings")]
@@ -2829,9 +2857,16 @@ mod tests {
         let _env = ResourceEnvGuard::acquire();
         std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
         std::env::set_var("KIN_EMBED_MAX_BATCH_TOKENS", "12345");
+        // The explicit token override wins; the attention area still tracks the
+        // plan (auto-scaled, so not hardcoded).
+        let plan = throughput_embedding_plan(GpuBackend::Metal);
         let budget = BatchBudget::from_env(GpuBackend::Metal);
         assert_eq!(budget.max_tokens, 12_345);
-        assert_eq!(budget.max_attention_area, 8_388_608);
+        let expected_area = plan
+            .max_attention_area
+            .map(|area| area as usize)
+            .unwrap_or(usize::MAX);
+        assert_eq!(budget.max_attention_area, expected_area);
     }
 
     #[cfg(feature = "embeddings")]
@@ -2940,6 +2975,167 @@ mod tests {
         std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
         std::env::set_var("KIN_EMBED_BACKEND", "cpu");
         assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
+    }
+
+    /// Build a length-sorted `EncodedBatch` from a list of input lengths, exactly
+    /// as `embed_uncached_batch` does: `idx[k]` is the original (pre-sort) input
+    /// position of the k-th shortest entity.
+    #[cfg(feature = "embeddings")]
+    fn encoded_batch_from_lengths(lengths: &[usize]) -> EncodedBatch {
+        let mut order: Vec<(usize, usize)> = lengths.iter().copied().enumerate().collect();
+        order.sort_by_key(|(_, len)| *len);
+        let mut batch = EncodedBatch {
+            idx: Vec::with_capacity(order.len()),
+            ids: Vec::with_capacity(order.len()),
+            masks: Vec::with_capacity(order.len()),
+        };
+        for (orig, len) in order {
+            let len = len.max(1);
+            batch.idx.push(orig);
+            batch.ids.push(vec![0u32; len]);
+            batch.masks.push(vec![1u32; len]);
+        }
+        batch
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn covers_all_indices(metal: &EncodedBatch, cpu: &EncodedBatch, total: usize) {
+        let mut seen: Vec<usize> = metal.idx.iter().chain(cpu.idx.iter()).copied().collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..total).collect::<Vec<_>>(),
+            "every original index must appear exactly once across both arms"
+        );
+    }
+
+    // On a realistic mix of many short entities plus a few long ones, both the
+    // GPU arm and the CPU twin must each receive a real share — neither side may
+    // come back empty (an empty GPU subset would route everything back to the GPU
+    // and leave the CPU cores idle).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn balanced_partition_engages_both_arms_on_real_mix() {
+        let mut lengths: Vec<usize> = (0..200).map(|_| 128).collect();
+        lengths.extend((0..20).map(|_| 1600)); // > EMBED_CPU_SEQ_THRESHOLD
+        let batch = encoded_batch_from_lengths(&lengths);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
+
+        assert!(
+            metal.len() > 0,
+            "GPU arm must get a real share of the batch"
+        );
+        assert!(cpu.len() > 0, "CPU twin must get a real share of the batch");
+        covers_all_indices(&metal, &cpu, lengths.len());
+    }
+
+    // When long work dominates, the target clamps to "all short on the GPU" while
+    // the CPU twin carries the long entities — both arms busy, none idle.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn balanced_partition_long_heavy_keeps_gpu_busy() {
+        let mut lengths: Vec<usize> = (0..10).map(|_| 200).collect(); // short
+        lengths.extend((0..10).map(|_| 2000)); // long, heavy
+        let batch = encoded_batch_from_lengths(&lengths);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), HYBRID_DEFAULT_GPU_TPUT_RATIO);
+
+        assert_eq!(
+            metal.len(),
+            10,
+            "every short entity should land on the GPU arm"
+        );
+        assert!(
+            metal
+                .ids
+                .iter()
+                .all(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD),
+            "GPU arm must hold only short (<= threshold) sequences"
+        );
+        assert_eq!(
+            cpu.len(),
+            10,
+            "every long entity should land on the CPU arm"
+        );
+        assert!(
+            cpu.ids
+                .iter()
+                .all(|ids| ids.len() > EMBED_CPU_SEQ_THRESHOLD),
+            "CPU arm must hold the long sequences"
+        );
+        covers_all_indices(&metal, &cpu, lengths.len());
+    }
+
+    // With no long entities the split reduces to the GPU taking ratio/(ratio+1) of
+    // the (uniform) short work — ~80% at the default 4× ratio, ~20% to the CPU.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn balanced_partition_no_long_splits_short_by_ratio() {
+        let lengths: Vec<usize> = (0..100).map(|_| 100).collect();
+        let batch = encoded_batch_from_lengths(&lengths);
+        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0);
+
+        assert!(metal.len() > 0 && cpu.len() > 0, "both arms must run");
+        let metal_frac = metal.len() as f64 / lengths.len() as f64;
+        assert!(
+            (metal_frac - 0.8).abs() < 0.05,
+            "GPU share {metal_frac} should be ~0.8 (= 4/(4+1)) of uniform short work"
+        );
+        covers_all_indices(&metal, &cpu, lengths.len());
+    }
+
+    // Determinism: the same batch partitions identically across runs, and the union
+    // of both arms is exactly the input index set with no duplicates — so scattering
+    // results back by original index (see `scatter_placed`) is order-stable no matter
+    // how the CPU/GPU split falls. (Cross-backend fp parity of the vectors themselves
+    // requires a real GPU embed on Metal hardware.)
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn balanced_partition_is_deterministic_and_order_stable() {
+        let mut lengths = Vec::new();
+        for i in 0..300usize {
+            // Deterministic pseudo-mix of short and long sequences.
+            let len = if i % 7 == 0 {
+                1100 + (i % 5) * 200
+            } else {
+                50 + (i % 31)
+            };
+            lengths.push(len);
+        }
+        let batch = encoded_batch_from_lengths(&lengths);
+        let (m1, c1) = balanced_partition(batch.as_slice(), 3.5);
+        let (m2, c2) = balanced_partition(batch.as_slice(), 3.5);
+        assert_eq!(m1.idx, m2.idx, "GPU assignment must be deterministic");
+        assert_eq!(c1.idx, c2.idx, "CPU assignment must be deterministic");
+        covers_all_indices(&m1, &c1, lengths.len());
+    }
+
+    // The SeqFloor split (slice `split_at`, zero-clone) likewise covers every index
+    // exactly once.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn seqfloor_split_covers_all_indices() {
+        let mut lengths: Vec<usize> = (0..50).map(|i| 100 + i).collect();
+        lengths.extend((0..15).map(|i| 1200 + i * 10));
+        let batch = encoded_batch_from_lengths(&lengths);
+        let split = batch
+            .ids
+            .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
+        let (short, long) = batch.as_slice().split_at(split);
+        assert!(
+            !short.is_empty() && !long.is_empty(),
+            "both sides should be present"
+        );
+        let mut seen: Vec<usize> = short.idx.iter().chain(long.idx.iter()).copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..lengths.len()).collect::<Vec<_>>());
+        assert!(short
+            .ids
+            .iter()
+            .all(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD));
+        assert!(long
+            .ids
+            .iter()
+            .all(|ids| ids.len() > EMBED_CPU_SEQ_THRESHOLD));
     }
 
     #[cfg(feature = "embeddings")]
