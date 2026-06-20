@@ -12258,6 +12258,35 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn staged_embedding_helpers_handle_empty_batches_and_preserve_requeue_recency() {
+        let g = InMemoryGraph::new();
+        assert_eq!(g.process_embedding_queue(8).unwrap(), 0);
+
+        let empty = PreparedEmbedBatch {
+            keys: Vec::new(),
+            texts: Vec::new(),
+            recency: hashbrown::HashMap::new(),
+        };
+        assert!(g.embed_prepared_batch(&empty).unwrap().is_empty());
+        assert_eq!(g.persist_embedded_batch(Vec::new(), &empty).unwrap(), 0);
+
+        let changed = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xbeef)));
+        let defaulted = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xcafe)));
+        let mut recency = hashbrown::HashMap::new();
+        recency.insert(changed, EmbedRecency::ChangedThisSync);
+
+        g.requeue_embedding_keys([changed, defaulted], &recency);
+
+        let queue = g.embedding_queue.lock();
+        assert_eq!(
+            queue.items.get(&changed),
+            Some(&EmbedRecency::ChangedThisSync)
+        );
+        assert_eq!(queue.items.get(&defaulted), Some(&EmbedRecency::Backfill));
+    }
+
     /// CPU microbench for the embed hot-path changes. Ignored by default;
     /// run with `cargo test -p kin-db --lib embed_hot_path_microbench -- --ignored --nocapture`.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
