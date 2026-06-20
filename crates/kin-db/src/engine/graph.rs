@@ -178,10 +178,7 @@ fn entity_unchanged_since_last_revision(ent: &EntityData, entity: &Entity) -> bo
 /// superseded revisions are no longer current truth, so any vector still indexed
 /// under their key is an orphan — the returned ids let `prune_orphaned_vectors`
 /// evict exactly that set without rescanning the whole index.
-fn append_entity_revisions(
-    ent: &mut EntityData,
-    change: &SemanticChange,
-) -> Vec<EntityRevisionId> {
+fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec<EntityRevisionId> {
     let mut superseded = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
@@ -204,7 +201,11 @@ fn append_entity_revisions(
                 if let Some(prev) = chain.last() {
                     superseded.push(prev.revision_id);
                 }
-                chain.push(EntityRevision::new(new.clone(), change.id, previous_revision));
+                chain.push(EntityRevision::new(
+                    new.clone(),
+                    change.id,
+                    previous_revision,
+                ));
             }
             EntityDelta::Removed(_) => {}
         }
@@ -3930,7 +3931,8 @@ impl InMemoryGraph {
 
         let batch_size = batch_size.max(1);
         let batch = self.drain_embedding_batch(batch_size);
-        let recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> = batch.iter().copied().collect();
+        let recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> =
+            batch.iter().copied().collect();
 
         let mut keys: Vec<RetrievalKey> = Vec::with_capacity(batch.len());
         let mut texts: Vec<String> = Vec::with_capacity(batch.len());
@@ -10971,7 +10973,7 @@ mod tests {
     /// Incremental prune: after the first full reconcile, a subsequent re-embed
     /// supersession is retired by evicting ONLY the tracked orphan key — without
     /// rescanning the whole index — and the result matches what a full scan would
-    /// have produced. Guards the FIR-1114 incremental-prune fast path.
+    /// have produced. Guards the incremental-prune fast path.
     #[cfg(feature = "vector")]
     #[test]
     fn prune_incremental_evicts_only_tracked_superseded_vectors() {
@@ -12099,7 +12101,7 @@ mod tests {
                     2 => Visibility::Internal,
                     _ => Visibility::Private,
                 };
-                if i % 5 == 0 {
+                if i.is_multiple_of(5) {
                     e.kind = EntityKind::Interface;
                 }
                 g.upsert_entity(&e).unwrap();
@@ -12144,7 +12146,7 @@ mod tests {
         let fill = |g: &InMemoryGraph| {
             let mut q = g.artifact_embedding_queue.lock();
             for (i, id) in ids.iter().enumerate() {
-                let recency = if i % 3 == 0 {
+                let recency = if i.is_multiple_of(3) {
                     EmbedRecency::ChangedThisSync
                 } else {
                     EmbedRecency::Backfill
@@ -12172,7 +12174,11 @@ mod tests {
             batched.extend(chunk.into_iter().map(|(id, _)| id));
         }
 
-        assert_eq!(full.len(), 50, "the full drain must return every artifact once");
+        assert_eq!(
+            full.len(),
+            50,
+            "the full drain must return every artifact once"
+        );
         assert_eq!(
             full, batched,
             "artifact partial selection must equal the full-sorted drain order"
@@ -12200,10 +12206,7 @@ mod tests {
         // Same drain authority as the monolithic path: API surface embeds first.
         assert_eq!(
             prepared.keys,
-            vec![
-                RetrievalKey::Entity(api.id),
-                RetrievalKey::Entity(pubfn.id),
-            ],
+            vec![RetrievalKey::Entity(api.id), RetrievalKey::Entity(pubfn.id),],
             "prepare must drain in the deterministic priority order"
         );
         // Text is formatted parallel to keys and non-empty.
@@ -12215,7 +12218,7 @@ mod tests {
         assert!(g.prepare_pending_embedding_batch(100).is_empty());
     }
 
-    /// CPU microbench for the FIR-1114 hot-path changes. Ignored by default;
+    /// CPU microbench for the embed hot-path changes. Ignored by default;
     /// run with `cargo test -p kin-db --lib embed_hot_path_microbench -- --ignored --nocapture`.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     #[test]
@@ -12230,7 +12233,7 @@ mod tests {
         let mut sink = 0usize;
         let t = Instant::now();
         for _ in 0..rounds {
-            let cloned: Vec<String> = texts.iter().cloned().collect();
+            let cloned: Vec<String> = texts.to_vec();
             sink = sink.wrapping_add(cloned.len());
         }
         let old_clone = t.elapsed();
@@ -12252,7 +12255,7 @@ mod tests {
         let ids: Vec<ArtifactId> = (0..m).map(|_| ArtifactId::new()).collect();
         let batch = 256usize;
         let recency_of = |i: usize| {
-            if i % 4 == 0 {
+            if i.is_multiple_of(4) {
                 EmbedRecency::ChangedThisSync
             } else {
                 EmbedRecency::Backfill
@@ -12261,34 +12264,37 @@ mod tests {
         let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
             a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         };
+        // Each real batch drains the leftover back out of the HashMap in random
+        // order, so every batch sorts/selects UNSORTED input — model one such
+        // batch over `reps` fresh copies.
         let base: Vec<(ArtifactId, EmbedRecency)> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| (*id, recency_of(i)))
             .collect();
+        let reps = 200;
 
-        let mut q = base.clone();
         let t = Instant::now();
-        while !q.is_empty() {
+        let mut sink2 = 0u128;
+        for _ in 0..reps {
+            let mut q = base.clone();
             q.sort_unstable_by(order);
-            let take = batch.min(q.len());
-            q.drain(0..take);
+            sink2 ^= q[0].0 .0.as_u128();
         }
         let old_select = t.elapsed();
 
-        let mut q = base.clone();
         let t = Instant::now();
-        while !q.is_empty() {
-            let take = batch.min(q.len());
-            if take < q.len() {
-                q.select_nth_unstable_by(take, order);
+        for _ in 0..reps {
+            let mut q = base.clone();
+            if batch < q.len() {
+                q.select_nth_unstable_by(batch, order);
             }
-            q[..take].sort_unstable_by(order);
-            q.drain(0..take);
+            q[..batch].sort_unstable_by(order);
+            sink2 ^= q[0].0 .0.as_u128();
         }
         let new_select = t.elapsed();
         eprintln!(
-            "[S2] drain selection m={m} batch={batch}: old full-sort/batch {old_select:?} vs new partial-select {new_select:?}"
+            "[S2] per-batch selection m={m} take={batch} x{reps} (unsorted input): old full-sort {old_select:?} vs new partial-select {new_select:?} (sink={sink2})"
         );
 
         // S3 — prune: full index scan vs incremental tracked eviction.
