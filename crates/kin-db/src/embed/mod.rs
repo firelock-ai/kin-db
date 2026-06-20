@@ -67,6 +67,135 @@ fn parse_model_config<T: serde::de::DeserializeOwned>(data: &str) -> serde_json:
     serde_json::from_value(value)
 }
 
+/// Serializes every kin-db `BertModel` load so the CPU-twin's force-CPU toggle is
+/// never observable to a concurrent load.
+#[cfg(feature = "embeddings")]
+static MODEL_LOAD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load a `BertModel`, optionally pinned to the CPU backend.
+///
+/// kin-infer selects its compute backend at load time inside
+/// `gpu::create_compute`, whose only CPU override is the process-global
+/// `KIN_INFER_FORCE_CPU` env var. Toggling that var directly is a data race: a
+/// concurrent load on another thread would observe the transient value and pick
+/// the wrong backend. This serializes all kin-db loads under one lock and only
+/// flips the var inside the lock, so the override is never visible outside the
+/// single load it is meant for. (A non-env backend parameter on the kin-infer
+/// load API would remove the toggle entirely; until that exists, this keeps the
+/// override race-free.)
+#[cfg(feature = "embeddings")]
+fn load_bert_model(
+    weights_path: &Path,
+    config: BertConfig,
+    force_cpu: bool,
+) -> Result<BertModel, kin_infer::InferError> {
+    let _guard = MODEL_LOAD_GUARD
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !force_cpu {
+        return BertModel::load(weights_path, config);
+    }
+    let prev = std::env::var_os("KIN_INFER_FORCE_CPU");
+    std::env::set_var("KIN_INFER_FORCE_CPU", "1");
+    let result = BertModel::load(weights_path, config);
+    match prev {
+        Some(value) => std::env::set_var("KIN_INFER_FORCE_CPU", value),
+        None => std::env::remove_var("KIN_INFER_FORCE_CPU"),
+    }
+    result
+}
+
+/// Process-global counters that record how the throughput-profile hybrid split
+/// actually routed embedding work.
+///
+/// These make the CPU twin's contribution observable and provable: after an
+/// index run, `snapshot().cpu_twin_entities > 0` is positive evidence that the
+/// idle cores ran a real share of the batch (rather than the GPU silently
+/// absorbing all of it). Counters are best-effort relaxed atomics — they are an
+/// observability surface, never a control input.
+#[cfg(feature = "embeddings")]
+pub mod hybrid_metrics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GPU_ENTITIES: AtomicU64 = AtomicU64::new(0);
+    static GPU_TOKENS: AtomicU64 = AtomicU64::new(0);
+    static CPU_TWIN_ENTITIES: AtomicU64 = AtomicU64::new(0);
+    static CPU_TWIN_TOKENS: AtomicU64 = AtomicU64::new(0);
+    static HYBRID_BATCHES: AtomicU64 = AtomicU64::new(0);
+    static SINGLE_SIDE_BATCHES: AtomicU64 = AtomicU64::new(0);
+    static TWIN_UNAVAILABLE_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+    /// A point-in-time read of the hybrid dispatch counters.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct HybridDispatchStats {
+        /// Entities embedded on the GPU (Metal) arm.
+        pub gpu_entities: u64,
+        /// Padded tokens embedded on the GPU arm.
+        pub gpu_tokens: u64,
+        /// Entities embedded on the CPU twin — non-zero proves the twin ran.
+        pub cpu_twin_entities: u64,
+        /// Padded tokens embedded on the CPU twin.
+        pub cpu_twin_tokens: u64,
+        /// Batches that ran both arms concurrently.
+        pub hybrid_batches: u64,
+        /// Batches where the balanced split placed all work on one arm.
+        pub single_side_batches: u64,
+        /// Batches that fell back to serial primary-model dispatch because the
+        /// CPU twin could not be built.
+        pub twin_unavailable_batches: u64,
+    }
+
+    pub(crate) fn record_gpu(entities: u64, tokens: u64) {
+        GPU_ENTITIES.fetch_add(entities, Ordering::Relaxed);
+        GPU_TOKENS.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cpu_twin(entities: u64, tokens: u64) {
+        CPU_TWIN_ENTITIES.fetch_add(entities, Ordering::Relaxed);
+        CPU_TWIN_TOKENS.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_hybrid_batch() {
+        HYBRID_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_single_side_batch() {
+        SINGLE_SIDE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_twin_unavailable_batch() {
+        TWIN_UNAVAILABLE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the current counters.
+    pub fn snapshot() -> HybridDispatchStats {
+        HybridDispatchStats {
+            gpu_entities: GPU_ENTITIES.load(Ordering::Relaxed),
+            gpu_tokens: GPU_TOKENS.load(Ordering::Relaxed),
+            cpu_twin_entities: CPU_TWIN_ENTITIES.load(Ordering::Relaxed),
+            cpu_twin_tokens: CPU_TWIN_TOKENS.load(Ordering::Relaxed),
+            hybrid_batches: HYBRID_BATCHES.load(Ordering::Relaxed),
+            single_side_batches: SINGLE_SIDE_BATCHES.load(Ordering::Relaxed),
+            twin_unavailable_batches: TWIN_UNAVAILABLE_BATCHES.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero (test/diagnostic harnesses).
+    pub fn reset() {
+        for counter in [
+            &GPU_ENTITIES,
+            &GPU_TOKENS,
+            &CPU_TWIN_ENTITIES,
+            &CPU_TWIN_TOKENS,
+            &HYBRID_BATCHES,
+            &SINGLE_SIDE_BATCHES,
+            &TWIN_UNAVAILABLE_BATCHES,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Default HuggingFace model ID.
 ///
 /// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
@@ -339,7 +468,7 @@ impl CodeEmbedder {
             pad_token,
         }));
 
-        let model = BertModel::load(&weights_path, config)
+        let model = load_bert_model(&weights_path, config, false)
             .map_err(|e| KinDbError::IndexError(format!("failed to load BERT model: {e}")))?;
 
         let cache_namespace = model_namespace(
@@ -869,18 +998,55 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        let tokens =
+            |side: EncodedSlice<'_>| -> u64 { side.ids.iter().map(|ids| ids.len() as u64).sum() };
+        let metal_entities = metal_side.len() as u64;
+        let cpu_entities = cpu_side.len() as u64;
+        let metal_tokens = tokens(metal_side);
+        let cpu_tokens = tokens(cpu_side);
+
         if metal_side.is_empty() {
-            // Run this work on the CPU twin (the otherwise-idle cores). Passing
-            // `None` here would defer to the auto resolver, which routes to Metal —
-            // sending a CPU-destined subset back to the GPU. There is no
-            // concurrency in this branch (single subset), so deferring to the auto
-            // resolver only when the twin is unavailable is still safe.
-            let cpu_override = self.cpu_model().is_ok().then_some(EmbedBackendChoice::Cpu {
+            // The balanced split placed the whole batch on the CPU side — record
+            // that decision explicitly rather than silently re-routing it. Run it
+            // on the CPU twin (the otherwise-idle cores); passing `None` would
+            // defer to the auto resolver, which routes to Metal and would send a
+            // CPU-destined subset back to the GPU. There is no concurrency in this
+            // branch, so deferring to the auto resolver when the twin is missing
+            // is still safe.
+            let twin_available = self.cpu_model().is_ok();
+            hybrid_metrics::record_single_side_batch();
+            if twin_available {
+                hybrid_metrics::record_cpu_twin(cpu_entities, cpu_tokens);
+            } else {
+                hybrid_metrics::record_twin_unavailable_batch();
+                hybrid_metrics::record_gpu(cpu_entities, cpu_tokens);
+            }
+            tracing::info!(
+                target: "kindb.embed.dispatch",
+                routing = "cpu_only",
+                cpu_entities = cpu_entities,
+                cpu_tokens = cpu_tokens,
+                cpu_twin_used = twin_available,
+                "embed_hybrid_dispatch"
+            );
+            let cpu_override = twin_available.then_some(EmbedBackendChoice::Cpu {
                 reason: "hybrid_cpu_only",
             });
             return self.process_encoded_subset(cpu_side, dimensions, budget, cpu_override);
         }
         if cpu_side.is_empty() {
+            // Whole batch is short enough to stay on the GPU — record the
+            // single-arm decision and run it there.
+            hybrid_metrics::record_single_side_batch();
+            hybrid_metrics::record_gpu(metal_entities, metal_tokens);
+            tracing::info!(
+                target: "kindb.embed.dispatch",
+                routing = "gpu_only",
+                gpu_entities = metal_entities,
+                gpu_tokens = metal_tokens,
+                cpu_twin_used = false,
+                "embed_hybrid_dispatch"
+            );
             return self.process_encoded_subset(metal_side, dimensions, budget, None);
         }
 
@@ -892,8 +1058,15 @@ impl BertEmbedder {
         // and buffer pool and corrupts embeddings. In that case process the whole
         // set SERIALLY on the primary model instead (slower, but correct).
         if let Err(e) = self.cpu_model() {
+            hybrid_metrics::record_twin_unavailable_batch();
+            hybrid_metrics::record_gpu(metal_entities + cpu_entities, metal_tokens + cpu_tokens);
             tracing::warn!(
+                target: "kindb.embed.dispatch",
+                routing = "serial_primary",
                 error = %e,
+                gpu_entities = metal_entities + cpu_entities,
+                cpu_twin_used = false,
+                fallback_reason = "cpu_twin_unavailable",
                 "cpu twin unavailable; processing hybrid set serially on the primary model to avoid concurrent shared-model submission"
             );
             let mut merged = self.process_encoded_subset(
@@ -915,6 +1088,22 @@ impl BertEmbedder {
             return Ok(merged);
         }
 
+        // Both arms run concurrently: GPU on the primary Metal model, CPU twin on
+        // the idle cores. Record the actual per-arm work so the twin's share is
+        // provable after the fact.
+        hybrid_metrics::record_hybrid_batch();
+        hybrid_metrics::record_gpu(metal_entities, metal_tokens);
+        hybrid_metrics::record_cpu_twin(cpu_entities, cpu_tokens);
+        tracing::info!(
+            target: "kindb.embed.dispatch",
+            routing = "concurrent",
+            gpu_entities = metal_entities,
+            gpu_tokens = metal_tokens,
+            cpu_entities = cpu_entities,
+            cpu_tokens = cpu_tokens,
+            cpu_twin_used = true,
+            "embed_hybrid_dispatch"
+        );
         let (metal_res, cpu_res) = rayon::join(
             || {
                 self.process_encoded_subset(
@@ -944,11 +1133,10 @@ impl BertEmbedder {
 
     /// Lazily construct (or return) the CPU-only BertModel twin.
     ///
-    /// Construction sets `KIN_INFER_FORCE_CPU=1` around the single
-    /// `BertModel::load` call so `kin_infer::gpu::create_compute` returns
-    /// `CpuCompute` regardless of build-time Metal/CUDA features, then
-    /// restores the prior env value. Called from the dispatcher when
-    /// `KIN_EMBED_BACKEND` resolves to CPU.
+    /// Construction goes through `load_bert_model(.., force_cpu = true)`, which
+    /// pins this one load to `CpuCompute` under a serialized, scoped backend
+    /// toggle so the primary (GPU) model and any concurrent load are unaffected.
+    /// The twin runs the CPU arm of the throughput-profile hybrid split.
     #[cfg(feature = "embeddings")]
     fn cpu_model(&self) -> Result<&BertModel, KinDbError> {
         if let Some(model) = self.cpu_model.get() {
@@ -971,18 +1159,10 @@ impl BertEmbedder {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
 
-            // Force kin_infer::gpu::create_compute to pick the CPU backend
-            // for this one load call only. Restore prior value afterward so
-            // the primary (GPU) model loaded earlier is unaffected and any
-            // unrelated inference elsewhere keeps its backend selection.
-            let prev = std::env::var_os("KIN_INFER_FORCE_CPU");
-            std::env::set_var("KIN_INFER_FORCE_CPU", "1");
-            let result = BertModel::load(&source.weights_path, config);
-            match prev {
-                Some(v) => std::env::set_var("KIN_INFER_FORCE_CPU", v),
-                None => std::env::remove_var("KIN_INFER_FORCE_CPU"),
-            }
-            let cpu_model = result.map_err(|e| {
+            // Pin this single load to the CPU backend. The force-CPU toggle is
+            // serialized and scoped inside load_bert_model, so the primary (GPU)
+            // model and any concurrent load never observe it.
+            let cpu_model = load_bert_model(&source.weights_path, config, true).map_err(|e| {
                 KinDbError::IndexError(format!("failed to load CPU BERT twin: {e}"))
             })?;
             tracing::info!(

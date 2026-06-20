@@ -69,12 +69,34 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
     assert_eq!(reference.len(), texts.len(), "one vector per input");
 
     // Hybrid: throughput profile splits the batch across the GPU arm and the
-    // concurrent CPU twin.
+    // concurrent CPU twin. Reset the dispatch counters first so the snapshot
+    // afterward reflects only this embed.
+    kin_db::embed::hybrid_metrics::reset();
     std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
     let hybrid = embedder
         .embed_batch(&texts)
         .expect("throughput-hybrid embed must succeed");
     std::env::remove_var("KIN_RESOURCE_PROFILE");
+
+    // PROVE the CPU twin actually ran a share of the batch on the idle cores —
+    // not the GPU silently absorbing everything.
+    let stats = kin_db::embed::hybrid_metrics::snapshot();
+    assert!(
+        stats.cpu_twin_entities > 0,
+        "CPU twin did zero work — the hybrid split did not engage the idle cores ({stats:?})"
+    );
+    assert!(
+        stats.gpu_entities > 0,
+        "GPU arm did zero work — the split is degenerate ({stats:?})"
+    );
+    println!(
+        "hybrid dispatch: gpu_entities={} cpu_twin_entities={} hybrid_batches={} single_side={} twin_unavailable={}",
+        stats.gpu_entities,
+        stats.cpu_twin_entities,
+        stats.hybrid_batches,
+        stats.single_side_batches,
+        stats.twin_unavailable_batches
+    );
 
     assert_eq!(
         hybrid.len(),
