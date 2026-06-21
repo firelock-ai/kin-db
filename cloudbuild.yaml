@@ -13,7 +13,7 @@ steps:
     args:
       - '-c'
       - |
-        apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+        apt-get update && apt-get install -y pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
         HF_HUB_OFFLINE=1 cargo test --workspace -- \
           --skip process_embedding_queue_without_embeddings_is_noop \
           --skip default_dimensions_match_default_model \
