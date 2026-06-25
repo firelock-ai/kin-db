@@ -13,6 +13,7 @@ jobs:
     with:
       package: kin-db
       manifest: Cargo.toml
+      kin-actions-ref: v0.1.7
       source-paths: crates/kin-db Cargo.toml
       registry-build-command: cargo build && cargo build --no-default-features --features vector
       test-command: >-
