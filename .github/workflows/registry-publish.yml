@@ -11,6 +11,12 @@ jobs:
   release:
     uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.7
     with:
+      # Pin the kin-actions scripts to the same tag as the reusable workflow
+      # referenced above. The workflow's own default for this input is an older
+      # tag whose check-version-bump.py predates the --labels argument that the
+      # v0.1.7 workflow passes, so leaving it unset fails the version-bump gate
+      # ("unrecognized arguments: --labels"). Keep the two refs in lockstep.
+      kin-actions-ref: v0.1.7
       package: kin-db
       manifest: Cargo.toml
       source-paths: crates/kin-db Cargo.toml
