@@ -15,8 +15,6 @@ cargo test --workspace
 
 ## Architecture
 
-See `docs/ARCHITECTURE.md` for the full design rationale and `docs/EVALUATION.md` for the database comparison that led to building KinDB.
-
 ### Crates
 
 - `crates/kin-model` — Canonical semantic model crate owned by this repo: entities, relations, layout, and the `GraphStore` trait surface that KinDB implements.

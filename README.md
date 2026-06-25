@@ -1,6 +1,27 @@
-# kin-db
+# kin-db — The Semantic Engine for Kin
 
-Semantic graph storage engine for the Kin stack.
+> The semantic engine: graph storage, snapshots, indexing, text + vector search.
+
+The graph is the canonical repository substrate in Kin — not a file index, not a metadata
+overlay, but the primary source of truth for every entity, relation, and provenance record.
+`kin-db` is that substrate: it owns graph storage, snapshot persistence, BM25 lexical
+retrieval, and ANN vector search, and composes `kin-infer` for on-device embedding inference.
+`kin` (the system of record) and `kin-vfs` (the transparent filesystem projection) both build
+on top of it.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
+## What is Kin?
+
+Kin is the semantic system of record for AI-native software — your code as a graph of
+entities, relations, and intents, not a pile of files and diffs. AI agents and humans
+navigate it semantically, with provenance, review, and governance built in. It coexists
+with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+
+## kin-db's role
 
 `kin-db` owns the canonical graph substrate: entities, relations, provenance,
 sessions, and their indexes. It is not a general-purpose graph database — it is
@@ -46,6 +67,16 @@ Feature flags of note:
 - `CodeEmbedder` — manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
+## Ecosystem
+
+| Repo | Role |
+|------|------|
+| [kin](https://github.com/firelock-ai/kin) | Semantic system of record — CLI, daemon, MCP server, projections |
+| [kin-vfs](https://github.com/firelock-ai/kin-vfs) | Transparent filesystem projection |
+| [kin-editor](https://github.com/firelock-ai/kin-editor) | VS Code extension |
+| [kin-lsp](https://github.com/firelock-ai/kin-lsp) | Language-server enrichment boundary |
+| [kinlab](https://kinlab.ai) | Hosted collaboration and control plane |
+
 ## License
 
-Apache-2.0. Part of the open Kin local substrate.
+[Apache-2.0](LICENSE). Part of the open Kin local substrate.
