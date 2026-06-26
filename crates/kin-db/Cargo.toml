@@ -64,4 +64,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 [dev-dependencies]
 kin-vector = { version = "0.1.4", registry = "kin" }
-rand = "0.8"
+rand = "0.10"
