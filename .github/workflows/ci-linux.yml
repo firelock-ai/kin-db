@@ -38,7 +38,7 @@ jobs:
       # that "make public dependency resolution reproducible" replaced with git
       # revs, leaving the siblings stale and the git clone the actual resolver.)
       - name: Checkout kin-db
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: kin-db
 
