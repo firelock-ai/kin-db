@@ -81,3 +81,15 @@ jobs:
           --skip default_dimensions_match_default_model
           --skip test_vector_index_dimension_mismatch_auto_recovery
           --skip many_vectors_search_quality
+
+      # Optional-feature compile coverage. The default matrix (vector +
+      # embeddings) never compiles the gcs / archive / sql backends, so a
+      # dependency API change in that feature-gated code can break compilation
+      # while every default-feature job stays green. This check leg keeps those
+      # paths building on Linux. `metal` is intentionally excluded: it pulls the
+      # metal/objc2/block crates that only exist on cfg(target_os = "macos") and
+      # do not compile here. A check (not a full feature test) is the right
+      # weight — the gcs tests need GCS credentials and are already #[ignore]d.
+      - name: Check optional features (gcs, archive, sql)
+        working-directory: kin-db
+        run: cargo check -p kin-db --all-targets --features gcs,archive,sql
