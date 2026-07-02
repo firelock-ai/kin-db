@@ -186,28 +186,3 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: firelock-ai/kin-db
           fail_ci_if_error: false
-
-  notify-downstream:
-    name: Notify Downstream Repos
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [check]
-    runs-on: ubuntu-latest
-    env:
-      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-    steps:
-      - name: Trigger kin CI
-        # No-op until DISPATCH_TOKEN is provisioned (it never has been): without
-        # the secret, env.DISPATCH_TOKEN is empty so this step skips and the job
-        # stays green instead of failing on the missing token. Mirrors the fleet
-        # fix (kin-vector / kin-infer c119b84). Remove the guard once the
-        # cross-repo PAT is added.
-        if: ${{ env.DISPATCH_TOKEN != '' }}
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          # Requires a PAT with repo scope stored as DISPATCH_TOKEN secret.
-          # Create at: GitHub > Settings > Developer settings > Personal access tokens
-          # Then add to: kin-db repo > Settings > Secrets > Actions > DISPATCH_TOKEN
-          token: ${{ secrets.DISPATCH_TOKEN }}
-          repository: firelock-ai/kin
-          event-type: dependency-updated
-          client-payload: '{"source": "kin-db", "sha": "${{ github.sha }}"}'
