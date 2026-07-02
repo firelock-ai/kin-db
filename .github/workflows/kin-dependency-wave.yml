@@ -14,4 +14,4 @@ jobs:
       manifests: crates/kin-db/Cargo.toml
       test-command: cargo test -p kin-db --lib
     secrets:
-      KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+      KIN_CI_BOT_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
