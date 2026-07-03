@@ -424,10 +424,7 @@ pub fn gc_cache(base: &Path, opts: GcOptions, now: SystemTime) -> GcReport {
                 if epoch_hour(modified) > cutoff {
                     return;
                 }
-                if opts.dry_run {
-                    report.evicted_entries += 1;
-                    report.evicted_bytes = report.evicted_bytes.saturating_add(bytes);
-                } else if std::fs::remove_file(path).is_ok() {
+                if opts.dry_run || std::fs::remove_file(path).is_ok() {
                     report.evicted_entries += 1;
                     report.evicted_bytes = report.evicted_bytes.saturating_add(bytes);
                 }
