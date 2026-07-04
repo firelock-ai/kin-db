@@ -44,6 +44,17 @@ jobs:
           for sha in $(git rev-list --no-merges "${range}"); do
             author_name=$(git show -s --format='%an' "${sha}")
             author_email=$(git show -s --format='%ae' "${sha}")
+            # Bot accounts (dependabot[bot], github-actions[bot], renovate[bot], …)
+            # author commits with a name ending in "[bot]" and sign off with a
+            # service email that never matches their author email, so the strict
+            # match below can never pass for them. Exempt bot-authored commits;
+            # every human commit still requires a matching Signed-off-by trailer.
+            case "${author_name}" in
+              *'[bot]')
+                echo "SKIP ${sha} bot author '${author_name}' exempt from DCO"
+                continue
+                ;;
+            esac
             expected="Signed-off-by: ${author_name} <${author_email}>"
             if git show -s --format='%(trailers:key=Signed-off-by)' "${sha}" \
                 | grep -qiF "${expected}"; then
