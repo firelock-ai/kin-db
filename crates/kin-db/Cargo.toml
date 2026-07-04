@@ -65,7 +65,7 @@ rayon = "1"
 sysinfo = "0.39"
 tempfile = "3"
 tracing = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 kin-vector = { version = "0.1.6", registry = "kin" }
