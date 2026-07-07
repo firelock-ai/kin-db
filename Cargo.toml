@@ -10,6 +10,7 @@ version = "0.2.30"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
+repository = "https://github.com/firelock-ai/kin-db"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
