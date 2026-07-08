@@ -576,7 +576,7 @@
       ]
     },
     "SemanticFingerprint": {
-      "description": "Kin's identity moat. Survives renames, moves, formatting.",
+      "description": "Content-based fingerprint of an entity, used to detect what changed between revisions (structure, signature, and exact contents).",
       "type": "object",
       "required": [
         "algorithm",

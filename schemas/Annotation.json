@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Annotation",
-  "description": "A living annotation attached to one or more semantic scopes.\n\nAnnotations survive renames and moves because they are anchored to entity/contract/artifact identities, not line numbers. When the anchored entity's fingerprint drifts, staleness is detected.",
+  "description": "A living annotation attached to one or more semantic scopes.\n\nAnnotations are anchored to entity/contract/artifact identities, not line numbers, so they are designed to stay attached across renames and moves. When the anchored entity's fingerprint drifts, staleness is detected.",
   "type": "object",
   "required": [
     "annotation_id",
@@ -169,7 +169,7 @@
       "format": "date-time"
     },
     "WorkScope": {
-      "description": "A semantic scope that a work item or annotation is anchored to.\n\nUnlike line numbers, these survive renames, moves, and formatting changes because they reference semantic identities in the graph.",
+      "description": "A semantic scope that a work item or annotation is anchored to.\n\nUnlike line numbers, these reference semantic identities in the graph, so anchors are designed to stay attached across renames, moves, and formatting changes.",
       "oneOf": [
         {
           "type": "object",
