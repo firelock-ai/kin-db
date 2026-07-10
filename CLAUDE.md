@@ -17,10 +17,10 @@ cargo test --workspace
 
 ### Crates
 
-- `crates/kin-model` — Canonical semantic model crate owned by this repo: entities, relations, layout, and the `GraphStore` trait surface that KinDB implements.
-- `crates/kin-db` — Graph engine crate.
+- `kin-model` — External dependency consumed from the `kin` cargo registry (canonical repo: `firelock-ai/kin-model`): entities, relations, layout, and the canonical types KinDB builds on. Not part of this workspace.
+- `crates/kin-db` — Graph engine crate (the only workspace member).
   `types.rs` re-exports the canonical `kin-model` types for local compatibility.
-  `store.rs` re-exports the local `GraphStore` trait surface.
+  `store.rs` re-exports `kin-model`'s `GraphStore` trait surface, which KinDB implements.
   `engine/`, `storage/`, `vector/`, and `search/` implement the runtime behavior.
 
 ### Key Design Decisions
