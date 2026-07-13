@@ -1,8 +1,8 @@
-# kin-db — The Semantic Engine for Kin
+# kin-db: The Semantic Engine for Kin
 
 > The semantic engine: graph storage, snapshots, indexing, text + vector search.
 
-The graph is the canonical repository substrate in Kin — not a file index, not a metadata
+The graph is the canonical repository substrate in Kin, not a file index, not a metadata
 overlay, but the primary source of truth for every entity, relation, and provenance record.
 `kin-db` is that substrate: it owns graph storage, snapshot persistence, BM25 lexical
 retrieval, and ANN vector search, and composes `kin-infer` for on-device embedding inference.
@@ -14,17 +14,18 @@ on top of it.
 
 ## What is Kin?
 
-Kin is the system of record for AI-written software — your code as a graph of
-entities, relations, and intents, not a pile of files and diffs. AI agents and humans
-navigate it semantically, with provenance, review, and governance built in. It coexists
-with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+**AI writes code. Kin records what it means.** Kin is the semantic system of record for
+AI-written software: your code as a graph of entities, relations, and intents, not a pile
+of files and diffs. AI agents and humans navigate it semantically, with provenance, review,
+and governance built in. It coexists with Git and projects graph truth back to a normal
+filesystem, so any tool works unchanged.
 
 Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## kin-db's role
 
 `kin-db` owns the canonical graph substrate: entities, relations, provenance,
-sessions, and their indexes. It is not a general-purpose graph database — it is
+sessions, and their indexes. It is not a general-purpose graph database. It is
 built specifically to support Kin's semantic repository model, where every
 function, type, file, and relation is a first-class graph node with a stable
 identity, content hash, and verifiable Merkle ancestry.
@@ -52,19 +53,19 @@ Feature flags of note:
 
 ## Key types
 
-- `InMemoryGraph` — the live, mutable graph. Implements `GraphStore`,
+- `InMemoryGraph`: the live, mutable graph. Implements `GraphStore`,
   `EntityStore`, `ChangeStore`, `SessionStore`, `ProvenanceStore`, and
   `VerificationStore`.
-- `TieredGraph` — tiered storage wrapper: hot in-memory graph over a
+- `TieredGraph`: tiered storage wrapper, a hot in-memory graph over a
   configurable cold backend with configurable memory limits.
-- `SnapshotManager` — atomic snapshot persistence and swap.
-- `GraphSnapshot` / `GraphSnapshotDelta` — serializable full and incremental
+- `SnapshotManager`: atomic snapshot persistence and swap.
+- `GraphSnapshot` / `GraphSnapshotDelta`: serializable full and incremental
   graph states for persistence and sync.
-- `RetrievalQuery` / `unified_retrieve` — unified BM25 + vector retrieval
+- `RetrievalQuery` / `unified_retrieve`: unified BM25 + vector retrieval
   entry point with ranking policy applied above this layer.
-- `MerkleHash` / `compute_repo_truth_hash` — content-hash verification for
+- `MerkleHash` / `compute_repo_truth_hash`: content-hash verification for
   tamper detection and citable proof.
-- `CodeEmbedder` — manages the background embedding worker and interfaces with
+- `CodeEmbedder`: manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
 ## Legacy journal rebuilds
@@ -91,7 +92,7 @@ caller-reconciled full snapshot bytes.
 
 | Repo | Role |
 |------|------|
-| [kin](https://github.com/firelock-ai/kin) | Semantic system of record — CLI, daemon, MCP server, projections |
+| [kin](https://github.com/firelock-ai/kin) | Semantic system of record: CLI, daemon, MCP server, projections |
 | [kin-vfs](https://github.com/firelock-ai/kin-vfs) | Transparent filesystem projection |
 | [kin-editor](https://github.com/firelock-ai/kin-editor) | VS Code extension |
 | [kin-lsp](https://github.com/firelock-ai/kin-lsp) | Language-server enrichment boundary |
