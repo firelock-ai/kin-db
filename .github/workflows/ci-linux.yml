@@ -55,7 +55,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-linux-sources-${{ hashFiles('kin-db/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-linux-sources-${{ hashFiles('kin-db/**/Cargo.toml', 'kin-db/.cargo/config.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-linux-sources-
 
