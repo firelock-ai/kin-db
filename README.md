@@ -14,7 +14,7 @@ on top of it.
 
 ## What is Kin?
 
-**AI writes code. Kin records what it means.** Kin is the semantic system of record for
+**AI writes code. Kin proves the change.** Kin is the semantic system of record for
 AI-written software: your code as a graph of entities, relations, and intents, not a pile
 of files and diffs. AI agents and humans navigate it semantically, with provenance, review,
 and governance built in. It coexists with Git and projects graph truth back to a normal
