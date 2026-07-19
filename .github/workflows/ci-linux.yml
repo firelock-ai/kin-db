@@ -49,16 +49,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
 
-      - name: Cache cargo registry and build
+      - name: Cache cargo registry and sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            kin-db/target
-          key: ${{ runner.os }}-cargo-linux-${{ hashFiles('kin-db/**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-linux-sources-${{ hashFiles('kin-db/**/Cargo.toml', 'kin-db/.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-linux-
+            ${{ runner.os }}-cargo-linux-sources-
 
       # Default features only (vector + embeddings, CPU inference). No `metal`.
       - name: Build
