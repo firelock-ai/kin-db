@@ -88,6 +88,15 @@ rebuild after rechecking that old writers remain stopped. GCS journal filenames
 are historical timestamps, not replay authority, so GCS always requires
 caller-reconciled full snapshot bytes.
 
+For local repositories that predate snapshot authority, use
+`SnapshotManager::recover_local_authority_with_evidence`. The caller supplies
+the expected repository ID plus exact snapshot and ordered-delta digests in a
+`LocalAuthorityRecoveryEvidence` value. Recovery verifies those bytes before
+mutation, installs a durable recovery marker, commits graph authority, and
+reopens the result before cleanup. Stale evidence, changed journal contents,
+repository mismatches, or an unquiesced writer fail closed without promoting
+the caller's graph.
+
 ## Ecosystem
 
 | Repo | Role |
