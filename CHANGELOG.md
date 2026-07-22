@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-21
+
+### Added
+
+- Immutable SHA-256-addressed exact-source object storage across local and GCS
+  backends, with per-repository namespace isolation and bounded reads.
+
+### Changed
+
+- Raised the storage contract to 0.3.0 and adopted `kin-model` 0.4.0 exact
+  source-entry modes and immutable semantic-change identity.
+- Duplicate semantic change IDs are now idempotent only for structurally equal,
+  IEEE-754-bit-exact payloads; non-finite immutable payloads fail before mutation.
+
+### Security
+
+- Local source objects use descriptor-relative, no-follow publication and reads,
+  reject special files and ancestor substitution, preserve no-clobber semantics,
+  and reconfirm file, directory, and trust-root durability before acknowledgement.
+
 ## [0.2.40] - 2026-07-21
 
 ### Changed
@@ -164,7 +184,8 @@ in git history.
 - Embed config tolerance for duplicate `layer_norm_eps`, and an in-memory vector
   cache bound (0.2.2, 0.2.22).
 
-[unreleased]: https://github.com/firelock-ai/kin-db/compare/d46123fe1221...HEAD
+[unreleased]: https://github.com/firelock-ai/kin-db/compare/9dfbe2da3c94...HEAD
+[0.3.0]: https://github.com/firelock-ai/kin-db/compare/d46123fe1221...9dfbe2da3c94
 [0.2.40]: https://github.com/firelock-ai/kin-db/compare/b8c6ce362afe...d46123fe1221
 [0.2.39]: https://github.com/firelock-ai/kin-db/compare/daffd3c56a73...b8c6ce362afe
 [0.2.38]: https://github.com/firelock-ai/kin-db/compare/fa8f53168850...daffd3c56a73
