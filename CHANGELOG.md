@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-22
+
+### Added
+
+- Bounded immutable source blob reads: `load_source_blob_bounded` rejects an
+  object whose trusted metadata exceeds the caller's `max_bytes` budget before
+  allocating its body, returning the typed `SourceBlobReadLimitExceeded` error
+  (distinct from the backend-wide safety-limit `StorageError`). The local and
+  GCS backends enforce the bound on their metadata path, and the trait default
+  is fail-closed so a backend without bounded support cannot allocate an
+  unbounded legacy result on a security-sensitive path.
+
+### Changed
+
+- `load_source_blob` now delegates to the bounded read with the backend-wide
+  `MAX_SOURCE_BLOB_BYTES` safety limit, keeping the unbounded entry point within
+  the same allocation boundary.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added
