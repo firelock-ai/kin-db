@@ -1,6 +1,8 @@
 # kin-db: The Semantic Engine for Kin
 
-> The semantic engine: graph storage, snapshots, indexing, text + vector search.
+> **Software that remembers itself.**
+>
+> Exact context, not more.
 
 The graph is the canonical repository substrate in Kin, not a file index, not a metadata
 overlay, but the primary source of truth for every entity, relation, and provenance record.
