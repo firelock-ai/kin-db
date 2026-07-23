@@ -202,7 +202,8 @@ in git history.
 - Embed config tolerance for duplicate `layer_norm_eps`, and an in-memory vector
   cache bound (0.2.2, 0.2.22).
 
-[unreleased]: https://github.com/firelock-ai/kin-db/compare/9dfbe2da3c94...HEAD
+[unreleased]: https://github.com/firelock-ai/kin-db/compare/81a47647f579...HEAD
+[0.3.1]: https://github.com/firelock-ai/kin-db/compare/9dfbe2da3c94...81a47647f579
 [0.3.0]: https://github.com/firelock-ai/kin-db/compare/d46123fe1221...9dfbe2da3c94
 [0.2.40]: https://github.com/firelock-ai/kin-db/compare/b8c6ce362afe...d46123fe1221
 [0.2.39]: https://github.com/firelock-ai/kin-db/compare/daffd3c56a73...b8c6ce362afe
