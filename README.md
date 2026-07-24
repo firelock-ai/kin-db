@@ -65,8 +65,14 @@ Feature flags of note:
   graph states for persistence and sync.
 - `RetrievalQuery` / `unified_retrieve`: unified BM25 + vector retrieval
   entry point with ranking policy applied above this layer.
-- `MerkleHash` / `compute_repo_truth_hash`: content-hash verification for
-  tamper detection and citable proof.
+- `MerkleHash` / `compute_graph_root_hash`: entity-integrity primitive over
+  entity content and outgoing-relation topology.
+- `compute_repo_truth_hash` / `RepoTruthHash`: whole-snapshot content-hash
+  verification for tamper detection and citable proof. Covers the change DAG
+  and every other truth domain by content, not cardinality, and is independent
+  of map and insertion order. Persist `RepoTruthHash` rather than a bare digest:
+  it carries `REPO_TRUTH_HASH_VERSION`, so a stored value from an older encoding
+  reads as stale format instead of as truth drift.
 - `CodeEmbedder`: manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
