@@ -9,9 +9,10 @@ on:
 
 jobs:
   dependency-wave:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.16
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.17
     with:
       manifests: crates/kin-db/Cargo.toml
       test-command: cargo test -p kin-db --lib
+      auto-merge: true
     secrets:
       KIN_CI_BOT_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
