@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-25
+
+### Changed
+
+- `compute_repo_truth_hash` now covers the change DAG and every other snapshot
+  domain by content: each covered domain is reduced to a sorted multiset of
+  per-element digests over a canonical JSON encoding (type tags, length
+  prefixes, sorted object keys), so the digest is independent of map iteration
+  order, insertion order, and the slice order of vectors materialized from
+  maps. Previously the change DAG contributed only its cardinality and roughly
+  thirty domains contributed nothing at all, so two graphs whose histories
+  disagreed about every entity delta could hash identically. The digest value
+  changes for every repository, which is why this release is 0.4.0: a `^0.3`
+  consumer must opt into the new hash semantics deliberately.
+
+### Added
+
+- `RepoTruthHash` and `REPO_TRUTH_HASH_VERSION`: callers can persist the
+  versioned wrapper so a stored digest from an older encoding reads as stale
+  format rather than as truth drift. Exhaustive `GraphSnapshot` destructuring
+  makes a newly added domain a compile error until it is either covered or
+  explicitly excluded from the digest.
+
+## [0.3.2] - 2026-07-25
+
+### Changed
+
+- Refreshed Kin registry dependency pins; release tags are now minted
+  automatically once a version reaches main.
+
 ## [0.3.1] - 2026-07-22
 
 ### Added
