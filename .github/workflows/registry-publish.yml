@@ -9,7 +9,7 @@ on:
 
 jobs:
   release:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.9
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.14
     with:
       package: kin-db
       manifest: Cargo.toml
@@ -21,7 +21,10 @@ jobs:
         --skip default_dimensions_match_default_model
         --skip test_vector_index_dimension_mismatch_auto_recovery
         --skip many_vectors_search_quality
+      mint-release-tag: true
     secrets:
+      KIN_RELEASE_BOT_APP_ID: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+      KIN_RELEASE_BOT_PRIVATE_KEY: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
       KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
       KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
       KIN_DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
