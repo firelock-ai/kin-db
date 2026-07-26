@@ -1,22 +1,130 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "TreeEntry",
-  "description": "Content identity and exact mode for one repository tree entry.\n\nSymlink entries store the link target bytes as the referenced blob.",
-  "type": "object",
-  "required": [
-    "blob_hash",
-    "kind"
-  ],
-  "properties": {
-    "blob_hash": {
-      "$ref": "#/definitions/Hash256"
+  "description": "Exact materialization of one leaf in the repository tree.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "executable",
+        "hash",
+        "type"
+      ],
+      "properties": {
+        "executable": {
+          "type": "boolean"
+        },
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "blob"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
-    "kind": {
-      "$ref": "#/definitions/TreeEntryKind"
+    {
+      "description": "The referenced blob contains the byte-exact link target.",
+      "type": "object",
+      "required": [
+        "target_blob",
+        "type"
+      ],
+      "properties": {
+        "target_blob": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "symlink"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "A Git submodule pointer. The target need not exist in this repository's object database.",
+      "type": "object",
+      "required": [
+        "target",
+        "type"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/definitions/GitObjectId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "gitlink"
+          ]
+        }
+      },
+      "additionalProperties": false
     }
-  },
-  "additionalProperties": false,
+  ],
   "definitions": {
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "Hash256": {
       "description": "Content-addressed 256-bit hash.",
       "type": "array",
@@ -27,45 +135,6 @@
       },
       "maxItems": 32,
       "minItems": 32
-    },
-    "TreeEntryKind": {
-      "description": "Exact Git-relevant kind of a repository tree entry.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "executable",
-            "type"
-          ],
-          "properties": {
-            "executable": {
-              "type": "boolean"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "regular"
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": [
-            "type"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "symlink"
-              ]
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
     }
   }
 }

@@ -1,82 +1,25 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "TreeDelta",
-  "description": "Exact transition for one stable artifact identity in the repository tree.\n\n`Updated` covers content edits, mode changes, moves, and move-plus-edit. Paths are locations only; identity is always carried by `artifact_id`.",
-  "oneOf": [
-    {
-      "type": "object",
-      "required": [
-        "artifact_id",
-        "new",
-        "operation"
-      ],
-      "properties": {
-        "artifact_id": {
-          "$ref": "#/definitions/ArtifactId"
-        },
-        "new": {
-          "$ref": "#/definitions/LocatedEntry"
-        },
-        "operation": {
-          "type": "string",
-          "enum": [
-            "added"
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "required": [
-        "artifact_id",
-        "new",
-        "old",
-        "operation"
-      ],
-      "properties": {
-        "artifact_id": {
-          "$ref": "#/definitions/ArtifactId"
-        },
-        "new": {
-          "$ref": "#/definitions/LocatedEntry"
-        },
-        "old": {
-          "$ref": "#/definitions/LocatedEntry"
-        },
-        "operation": {
-          "type": "string",
-          "enum": [
-            "updated"
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "required": [
-        "artifact_id",
-        "old",
-        "operation"
-      ],
-      "properties": {
-        "artifact_id": {
-          "$ref": "#/definitions/ArtifactId"
-        },
-        "old": {
-          "$ref": "#/definitions/LocatedEntry"
-        },
-        "operation": {
-          "type": "string",
-          "enum": [
-            "removed"
-          ]
-        }
-      },
-      "additionalProperties": false
-    }
+  "title": "ResolvedArtifact",
+  "description": "One active artifact in a resolved repository tree.",
+  "type": "object",
+  "required": [
+    "artifact_id",
+    "entry",
+    "path"
   ],
+  "properties": {
+    "artifact_id": {
+      "$ref": "#/definitions/ArtifactId"
+    },
+    "entry": {
+      "$ref": "#/definitions/TreeEntry"
+    },
+    "path": {
+      "$ref": "#/definitions/RepoPath"
+    }
+  },
+  "additionalProperties": false,
   "definitions": {
     "ArtifactId": {
       "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
@@ -150,23 +93,6 @@
       },
       "maxItems": 32,
       "minItems": 32
-    },
-    "LocatedEntry": {
-      "description": "One artifact's exact location and materialization at a repository ref.",
-      "type": "object",
-      "required": [
-        "entry",
-        "path"
-      ],
-      "properties": {
-        "entry": {
-          "$ref": "#/definitions/TreeEntry"
-        },
-        "path": {
-          "$ref": "#/definitions/RepoPath"
-        }
-      },
-      "additionalProperties": false
     },
     "RepoPath": {
       "type": "object",

@@ -108,9 +108,10 @@
       }
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "ArtifactId": {
-      "description": "Deterministic ID for retrievable non-entity graph objects.\n\nArtifact IDs are derived from graph-owned file paths so the same tracked artifact produces the same retrieval ID across re-index and re-init.",
+      "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
       "type": "string",
       "format": "uuid"
     },
@@ -378,6 +379,63 @@
         "V1TreeSitter"
       ]
     },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "GraphNodeId": {
       "description": "Typed graph node reference for first-class mixed-domain relations.",
       "oneOf": [
@@ -485,6 +543,23 @@
         "Kotlin",
         "Hcl"
       ]
+    },
+    "LocatedEntry": {
+      "description": "One artifact's exact location and materialization at a repository ref.",
+      "type": "object",
+      "required": [
+        "entry",
+        "path"
+      ],
+      "properties": {
+        "entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        }
+      },
+      "additionalProperties": false
     },
     "Relation": {
       "description": "A typed edge in the semantic graph.",
@@ -696,6 +771,18 @@
         }
       ]
     },
+    "RepoPath": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "RiskLevel": {
       "description": "Risk classification.",
       "type": "string",
@@ -883,21 +970,21 @@
       "format": "date-time"
     },
     "TreeDelta": {
-      "description": "Exact transition for one path in the repository tree.\n\nEach variant carries every entry needed to describe the transition. This makes mode-unknown entries, missing hashes, and `None -> None` deltas unrepresentable.",
+      "description": "Exact transition for one stable artifact identity in the repository tree.\n\n`Updated` covers content edits, mode changes, moves, and move-plus-edit. Paths are locations only; identity is always carried by `artifact_id`.",
       "oneOf": [
         {
           "type": "object",
           "required": [
-            "file_id",
-            "new_entry",
+            "artifact_id",
+            "new",
             "operation"
           ],
           "properties": {
-            "file_id": {
-              "$ref": "#/definitions/FilePathId"
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
             },
-            "new_entry": {
-              "$ref": "#/definitions/TreeEntry"
+            "new": {
+              "$ref": "#/definitions/LocatedEntry"
             },
             "operation": {
               "type": "string",
@@ -911,25 +998,25 @@
         {
           "type": "object",
           "required": [
-            "file_id",
-            "new_entry",
-            "old_entry",
+            "artifact_id",
+            "new",
+            "old",
             "operation"
           ],
           "properties": {
-            "file_id": {
-              "$ref": "#/definitions/FilePathId"
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
             },
-            "new_entry": {
-              "$ref": "#/definitions/TreeEntry"
+            "new": {
+              "$ref": "#/definitions/LocatedEntry"
             },
-            "old_entry": {
-              "$ref": "#/definitions/TreeEntry"
+            "old": {
+              "$ref": "#/definitions/LocatedEntry"
             },
             "operation": {
               "type": "string",
               "enum": [
-                "modified"
+                "updated"
               ]
             }
           },
@@ -938,16 +1025,16 @@
         {
           "type": "object",
           "required": [
-            "file_id",
-            "old_entry",
+            "artifact_id",
+            "old",
             "operation"
           ],
           "properties": {
-            "file_id": {
-              "$ref": "#/definitions/FilePathId"
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
             },
-            "old_entry": {
-              "$ref": "#/definitions/TreeEntry"
+            "old": {
+              "$ref": "#/definitions/LocatedEntry"
             },
             "operation": {
               "type": "string",
@@ -961,54 +1048,66 @@
       ]
     },
     "TreeEntry": {
-      "description": "Content identity and exact mode for one repository tree entry.\n\nSymlink entries store the link target bytes as the referenced blob.",
-      "type": "object",
-      "required": [
-        "blob_hash",
-        "kind"
-      ],
-      "properties": {
-        "blob_hash": {
-          "$ref": "#/definitions/Hash256"
-        },
-        "kind": {
-          "$ref": "#/definitions/TreeEntryKind"
-        }
-      },
-      "additionalProperties": false
-    },
-    "TreeEntryKind": {
-      "description": "Exact Git-relevant kind of a repository tree entry.",
+      "description": "Exact materialization of one leaf in the repository tree.",
       "oneOf": [
         {
           "type": "object",
           "required": [
             "executable",
+            "hash",
             "type"
           ],
           "properties": {
             "executable": {
               "type": "boolean"
             },
+            "hash": {
+              "$ref": "#/definitions/Hash256"
+            },
             "type": {
               "type": "string",
               "enum": [
-                "regular"
+                "blob"
               ]
             }
           },
           "additionalProperties": false
         },
         {
+          "description": "The referenced blob contains the byte-exact link target.",
           "type": "object",
           "required": [
+            "target_blob",
             "type"
           ],
           "properties": {
+            "target_blob": {
+              "$ref": "#/definitions/Hash256"
+            },
             "type": {
               "type": "string",
               "enum": [
                 "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A Git submodule pointer. The target need not exist in this repository's object database.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "gitlink"
               ]
             }
           },
