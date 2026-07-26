@@ -6,6 +6,7 @@
   "required": [
     "confidence",
     "dst",
+    "evidence",
     "id",
     "kind",
     "origin",
@@ -29,14 +30,20 @@
       ]
     },
     "dst": {
-      "$ref": "#/definitions/EntityId"
+      "$ref": "#/definitions/GraphNodeId"
+    },
+    "evidence": {
+      "description": "Parser/linker evidence for this edge.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RelationEvidence"
+      }
     },
     "id": {
       "$ref": "#/definitions/RelationId"
     },
     "import_source": {
       "description": "For Calls/References edges, the module/package the target was imported from. Enables qualified cross-repo resolution in the spine. e.g., \"requests\" for `from requests import get`, \"kin_db\" for `use kin_db::InMemoryGraph`",
-      "default": null,
       "type": [
         "string",
         "null"
@@ -49,17 +56,141 @@
       "$ref": "#/definitions/RelationOrigin"
     },
     "src": {
-      "$ref": "#/definitions/EntityId"
+      "$ref": "#/definitions/GraphNodeId"
     }
   },
   "definitions": {
+    "ArtifactId": {
+      "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "CallArgShape": {
+      "description": "The argument shape observed at a single call site: how many positional arguments were passed, which keyword-argument names were used, and whether the call forwards a `*args` positional splat or a `**kwargs` keyword splat.\n\nCaptured per `Calls` edge so a consumer that invokes a callable positionally (unaffected by a parameter rename) can be told apart from one that names a parameter (which a rename would strand). A `**kwargs` splat means the keyword set is not statically known; the arity is known exactly only when neither splat flag is set.\n\n`keywords` is kept sorted and deduplicated so the shape is order- and duplicate-independent, keeping graph writes deterministic.",
+      "type": "object",
+      "required": [
+        "has_var_keyword",
+        "has_var_positional",
+        "keywords",
+        "positional"
+      ],
+      "properties": {
+        "has_var_keyword": {
+          "description": "The call forwards a `**mapping` keyword splat, so its keyword set is not statically known.",
+          "type": "boolean"
+        },
+        "has_var_positional": {
+          "description": "The call forwards a `*sequence` positional splat (or an equivalent pack-expansion).",
+          "type": "boolean"
+        },
+        "keywords": {
+          "description": "Sorted, deduplicated names of explicit keyword arguments (`name=value`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "positional": {
+          "description": "Number of positional argument expressions passed. A `*sequence` splat is not counted here; it is recorded by `has_var_positional`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
     "EntityId": {
       "description": "Unique identifier for an Entity.",
       "type": "string",
       "format": "uuid"
     },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "GraphNodeId": {
+      "description": "Typed graph node reference for first-class mixed-domain relations.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/ArtifactId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Test"
+          ],
+          "properties": {
+            "Test": {
+              "$ref": "#/definitions/TestId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Work"
+          ],
+          "properties": {
+            "Work": {
+              "$ref": "#/definitions/WorkId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "VerificationRun"
+          ],
+          "properties": {
+            "VerificationRun": {
+              "$ref": "#/definitions/VerificationRunId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "Hash256": {
-      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "description": "Content-addressed 256-bit hash.",
       "type": "array",
       "items": {
         "type": "integer",
@@ -68,6 +199,71 @@
       },
       "maxItems": 32,
       "minItems": 32
+    },
+    "RelationEvidence": {
+      "description": "Concrete evidence supporting a graph relation.",
+      "type": "object",
+      "required": [
+        "occurrence_count"
+      ],
+      "properties": {
+        "call_shape": {
+          "description": "Argument shape of the call site that produced this edge, when captured. Present only for `Calls` edges from languages that emit shapes; non-call edges and unresolved calls leave it `None`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CallArgShape"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurrence_count": {
+          "description": "Number of equivalent occurrences collapsed into this evidence record.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parser_rule": {
+          "description": "Parser or linker rule that produced this evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_path": {
+          "description": "Resolved graph-owned target path, when the linker could resolve it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_path": {
+          "description": "Module/include path as written in source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_span": {
+          "description": "Source span of the syntax that produced the edge, when available.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token": {
+          "description": "Lexical token at the evidence site, e.g. a macro name or imported symbol.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "RelationId": {
       "description": "Unique identifier for a Relation.",
@@ -78,28 +274,51 @@
       "description": "Classification of a relation edge.",
       "type": "string",
       "enum": [
-        "Calls",
-        "Imports",
         "Contains",
-        "References",
-        "Implements",
         "Extends",
-        "Tests",
+        "Implements",
+        "Overrides",
+        "Calls",
+        "Instantiates",
+        "References",
+        "UsesMacro",
+        "UsesType",
+        "Imports",
+        "Includes",
         "DependsOn",
+        "EmitsEvent",
+        "SubscribesTo",
         "DefinesContract",
         "ConsumesContract",
-        "EmitsEvent",
+        "SendsMessage",
+        "Spawns",
+        "Tests",
+        "Covers",
+        "CoChanges",
+        "DerivedFrom",
+        "DocumentedBy",
         "OwnedBy",
-        "DocumentedBy"
+        "OwnedByFile"
       ]
     },
     "RelationOrigin": {
       "description": "How a relation was established.",
-      "type": "string",
-      "enum": [
-        "Parsed",
-        "Inferred",
-        "Manual"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Parsed",
+            "Inferred",
+            "Manual"
+          ]
+        },
+        {
+          "description": "Discovered via Language Server Protocol (type-resolved).",
+          "type": "string",
+          "enum": [
+            "Lsp"
+          ]
+        }
       ]
     },
     "SemanticChangeId": {
@@ -109,6 +328,75 @@
           "$ref": "#/definitions/Hash256"
         }
       ]
+    },
+    "SourceSpan": {
+      "description": "Source location of an entity within a file.",
+      "type": "object",
+      "required": [
+        "end_byte",
+        "end_col",
+        "end_line",
+        "file",
+        "start_byte",
+        "start_col",
+        "start_line"
+      ],
+      "properties": {
+        "end_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "end_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "end_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "file": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "start_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "start_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "TestId": {
+      "description": "Unique identifier for a test case.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "VerificationRunId": {
+      "description": "Unique identifier for a verification run.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "WorkId": {
+      "description": "Unique identifier for a WorkItem.",
+      "type": "string",
+      "format": "uuid"
     }
   }
 }

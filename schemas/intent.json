@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Intent",
+  "description": "A declared intent from an agent session (transient, not part of semantic history).\n\nIntents represent what an agent plans to modify, enabling collision detection before conflicting writes occur.",
+  "type": "object",
+  "required": [
+    "intent_id",
+    "lock_type",
+    "registered_at",
+    "scopes",
+    "session_id",
+    "task_description"
+  ],
+  "properties": {
+    "expires_at": {
+      "description": "Optional expiry (after which the intent is auto-reaped).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "intent_id": {
+      "$ref": "#/definitions/IntentId"
+    },
+    "lock_type": {
+      "description": "Lock strength.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/LockType"
+        }
+      ]
+    },
+    "registered_at": {
+      "description": "When the intent was registered.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        }
+      ]
+    },
+    "scopes": {
+      "description": "What the intent targets (entities, contracts, files).",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/IntentScope"
+      }
+    },
+    "session_id": {
+      "description": "Session that owns this intent.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SessionId"
+        }
+      ]
+    },
+    "task_description": {
+      "description": "Human-readable description of what the agent plans to do.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "IntentId": {
+      "description": "Unique identifier for an Intent.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "IntentScope": {
+      "description": "What an intent targets.",
+      "oneOf": [
+        {
+          "description": "An entity in the semantic graph.",
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A contract (API, schema, protocol).",
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A file artifact.",
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/FilePathId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "LockType": {
+      "description": "Lock strength for an intent.",
+      "oneOf": [
+        {
+          "description": "Advisory lock: other agents see a warning but can proceed.",
+          "type": "string",
+          "enum": [
+            "Soft"
+          ]
+        },
+        {
+          "description": "Exclusive lock: other agents are blocked from modifying the scope.",
+          "type": "string",
+          "enum": [
+            "Hard"
+          ]
+        }
+      ]
+    },
+    "SessionId": {
+      "description": "Unique identifier for an AgentSession.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

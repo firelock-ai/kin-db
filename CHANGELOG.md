@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Local snapshot persistence now has one exact authority contract: an atomic
+  manifest binds immutable generation payloads and acknowledged or retired
+  deltas by digest. The requested `.kndb` path is a logical namespace, not a
+  compatibility payload or projection.
+- SQLite now requires the current non-null snapshot-authority schema, and GCS
+  requires the current full-authority envelope. Neither backend migrates old
+  formats or promotes unbound journal objects into graph truth.
+- Persisted vector indexes now require a complete model/root descriptor and a
+  complete current metadata sidecar, including a non-empty embedder identity.
+- Artifact IDs are assigned from graph authority with collision retry, so a
+  filesystem path does not seed identity and renames preserve the assigned ID.
+- Regenerated the checked-in JSON schemas from the exact current `kin-model`
+  schema generator.
+
+### Removed
+
+- Removed the public local-authority repair and journal-rebuild APIs, old
+  authority decoders, raw `graph.kndb` compatibility writes, and implicit
+  vector-index acceptance paths.
+
+## [0.5.0] - 2026-07-25
+
+### Changed
+
+- Replaced content-hash-only file tracking with an exact graph-owned working
+  tree. Every tracked path now persists its blob identity and materialization
+  kind, including regular versus executable files and symbolic links.
+- Tree transitions are part of `TransactionDelta` and are validated before any
+  graph mutation, so stale add, modify, mode-change, symlink, and removal
+  transitions fail atomically instead of partially updating semantic facets.
+- Repository-truth hashing now covers the exact working tree, including
+  executable and symbolic-link identity.
+- Snapshot v9 is one required schema rather than a partially defaulted
+  compatibility layout. The zero-copy writer now persists the graph-assigned
+  artifact index explicitly, preserving stable artifact identity across
+  save/reopen and rename.
+
+### Removed
+
+- Removed snapshot formats v1 through v8 and their migration code. Pre-release
+  repositories must be reinitialized because the missing file-kind information
+  cannot be reconstructed from the old hash-only snapshots.
+- Removed the superseded flat verification-link vectors, temporal tombstone
+  maps, and persisted change-order cache. Verification edges live only as graph
+  relations; revisions and ordering are derived from the change DAG.
+
 ## [0.4.0] - 2026-07-25
 
 ### Changed
