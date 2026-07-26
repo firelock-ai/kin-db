@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-26
+
+### Changed
+
+- Repository admission now derives an in-memory index of exact
+  `(ArtifactId, GitObjectId)` pairs from previously persisted, raw-tree-verified
+  Git history. Workspaces and native changes can restore or retarget those
+  authenticated Gitlinks after ref movement, authority removal, and reopen,
+  while raw objects, unseen targets, copied identities, and same-transaction
+  history remain fail-closed.
+
+## [0.5.0] - 2026-07-25
+
 ### Changed
 
 - Local snapshot persistence now has one exact authority contract: an atomic
@@ -22,17 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filesystem path does not seed identity and renames preserve the assigned ID.
 - Regenerated the checked-in JSON schemas from the exact current `kin-model`
   schema generator.
-
-### Removed
-
-- Removed the public local-authority repair and journal-rebuild APIs, old
-  authority decoders, raw `graph.kndb` compatibility writes, and implicit
-  vector-index acceptance paths.
-
-## [0.5.0] - 2026-07-25
-
-### Changed
-
 - Replaced content-hash-only file tracking with an exact graph-owned working
   tree. Every tracked path now persists its blob identity and materialization
   kind, including regular versus executable files and symbolic links.
@@ -48,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed the public local-authority repair and journal-rebuild APIs, old
+  authority decoders, raw `graph.kndb` compatibility writes, and implicit
+  vector-index acceptance paths.
 - Removed snapshot formats v1 through v8 and their migration code. Pre-release
   repositories must be reinitialized because the missing file-kind information
   cannot be reconstructed from the old hash-only snapshots.
