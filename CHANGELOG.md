@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Persist complete workspace semantic overlays alongside exact trees, validate
+  them relative to the workspace base inside repository authority, and
+  materialize the same entity/relation state after reopen.
+- Reject pre-overlay repository authority and transaction schemas instead of
+  silently rebuilding dirty workspace semantics from `base_target`.
+- Advance the graph snapshot wire format to v12 and the local-state root
+  domain to v2 so tree-only workspace snapshots and pre-overlay root
+  identities fail closed rather than masquerading as current authority.
+
 ## [0.5.1] - 2026-07-26
 
 ### Changed
