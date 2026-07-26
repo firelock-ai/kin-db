@@ -76,6 +76,25 @@ Feature flags of note:
 - `CodeEmbedder`: manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
+## Persistence contract
+
+`SnapshotManager` accepts a logical snapshot namespace such as
+`.kin/kindb/graph.kndb`. That path is not itself a snapshot payload. Current
+local authority is the atomic `graph.kndb.authority.json` manifest, which binds
+an immutable generation under `graph.kndb.snapshots/` plus every acknowledged
+or retired delta by SHA-256. Raw bytes at `graph.kndb`, an authority manifest
+from another version, or an unbound delta fail closed; KinDB does not migrate,
+project, or silently repair them.
+
+SQLite accepts only its current non-null snapshot-authority schema. GCS accepts
+only the current full-authority envelope and does not expose unbound journal
+objects as replayable graph truth.
+
+Persisted vector indexes require both a complete in-index model/root descriptor
+and a current metadata sidecar with provider, model, revision, pipeline, graph
+root, dimensions, count, and embedder identity. Missing or mismatched identity
+never becomes retrieval authority.
+
 ## Ecosystem
 
 | Repo | Role |

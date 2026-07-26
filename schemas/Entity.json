@@ -10,6 +10,7 @@
     "language",
     "metadata",
     "name",
+    "role",
     "signature",
     "visibility"
   ],
@@ -71,12 +72,7 @@
       "type": "string"
     },
     "role": {
-      "default": "source",
-      "allOf": [
-        {
-          "$ref": "#/definitions/EntityRole"
-        }
-      ]
+      "$ref": "#/definitions/EntityRole"
     },
     "signature": {
       "type": "string"
@@ -235,7 +231,7 @@
           ]
         },
         "equivalence_hash": {
-          "description": "Hash of the entity's behavior-equivalence class: the token stream with pure-no-op statements (e.g. docstrings) normalized away, so a behavior-preserving body edit leaves it unchanged while any real change alters it. The zero hash (the serde default) means \"not computed\" and is never treated as a match. Always serialized. The custom deserializer accepts both the legacy five-field sequence and the current six-field sequence because graph snapshots use a positional binary format.",
+          "description": "Hash of the entity's behavior-equivalence class: the token stream with pure-no-op statements (e.g. docstrings) normalized away, so a behavior-preserving body edit leaves it unchanged while any real change alters it. The zero hash means \"not computed\" and is never treated as a match. Always serialized and required.",
           "allOf": [
             {
               "$ref": "#/definitions/Hash256"

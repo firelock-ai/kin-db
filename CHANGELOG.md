@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Local snapshot persistence now has one exact authority contract: an atomic
+  manifest binds immutable generation payloads and acknowledged or retired
+  deltas by digest. The requested `.kndb` path is a logical namespace, not a
+  compatibility payload or projection.
+- SQLite now requires the current non-null snapshot-authority schema, and GCS
+  requires the current full-authority envelope. Neither backend migrates old
+  formats or promotes unbound journal objects into graph truth.
+- Persisted vector indexes now require a complete model/root descriptor and a
+  complete current metadata sidecar, including a non-empty embedder identity.
+- Artifact IDs are assigned from graph authority with collision retry, so a
+  filesystem path does not seed identity and renames preserve the assigned ID.
+- Regenerated the checked-in JSON schemas from the exact current `kin-model`
+  schema generator.
+
+### Removed
+
+- Removed the public local-authority repair and journal-rebuild APIs, old
+  authority decoders, raw `graph.kndb` compatibility writes, and implicit
+  vector-index acceptance paths.
+
 ## [0.5.0] - 2026-07-25
 
 ### Changed
