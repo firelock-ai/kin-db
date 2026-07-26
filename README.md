@@ -76,34 +76,24 @@ Feature flags of note:
 - `CodeEmbedder`: manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
-## Legacy journal rebuilds
+## Persistence contract
 
-Pre-authority delta journals intentionally fail closed. To upgrade one, first
-quiesce every old writer and preserve the base plus all journal artifacts. An
-operator must reconcile those artifacts into a full graph, then call the
-public recovery surface with the last observed authority or legacy generation:
+`SnapshotManager` accepts a logical snapshot namespace such as
+`.kin/kindb/graph.kndb`. That path is not itself a snapshot payload. Current
+local authority is the atomic `graph.kndb.authority.json` manifest, which binds
+an immutable generation under `graph.kndb.snapshots/` plus every acknowledged
+or retired delta by SHA-256. Raw bytes at `graph.kndb`, an authority manifest
+from another version, or an unbound delta fail closed; KinDB does not migrate,
+project, or silently repair them.
 
-```rust
-let committed = backend.rebuild_legacy_journal(repo_id, &reconciled_bytes, expected_generation)?;
-// Local SnapshotManager layout:
-let (_, committed) = SnapshotManager::rebuild_legacy_journal(path, &reconciled_graph, expected_generation)?;
-```
+SQLite accepts only its current non-null snapshot-authority schema. GCS accepts
+only the current full-authority envelope and does not expose unbound journal
+objects as replayable graph truth.
 
-The operation captures the exact journal before a CAS promotion and deletes
-only that capture after the new full authority is durable. A cleanup failure
-still returns the committed generation; preserve it and retry the explicit
-rebuild after rechecking that old writers remain stopped. GCS journal filenames
-are historical timestamps, not replay authority, so GCS always requires
-caller-reconciled full snapshot bytes.
-
-For local repositories that predate snapshot authority, use
-`SnapshotManager::recover_local_authority_with_evidence`. The caller supplies
-the expected repository ID plus exact snapshot and ordered-delta digests in a
-`LocalAuthorityRecoveryEvidence` value. Recovery verifies those bytes before
-mutation, installs a durable recovery marker, commits graph authority, and
-reopens the result before cleanup. Stale evidence, changed journal contents,
-repository mismatches, or an unquiesced writer fail closed without promoting
-the caller's graph.
+Persisted vector indexes require both a complete in-index model/root descriptor
+and a current metadata sidecar with provider, model, revision, pipeline, graph
+root, dimensions, count, and embedder identity. Missing or mismatched identity
+never becomes retrieval authority.
 
 ## Ecosystem
 

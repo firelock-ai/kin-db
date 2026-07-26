@@ -10,6 +10,7 @@
     "language",
     "metadata",
     "name",
+    "role",
     "signature",
     "visibility"
   ],
@@ -70,6 +71,9 @@
     "name": {
       "type": "string"
     },
+    "role": {
+      "$ref": "#/definitions/EntityRole"
+    },
     "signature": {
       "type": "string"
     },
@@ -125,13 +129,26 @@
         "enum_def",
         "enum_variant",
         "constant",
-        "static_var"
+        "static_var",
+        "macro"
       ]
     },
     "EntityMetadata": {
       "description": "Extensible metadata bag for entities.",
       "type": "object",
       "additionalProperties": true
+    },
+    "EntityRole": {
+      "description": "Role of a semantic entity within the project.",
+      "type": "string",
+      "enum": [
+        "source",
+        "test",
+        "external",
+        "docs",
+        "generated",
+        "vendored"
+      ]
     },
     "FilePathId": {
       "description": "File path identifier.",
@@ -144,7 +161,7 @@
       ]
     },
     "Hash256": {
-      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "description": "Content-addressed 256-bit hash.",
       "type": "array",
       "items": {
         "type": "integer",
@@ -189,6 +206,7 @@
         "algorithm",
         "ast_hash",
         "behavior_hash",
+        "equivalence_hash",
         "signature_hash",
         "stability_score"
       ],
@@ -197,7 +215,7 @@
           "$ref": "#/definitions/FingerprintAlgorithm"
         },
         "ast_hash": {
-          "description": "Normalized AST shape hash.",
+          "description": "Hash of the normalized AST/source structure (insensitive to comments and whitespace).",
           "allOf": [
             {
               "$ref": "#/definitions/Hash256"
@@ -205,7 +223,15 @@
           ]
         },
         "behavior_hash": {
-          "description": "Control flow + side effects hash.",
+          "description": "Hash of the entity's full source text (changes on any body edit).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "equivalence_hash": {
+          "description": "Hash of the entity's behavior-equivalence class: the token stream with pure-no-op statements (e.g. docstrings) normalized away, so a behavior-preserving body edit leaves it unchanged while any real change alters it. The zero hash means \"not computed\" and is never treated as a match. Always serialized and required.",
           "allOf": [
             {
               "$ref": "#/definitions/Hash256"
@@ -213,7 +239,7 @@
           ]
         },
         "signature_hash": {
-          "description": "Parameter/return contract hash.",
+          "description": "Hash of the entity's signature line / declaration shape.",
           "allOf": [
             {
               "$ref": "#/definitions/Hash256"

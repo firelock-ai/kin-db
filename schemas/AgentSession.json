@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentSession",
+  "description": "A registered agent session (transient, not part of semantic history).",
+  "type": "object",
+  "required": [
+    "capabilities",
+    "client_name",
+    "cwd",
+    "last_heartbeat",
+    "session_id",
+    "started_at",
+    "transport",
+    "vendor"
+  ],
+  "properties": {
+    "capabilities": {
+      "description": "Declared capabilities.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SessionCapabilities"
+        }
+      ]
+    },
+    "client_name": {
+      "description": "User-facing session name.",
+      "type": "string"
+    },
+    "cwd": {
+      "description": "Working directory of the agent.",
+      "type": "string"
+    },
+    "last_heartbeat": {
+      "description": "Last heartbeat received from the agent.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        }
+      ]
+    },
+    "pid": {
+      "description": "OS process ID (if known).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "session_id": {
+      "$ref": "#/definitions/SessionId"
+    },
+    "started_at": {
+      "description": "When the session was registered.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        }
+      ]
+    },
+    "transport": {
+      "description": "How the session connects to Kin.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SessionTransport"
+        }
+      ]
+    },
+    "vendor": {
+      "description": "Vendor identifier: \"claude-code\", \"codex\", \"gemini-cli\", etc.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "SessionCapabilities": {
+      "description": "Capabilities declared by the agent session.",
+      "type": "object",
+      "required": [
+        "can_branch",
+        "can_commit",
+        "can_execute",
+        "can_read",
+        "can_write",
+        "max_concurrent_intents"
+      ],
+      "properties": {
+        "can_branch": {
+          "description": "Agent can create branches.",
+          "type": "boolean"
+        },
+        "can_commit": {
+          "description": "Agent can commit semantic changes.",
+          "type": "boolean"
+        },
+        "can_execute": {
+          "description": "Agent can execute commands.",
+          "type": "boolean"
+        },
+        "can_read": {
+          "description": "Agent can read files.",
+          "type": "boolean"
+        },
+        "can_write": {
+          "description": "Agent can write files.",
+          "type": "boolean"
+        },
+        "max_concurrent_intents": {
+          "description": "Maximum number of concurrent intents this session supports.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SessionId": {
+      "description": "Unique identifier for an AgentSession.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "SessionTransport": {
+      "description": "How the agent session connects to Kin.",
+      "oneOf": [
+        {
+          "description": "MCP (Model Context Protocol) connection.",
+          "type": "string",
+          "enum": [
+            "Mcp"
+          ]
+        },
+        {
+          "description": "Direct CLI invocation.",
+          "type": "string",
+          "enum": [
+            "Cli"
+          ]
+        },
+        {
+          "description": "External wrapper (e.g., aider, continue.dev).",
+          "type": "string",
+          "enum": [
+            "Wrapper"
+          ]
+        },
+        {
+          "description": "Local UI (web-based dashboard).",
+          "type": "string",
+          "enum": [
+            "Ui"
+          ]
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -98,7 +98,7 @@
       "type": "string"
     },
     "Hash256": {
-      "description": "Content-addressed 256-bit hash. Serializes as a 32-element byte array.",
+      "description": "Content-addressed 256-bit hash.",
       "type": "array",
       "items": {
         "type": "integer",

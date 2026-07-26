@@ -1,74 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "SemanticChange",
-  "description": "Kin's native commit — the unit of semantic history.",
+  "title": "TransactionDelta",
+  "description": "Delta for a batch of transactional graph changes.",
   "type": "object",
   "required": [
-    "author",
     "entity_deltas",
-    "evidence",
-    "id",
-    "message",
-    "parents",
-    "projected_files",
     "relation_deltas",
-    "timestamp",
     "tree_deltas"
   ],
   "properties": {
-    "author": {
-      "description": "Human or assistant.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/AuthorId"
-        }
-      ]
-    },
-    "authored_on": {
-      "description": "Informational: branch name at creation time.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/BranchName"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "entity_deltas": {
       "type": "array",
       "items": {
         "$ref": "#/definitions/EntityDelta"
-      }
-    },
-    "evidence": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/EvidenceId"
-      }
-    },
-    "id": {
-      "description": "Content-addressed hash.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/SemanticChangeId"
-        }
-      ]
-    },
-    "message": {
-      "type": "string"
-    },
-    "parents": {
-      "description": "0 = genesis, 1 = normal, 2 = merge.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/SemanticChangeId"
-      }
-    },
-    "projected_files": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/FilePathId"
       }
     },
     "relation_deltas": {
@@ -77,31 +21,7 @@
         "$ref": "#/definitions/RelationDelta"
       }
     },
-    "risk_summary": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/RiskSummary"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "spec_link": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/SpecId"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "timestamp": {
-      "$ref": "#/definitions/Timestamp"
-    },
     "tree_deltas": {
-      "description": "Exact changes to the repository tree, including code, configuration, documentation, assets, and files in unsupported languages.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/TreeDelta"
@@ -114,14 +34,6 @@
       "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
       "type": "string",
       "format": "uuid"
-    },
-    "AuthorId": {
-      "description": "Author identifier (human or assistant).",
-      "type": "string"
-    },
-    "BranchName": {
-      "description": "Branch name.",
-      "type": "string"
     },
     "CallArgShape": {
       "description": "The argument shape observed at a single call site: how many positional arguments were passed, which keyword-argument names were used, and whether the call forwards a `*args` positional splat or a `**kwargs` keyword splat.\n\nCaptured per `Calls` edge so a consumer that invokes a callable positionally (unaffected by a parameter rename) can be told apart from one that names a parameter (which a rename would strand). A `**kwargs` splat means the keyword set is not statically known; the arity is known exactly only when neither splat flag is set.\n\n`keywords` is kept sorted and deduplicated so the shape is order- and duplicate-independent, keeping graph writes deterministic.",
@@ -363,11 +275,6 @@
         "generated",
         "vendored"
       ]
-    },
-    "EvidenceId": {
-      "description": "Unique identifier for an Evidence record.",
-      "type": "string",
-      "format": "uuid"
     },
     "FilePathId": {
       "description": "File path identifier.",
@@ -783,64 +690,6 @@
       },
       "additionalProperties": false
     },
-    "RiskLevel": {
-      "description": "Risk classification.",
-      "type": "string",
-      "enum": [
-        "Low",
-        "Medium",
-        "High",
-        "Critical"
-      ]
-    },
-    "RiskSummary": {
-      "description": "Summary of risk associated with a semantic change.",
-      "type": "object",
-      "required": [
-        "breaking_changes",
-        "contract_violations",
-        "notes",
-        "overall_risk",
-        "test_coverage_gaps",
-        "work_risks"
-      ],
-      "properties": {
-        "breaking_changes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "contract_violations": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "notes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "overall_risk": {
-          "$ref": "#/definitions/RiskLevel"
-        },
-        "test_coverage_gaps": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "work_risks": {
-          "description": "Risks related to in-progress work items affected by changes.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    },
     "SemanticChangeId": {
       "description": "Content-addressed identifier for a SemanticChange.",
       "allOf": [
@@ -951,11 +800,6 @@
         }
       }
     },
-    "SpecId": {
-      "description": "Unique identifier for a Spec.",
-      "type": "string",
-      "format": "uuid"
-    },
     "TestId": {
       "description": "Unique identifier for a test case.",
       "allOf": [
@@ -963,11 +807,6 @@
           "$ref": "#/definitions/Hash256"
         }
       ]
-    },
-    "Timestamp": {
-      "description": "UTC timestamp wrapper.",
-      "type": "string",
-      "format": "date-time"
     },
     "TreeDelta": {
       "description": "Exact transition for one stable artifact identity in the repository tree.\n\n`Updated` covers content edits, mode changes, moves, and move-plus-edit. Paths are locations only; identity is always carried by `artifact_id`.",

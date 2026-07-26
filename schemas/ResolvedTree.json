@@ -1,0 +1,193 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResolvedTree",
+  "type": "object",
+  "required": [
+    "artifacts"
+  ],
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ResolvedArtifact"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ArtifactId": {
+      "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "RepoPath": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResolvedArtifact": {
+      "description": "One active artifact in a resolved repository tree.",
+      "type": "object",
+      "required": [
+        "artifact_id",
+        "entry",
+        "path"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/definitions/ArtifactId"
+        },
+        "entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TreeEntry": {
+      "description": "Exact materialization of one leaf in the repository tree.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "hash",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The referenced blob contains the byte-exact link target.",
+          "type": "object",
+          "required": [
+            "target_blob",
+            "type"
+          ],
+          "properties": {
+            "target_blob": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A Git submodule pointer. The target need not exist in this repository's object database.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "gitlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}
