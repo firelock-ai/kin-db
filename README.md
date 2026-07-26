@@ -76,35 +76,6 @@ Feature flags of note:
 - `CodeEmbedder`: manages the background embedding worker and interfaces with
   `kin-infer` for on-device model inference.
 
-## Legacy journal rebuilds
-
-Pre-authority delta journals intentionally fail closed. To upgrade one, first
-quiesce every old writer and preserve the base plus all journal artifacts. An
-operator must reconcile those artifacts into a full graph, then call the
-public recovery surface with the last observed authority or legacy generation:
-
-```rust
-let committed = backend.rebuild_legacy_journal(repo_id, &reconciled_bytes, expected_generation)?;
-// Local SnapshotManager layout:
-let (_, committed) = SnapshotManager::rebuild_legacy_journal(path, &reconciled_graph, expected_generation)?;
-```
-
-The operation captures the exact journal before a CAS promotion and deletes
-only that capture after the new full authority is durable. A cleanup failure
-still returns the committed generation; preserve it and retry the explicit
-rebuild after rechecking that old writers remain stopped. GCS journal filenames
-are historical timestamps, not replay authority, so GCS always requires
-caller-reconciled full snapshot bytes.
-
-For local repositories that predate snapshot authority, use
-`SnapshotManager::recover_local_authority_with_evidence`. The caller supplies
-the expected repository ID plus exact snapshot and ordered-delta digests in a
-`LocalAuthorityRecoveryEvidence` value. Recovery verifies those bytes before
-mutation, installs a durable recovery marker, commits graph authority, and
-reopens the result before cleanup. Stale evidence, changed journal contents,
-repository mismatches, or an unquiesced writer fail closed without promoting
-the caller's graph.
-
 ## Ecosystem
 
 | Repo | Role |
