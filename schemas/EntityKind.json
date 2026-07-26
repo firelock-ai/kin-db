@@ -21,6 +21,7 @@
     "enum_def",
     "enum_variant",
     "constant",
-    "static_var"
+    "static_var",
+    "macro"
   ]
 }

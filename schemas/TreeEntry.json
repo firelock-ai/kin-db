@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TreeEntry",
+  "description": "Content identity and exact mode for one repository tree entry.\n\nSymlink entries store the link target bytes as the referenced blob.",
+  "type": "object",
+  "required": [
+    "blob_hash",
+    "kind"
+  ],
+  "properties": {
+    "blob_hash": {
+      "$ref": "#/definitions/Hash256"
+    },
+    "kind": {
+      "$ref": "#/definitions/TreeEntryKind"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "TreeEntryKind": {
+      "description": "Exact Git-relevant kind of a repository tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "regular"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

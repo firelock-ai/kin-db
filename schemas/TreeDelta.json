@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TreeDelta",
+  "description": "Exact transition for one path in the repository tree.\n\nEach variant carries every entry needed to describe the transition. This makes mode-unknown entries, missing hashes, and `None -> None` deltas unrepresentable.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "file_id",
+        "new_entry",
+        "operation"
+      ],
+      "properties": {
+        "file_id": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "new_entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "added"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "file_id",
+        "new_entry",
+        "old_entry",
+        "operation"
+      ],
+      "properties": {
+        "file_id": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "new_entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "old_entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "modified"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "file_id",
+        "old_entry",
+        "operation"
+      ],
+      "properties": {
+        "file_id": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "old_entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "removed"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "TreeEntry": {
+      "description": "Content identity and exact mode for one repository tree entry.\n\nSymlink entries store the link target bytes as the referenced blob.",
+      "type": "object",
+      "required": [
+        "blob_hash",
+        "kind"
+      ],
+      "properties": {
+        "blob_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "kind": {
+          "$ref": "#/definitions/TreeEntryKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TreeEntryKind": {
+      "description": "Exact Git-relevant kind of a repository tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "regular"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

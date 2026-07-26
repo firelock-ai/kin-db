@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-25
+
+### Changed
+
+- Replaced content-hash-only file tracking with an exact graph-owned working
+  tree. Every tracked path now persists its blob identity and materialization
+  kind, including regular versus executable files and symbolic links.
+- Tree transitions are part of `TransactionDelta` and are validated before any
+  graph mutation, so stale add, modify, mode-change, symlink, and removal
+  transitions fail atomically instead of partially updating semantic facets.
+- Repository-truth hashing now covers the exact working tree, including
+  executable and symbolic-link identity.
+
+### Removed
+
+- Removed snapshot formats v1 through v8 and their migration code. Pre-release
+  repositories must be reinitialized because the missing file-kind information
+  cannot be reconstructed from the old hash-only snapshots.
+
 ## [0.4.0] - 2026-07-25
 
 ### Changed

@@ -1,0 +1,161 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TrafficReport",
+  "description": "Traffic report for a given scope target.\n\nShows what agents are actively working on or near a given entity/contract/file.",
+  "type": "object",
+  "required": [
+    "active_intents",
+    "downstream_warnings",
+    "target"
+  ],
+  "properties": {
+    "active_intents": {
+      "description": "Intents that directly lock this target.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/IntentSummary"
+      }
+    },
+    "downstream_warnings": {
+      "description": "Intents that lock downstream dependencies (warning zone).",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/IntentSummary"
+      }
+    },
+    "target": {
+      "description": "The scope being queried.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/IntentScope"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "IntentId": {
+      "description": "Unique identifier for an Intent.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "IntentScope": {
+      "description": "What an intent targets.",
+      "oneOf": [
+        {
+          "description": "An entity in the semantic graph.",
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A contract (API, schema, protocol).",
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A file artifact.",
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/FilePathId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "IntentSummary": {
+      "description": "Summary of an intent for display in traffic reports.",
+      "type": "object",
+      "required": [
+        "intent_id",
+        "lock_type",
+        "registered_at",
+        "session_id",
+        "task_description",
+        "vendor"
+      ],
+      "properties": {
+        "intent_id": {
+          "$ref": "#/definitions/IntentId"
+        },
+        "lock_type": {
+          "$ref": "#/definitions/LockType"
+        },
+        "registered_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "task_description": {
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string"
+        }
+      }
+    },
+    "LockType": {
+      "description": "Lock strength for an intent.",
+      "oneOf": [
+        {
+          "description": "Advisory lock: other agents see a warning but can proceed.",
+          "type": "string",
+          "enum": [
+            "Soft"
+          ]
+        },
+        {
+          "description": "Exclusive lock: other agents are blocked from modifying the scope.",
+          "type": "string",
+          "enum": [
+            "Hard"
+          ]
+        }
+      ]
+    },
+    "SessionId": {
+      "description": "Unique identifier for an AgentSession.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
