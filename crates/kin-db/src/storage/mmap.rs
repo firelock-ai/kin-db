@@ -209,15 +209,17 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
 }
 
 /// Reopen a directory beneath an already-pinned capability as a descriptor
-/// that can actually be fsynced.
+/// that carries a real access mode.
 ///
 /// `Dir::open_dir` asks for a directory without readdir access, so cap-std adds
-/// `O_PATH` on the targets that have it. An `O_PATH` descriptor carries no
-/// access mode, and fsync rejects it with `EBADF`, so durability confirmation
-/// reopens through plain read access instead. The reopen stays relative to the
-/// pinned descriptor, so it does not reintroduce the ancestor-swap race a
-/// path-based reopen would.
-pub(crate) fn open_syncable_directory_at(
+/// `O_PATH` on the targets that have it. An `O_PATH` descriptor names a
+/// filesystem object without opening it, so it is accepted as an `openat`
+/// base but rejects every operation that needs an access mode. Both `fsync`
+/// and `flock` fail on one with `EBADF`, so durability confirmation and
+/// repository locking reopen through plain read access instead. The reopen
+/// stays relative to the pinned descriptor, so it does not reintroduce the
+/// ancestor-swap race a path-based reopen would.
+pub(crate) fn open_directory_handle_at(
     directory: &cap_std::fs::Dir,
     relative: &Path,
     display_path: &Path,
@@ -228,7 +230,7 @@ pub(crate) fn open_syncable_directory_at(
     options.read(true).maybe_dir(true);
     let opened = directory.open_with(relative, &options).map_err(|error| {
         KinDbError::StorageError(format!(
-            "failed to open retained directory {} for durability confirmation: {error}",
+            "failed to open retained directory {}: {error}",
             display_path.display()
         ))
     })?;
@@ -1420,7 +1422,7 @@ pub(crate) fn sync_parent_dir_at(
         return Ok(());
     };
     let display = capability_display_path(display_root, parent);
-    let parent_directory = open_syncable_directory_at(directory, parent, &display)?;
+    let parent_directory = open_directory_handle_at(directory, parent, &display)?;
     sync_directory_handle(&parent_directory, &display)
 }
 

@@ -412,15 +412,13 @@ fn open_source_blob_capability_from_repository(
     create: bool,
     confirm_durability: bool,
 ) -> Result<SourceBlobCapability, KinDbError> {
-    let repo_dir = repository
-        .open_dir(".")
+    let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
         .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to clone retained repository capability {}: {error}",
-                repository_display.display()
-            ))
-        })?
-        .into_std_file();
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            repository_display.display()
+        ))
+    })?;
     let mut parent = repo_dir.try_clone().map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to clone retained repository directory {}: {error}",
@@ -1848,7 +1846,7 @@ fn confirm_pending_local_directory_publication(
         return Ok(());
     }
     let parent_clone =
-        mmap::open_syncable_directory_at(parent, Path::new("."), parent_display_path).map_err(
+        mmap::open_directory_handle_at(parent, Path::new("."), parent_display_path).map_err(
             |error| {
                 KinDbError::StorageError(format!(
                     "failed to clone retained parent directory {} while confirming publication of {}: {error}",
@@ -2536,7 +2534,7 @@ impl LocalFileBackend {
             ))
         })?;
         let staging_clone =
-            mmap::open_syncable_directory_at(&directory, Path::new("."), &staging_display).map_err(
+            mmap::open_directory_handle_at(&directory, Path::new("."), &staging_display).map_err(
                 |error| {
                     KinDbError::StorageError(format!(
                         "failed to clone randomized local directory staging capability {}: {error}",
@@ -2555,7 +2553,7 @@ impl LocalFileBackend {
         }
         let parent_display = display_path.parent().unwrap_or_else(|| Path::new("."));
         let publication_sync_error =
-            match mmap::open_syncable_directory_at(parent, Path::new("."), parent_display) {
+            match mmap::open_directory_handle_at(parent, Path::new("."), parent_display) {
                 Ok(parent_clone) => {
                     mmap::sync_directory_handle(&parent_clone, parent_display).err()
                 }
@@ -3399,16 +3397,17 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         _marker_file: &std::fs::File,
     ) -> Result<std::fs::File, KinDbError> {
-        namespace
-            .directory
-            .open_dir(".")
-            .map(cap_std::fs::Dir::into_std_file)
-            .map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to clone retained repository directory {} for locking: {error}",
-                    namespace.display_path.display()
-                ))
-            })
+        mmap::open_directory_handle_at(
+            &namespace.directory,
+            Path::new("."),
+            &namespace.display_path,
+        )
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to clone retained repository directory {} for locking: {error}",
+                namespace.display_path.display()
+            ))
+        })
     }
 
     #[cfg(windows)]
