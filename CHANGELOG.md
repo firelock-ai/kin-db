@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain to v2 so tree-only workspace snapshots and pre-overlay root
   identities fail closed rather than masquerading as current authority.
 
+### Fixed
+
+- Read Windows storage-root identity from `BY_HANDLE_FILE_INFORMATION` through
+  an open handle instead of the unstable `windows_by_handle` metadata
+  accessors, so the crate builds on stable Rust. The root is reopened with the
+  exact reach `symlink_metadata` had, and a volume serial that overflows its
+  `DWORD` or a filesystem that reports no file ID now fails closed instead of
+  pinning an identity that cannot tell two directories apart.
+
 ## [0.5.1] - 2026-07-26
 
 ### Changed
