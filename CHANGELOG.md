@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-07-27
+
+### Added
+
+- Added a public, read-only workspace admission snapshot that returns one
+  coherent workspace binding, frozen case behavior, and exact compiled matcher
+  from one repository-authority lease. Missing, tampered, or wrong-length CAS
+  bodies remain fail-closed during reads.
+
+### Security
+
+- Local storage now retains one identity-pinned directory capability per
+  repository namespace. Authority, snapshot, delta, immutable source, overlay,
+  and lock operations target that retained capability and reject a repository
+  descendant replaced at the same ambient path instead of rebinding to it.
+- New repository and internal-surface directories publish from randomized
+  stages with no-replace renames. Failed post-publication confirmation retains
+  or poisons the exact epoch, and retries must durably re-confirm its containing
+  directory before creating a lock, payload, or authority record.
+- Windows retains the complete `FILE_ID_128` for directory identity, read from
+  a retained handle through `GetFileInformationByHandleEx(FileIdInfo)` rather
+  than the unstable `windows_by_handle` metadata accessors, so the crate builds
+  on stable Rust and ReFS file IDs stay distinguishable. Pinned directory
+  handles are flushed for repository, surface, lock, source-ancestor, and
+  digest-entry publication. This replaces the 0.6.1 storage-root identity
+  implementation, which read the legacy 64-bit file index by reopening the root
+  path. The Windows arms remain unvalidated by CI: adding `windows-latest` to
+  the matrix surfaced 99 pre-existing failures in modules this release does not
+  touch, so enabling that platform is left to follow-up work rather than landed
+  red or silenced.
+
+### Fixed
+
+- Reopen retained directory capabilities with a real access mode before
+  fsyncing or locking them. `Dir::open_dir` is opened as `O_PATH` on the
+  targets that have it, and an `O_PATH` descriptor rejects both `fsync` and
+  `flock` with `EBADF`, so directory publication and repository lock
+  acquisition failed on Linux while passing on macOS.
+
+## [0.6.2] - 2026-07-27
+
+### Changed
+
+- Bumped the `kin-model` dependency to 0.6.1.
+
+## [0.6.1] - 2026-07-26
+
+### Fixed
+
+- Read Windows storage-root identity from `BY_HANDLE_FILE_INFORMATION` through
+  an open handle instead of the unstable `windows_by_handle` metadata
+  accessors, so the crate builds on stable Rust. The root is reopened with the
+  exact reach `symlink_metadata` had, and a volume serial that overflows its
+  `DWORD` or a filesystem that reports no file ID now fails closed instead of
+  pinning an identity that cannot tell two directories apart. Superseded in
+  0.6.3 by retained-handle `FILE_ID_128` identity.
+
+## [0.6.0] - 2026-07-26
+
 ### Changed
 
 - Persist complete workspace semantic overlays alongside exact trees, validate
@@ -17,15 +76,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Advance the graph snapshot wire format to v12 and the local-state root
   domain to v2 so tree-only workspace snapshots and pre-overlay root
   identities fail closed rather than masquerading as current authority.
-
-### Fixed
-
-- Read Windows storage-root identity from `BY_HANDLE_FILE_INFORMATION` through
-  an open handle instead of the unstable `windows_by_handle` metadata
-  accessors, so the crate builds on stable Rust. The root is reopened with the
-  exact reach `symlink_metadata` had, and a volume serial that overflows its
-  `DWORD` or a filesystem that reports no file ID now fails closed instead of
-  pinning an identity that cannot tell two directories apart.
 
 ## [0.5.1] - 2026-07-26
 

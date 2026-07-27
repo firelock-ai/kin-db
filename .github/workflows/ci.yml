@@ -100,6 +100,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Clippy
+        shell: bash
         # CLIPPY BURN-DOWN ALLOW-LIST (kin-db).
         # kin-db is the retrieval stack; during the freeze, behavior-adjacent code
         # edits on main are FORBIDDEN, so these pre-existing lints are temporarily
