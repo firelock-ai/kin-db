@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-07-26
+## [0.6.3] - 2026-07-27
 
 ### Added
 
@@ -32,7 +32,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on stable Rust and ReFS file IDs stay distinguishable. Pinned directory
   handles are flushed for repository, surface, lock, source-ancestor, and
   digest-entry publication. CI and release validation now exercise Windows as a
-  first-class platform.
+  first-class platform. This replaces the 0.6.1 storage-root identity
+  implementation, which read the legacy 64-bit file index by reopening the root
+  path.
+
+### Fixed
+
+- Reopen retained directory capabilities with a real access mode before
+  fsyncing or locking them. `Dir::open_dir` is opened as `O_PATH` on the
+  targets that have it, and an `O_PATH` descriptor rejects both `fsync` and
+  `flock` with `EBADF`, so directory publication and repository lock
+  acquisition failed on Linux while passing on macOS.
+
+## [0.6.2] - 2026-07-27
+
+### Changed
+
+- Bumped the `kin-model` dependency to 0.6.1.
+
+## [0.6.1] - 2026-07-26
+
+### Fixed
+
+- Read Windows storage-root identity from `BY_HANDLE_FILE_INFORMATION` through
+  an open handle instead of the unstable `windows_by_handle` metadata
+  accessors, so the crate builds on stable Rust. The root is reopened with the
+  exact reach `symlink_metadata` had, and a volume serial that overflows its
+  `DWORD` or a filesystem that reports no file ID now fails closed instead of
+  pinning an identity that cannot tell two directories apart. Superseded in
+  0.6.3 by retained-handle `FILE_ID_128` identity.
 
 ## [0.6.0] - 2026-07-26
 
