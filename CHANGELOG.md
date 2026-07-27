@@ -31,10 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the unstable `windows_by_handle` metadata accessors, so the crate builds
   on stable Rust and ReFS file IDs stay distinguishable. Pinned directory
   handles are flushed for repository, surface, lock, source-ancestor, and
-  digest-entry publication. CI and release validation now exercise Windows as a
-  first-class platform. This replaces the 0.6.1 storage-root identity
+  digest-entry publication. This replaces the 0.6.1 storage-root identity
   implementation, which read the legacy 64-bit file index by reopening the root
-  path.
+  path. The Windows arms remain unvalidated by CI: adding `windows-latest` to
+  the matrix surfaced 99 pre-existing failures in modules this release does not
+  touch, so enabling that platform is left to follow-up work rather than landed
+  red or silenced.
 
 ### Fixed
 
