@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-07-27
+
+### Fixed
+
+- Loading a snapshot whose entity-revision cache is empty now derives revisions
+  by reading each change against its first declared parent, the same material
+  lineage `resolve_graph_at` replays. The previous derivation replayed the whole
+  change DAG as one flat topological sequence, which folded divergent siblings
+  into a single state: a merge that restates its second parent's transition was
+  reported as `change <id> has stale old payload for entity <id>` even though
+  every lineage reaching it is consistent. Repository authority clears that
+  cache on every admission, so history replay rebuilt it on each commit and
+  refused any transaction carrying merge history. Preconditions are still
+  enforced against the state each change was authored on, so an old payload no
+  parent published still fails closed.
+
 ## [0.6.3] - 2026-07-27
 
 ### Added
