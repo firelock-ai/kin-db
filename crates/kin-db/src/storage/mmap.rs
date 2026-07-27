@@ -208,6 +208,33 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     }
 }
 
+/// Reopen a directory beneath an already-pinned capability as a descriptor
+/// that can actually be fsynced.
+///
+/// `Dir::open_dir` asks for a directory without readdir access, so cap-std adds
+/// `O_PATH` on the targets that have it. An `O_PATH` descriptor carries no
+/// access mode, and fsync rejects it with `EBADF`, so durability confirmation
+/// reopens through plain read access instead. The reopen stays relative to the
+/// pinned descriptor, so it does not reintroduce the ancestor-swap race a
+/// path-based reopen would.
+pub(crate) fn open_syncable_directory_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<File, KinDbError> {
+    use cap_fs_ext::OpenOptionsMaybeDirExt;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).maybe_dir(true);
+    let opened = directory.open_with(relative, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to open retained directory {} for durability confirmation: {error}",
+            display_path.display()
+        ))
+    })?;
+    Ok(opened.into_std())
+}
+
 /// Fsync an already-pinned directory handle. Capability-style storage paths
 /// use this instead of reopening a path after validation, which would
 /// reintroduce an ancestor-swap race.
@@ -1393,13 +1420,8 @@ pub(crate) fn sync_parent_dir_at(
         return Ok(());
     };
     let display = capability_display_path(display_root, parent);
-    let parent_directory = directory.open_dir(parent).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to open retained parent directory {} for fsync: {error}",
-            display.display()
-        ))
-    })?;
-    sync_directory_handle(&parent_directory.into_std_file(), &display)
+    let parent_directory = open_syncable_directory_at(directory, parent, &display)?;
+    sync_directory_handle(&parent_directory, &display)
 }
 
 fn capability_write_new_bytes_and_fsync(

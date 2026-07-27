@@ -1847,14 +1847,17 @@ fn confirm_pending_local_directory_publication(
     if !pending.load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
-    let parent_clone = parent.open_dir(".").map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to clone retained parent directory {} while confirming publication of {}: {error}",
-            parent_display_path.display(),
-            child_display_path.display()
-        ))
-    })?;
-    mmap::sync_directory_handle(&parent_clone.into_std_file(), parent_display_path)?;
+    let parent_clone =
+        mmap::open_syncable_directory_at(parent, Path::new("."), parent_display_path).map_err(
+            |error| {
+                KinDbError::StorageError(format!(
+                    "failed to clone retained parent directory {} while confirming publication of {}: {error}",
+                    parent_display_path.display(),
+                    child_display_path.display()
+                ))
+            },
+        )?;
+    mmap::sync_directory_handle(&parent_clone, parent_display_path)?;
     pending.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
@@ -2532,18 +2535,16 @@ impl LocalFileBackend {
                 staging_display.display()
             ))
         })?;
-        mmap::sync_directory_handle(
-            &directory
-                .open_dir(".")
-                .map_err(|error| {
+        let staging_clone =
+            mmap::open_syncable_directory_at(&directory, Path::new("."), &staging_display).map_err(
+                |error| {
                     KinDbError::StorageError(format!(
                         "failed to clone randomized local directory staging capability {}: {error}",
                         staging_display.display()
                     ))
-                })?
-                .into_std_file(),
-            &staging_display,
-        )?;
+                },
+            )?;
+        mmap::sync_directory_handle(&staging_clone, &staging_display)?;
         if !Self::rename_local_directory_no_replace(parent, staging_name.as_ref(), component)? {
             tracing::warn!(
                 path = %staging_display.display(),
@@ -2552,16 +2553,16 @@ impl LocalFileBackend {
             );
             return Ok(LocalDirectoryCreateOutcome::CompetingTarget);
         }
-        let publication_sync_error = match parent.open_dir(".") {
-            Ok(parent_clone) => mmap::sync_directory_handle(
-                &parent_clone.into_std_file(),
-                display_path.parent().unwrap_or_else(|| Path::new(".")),
-            )
-            .err(),
-            Err(error) => Some(KinDbError::StorageError(format!(
-                "failed to clone retained local parent directory for publication sync: {error}"
-            ))),
-        };
+        let parent_display = display_path.parent().unwrap_or_else(|| Path::new("."));
+        let publication_sync_error =
+            match mmap::open_syncable_directory_at(parent, Path::new("."), parent_display) {
+                Ok(parent_clone) => {
+                    mmap::sync_directory_handle(&parent_clone, parent_display).err()
+                }
+                Err(error) => Some(KinDbError::StorageError(format!(
+                    "failed to clone retained local parent directory for publication sync: {error}"
+                ))),
+            };
         // Deterministic adversarial tests replace the just-published target
         // here. Production has no hook.
         run_local_directory_after_preopen_hook(kind);
