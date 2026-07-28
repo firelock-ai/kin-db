@@ -1826,6 +1826,11 @@ pub enum LocalNamespaceProbe {
     Unavailable(KinDbError),
 }
 
+enum LocalStorageRootProbeFault {
+    IdentityLost(LocalNamespaceIdentityFault),
+    Unavailable(KinDbError),
+}
+
 struct LocalStorageRootCapability {
     /// On Windows every ancestor handle deliberately omits DELETE sharing so
     /// the process pins the complete canonical path. On Unix the retained
@@ -3009,8 +3014,9 @@ impl LocalFileBackend {
     /// quarantine, so a caller revalidating a binding pays a metadata read
     /// rather than a full authority load. It answers the identity question
     /// only: a truncated snapshot, a missing lock file, or a quarantined state
-    /// on an intact namespace is [`LocalNamespaceProbe::Unavailable`], never an
-    /// identity loss.
+    /// on an intact namespace does not change the identity answer from
+    /// [`LocalNamespaceProbe::Retained`]. A fault that prevents the identity
+    /// itself from being inspected is [`LocalNamespaceProbe::Unavailable`].
     ///
     /// Ordering matches the authority reads. The first probe on a fresh backend
     /// is what takes the pin, so a swap landing before it becomes the baseline
@@ -3020,7 +3026,26 @@ impl LocalFileBackend {
         if let Err(error) = validate_source_blob_repo_id(repo_id) {
             return LocalNamespaceProbe::Unavailable(error);
         }
-        let pinned = self.repository_namespaces.lock().get(repo_id).cloned();
+        let (pinned, namespace_poisoned) = {
+            let namespaces = self.repository_namespaces.lock();
+            let namespace_poisoned = self
+                .poisoned_repository_namespaces
+                .lock()
+                .contains_key(repo_id);
+            (namespaces.get(repo_id).cloned(), namespace_poisoned)
+        };
+        if namespace_poisoned {
+            let display_path = pinned.as_ref().map_or_else(
+                || self.base_path.join(repo_id),
+                |expected| expected.display_path.clone(),
+            );
+            return LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::Namespace(
+                KinDbError::StorageError(format!(
+                    "local repository namespace {} was displaced during creation; this backend will not bind a replacement epoch",
+                    display_path.display()
+                )),
+            ));
+        }
         let Some(expected) = pinned else {
             // Nothing is pinned yet, and the first read is what takes the pin.
             // Bind through the capability path so the probe claims the same
@@ -3029,21 +3054,17 @@ impl LocalFileBackend {
             return match self.repository_capability(repo_id, false) {
                 Ok(Some(_)) => LocalNamespaceProbe::Retained,
                 Ok(None) => LocalNamespaceProbe::Absent,
+                Err(error)
+                    if self
+                        .poisoned_repository_namespaces
+                        .lock()
+                        .contains_key(repo_id) =>
+                {
+                    LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::Namespace(error))
+                }
                 Err(error) => LocalNamespaceProbe::Unavailable(error),
             };
         };
-        if self
-            .poisoned_repository_namespaces
-            .lock()
-            .contains_key(repo_id)
-        {
-            return LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::Namespace(
-                KinDbError::StorageError(format!(
-                    "local repository namespace {} was displaced during creation; this backend will not bind a replacement epoch",
-                    expected.display_path.display()
-                )),
-            ));
-        }
 
         let root = match self.revalidate_pinned_storage_root() {
             Ok(Some(root)) => root,
@@ -3053,8 +3074,12 @@ impl LocalFileBackend {
                     self.base_path.display()
                 )))
             }
-            Err(fault) => return LocalNamespaceProbe::IdentityLost(fault),
-
+            Err(LocalStorageRootProbeFault::IdentityLost(fault)) => {
+                return LocalNamespaceProbe::IdentityLost(fault)
+            }
+            Err(LocalStorageRootProbeFault::Unavailable(error)) => {
+                return LocalNamespaceProbe::Unavailable(error)
+            }
         };
 
         let observed = Self::observe_local_directory_entry(
@@ -3104,31 +3129,80 @@ impl LocalFileBackend {
         &self,
     ) -> std::result::Result<
         Option<std::sync::Arc<LocalStorageRootCapability>>,
-        LocalNamespaceIdentityFault,
+        LocalStorageRootProbeFault,
     > {
         let current = match Self::open_storage_root_capability(&self.base_path) {
             Ok(current) => current,
-            Err(error) => return Err(LocalNamespaceIdentityFault::StorageRoot(error)),
+            Err(error) => {
+                let expected = self.storage_root_capability.lock().clone();
+                return Err(self.classify_storage_root_open_error(expected.as_deref(), error));
+            }
         };
         let expected = self.storage_root_capability.lock();
         match (expected.as_ref(), current) {
             (Some(expected), Some(current)) if expected.identity == current.identity => {
                 Ok(Some(std::sync::Arc::clone(expected)))
             }
-            (Some(_), Some(_)) => Err(LocalNamespaceIdentityFault::StorageRoot(
-                KinDbError::StorageError(format!(
+            (Some(_), Some(_)) => Err(LocalStorageRootProbeFault::IdentityLost(
+                LocalNamespaceIdentityFault::StorageRoot(KinDbError::StorageError(format!(
                     "local storage root {} changed since this backend opened; refusing to bind a replacement repository namespace",
                     self.base_path.display()
-                )),
+                ))),
             )),
-            (Some(_), None) => Err(LocalNamespaceIdentityFault::StorageRoot(
-                KinDbError::StorageError(format!(
+            (Some(_), None) => Err(LocalStorageRootProbeFault::IdentityLost(
+                LocalNamespaceIdentityFault::StorageRoot(KinDbError::StorageError(format!(
                     "local storage root {} was detached after this backend opened",
                     self.base_path.display()
-                )),
+                ))),
             )),
             (None, _) => Ok(None),
         }
+    }
+
+    /// Classify a failed ambient reopen by observing what the root path names
+    /// now. A missing, linked, non-directory, or identity-different path is a
+    /// structural replacement of a root this backend pinned. If the path still
+    /// names the pinned directory, or cannot itself be inspected, the reopen
+    /// error says nothing conclusive about identity and remains unavailable.
+    fn classify_storage_root_open_error(
+        &self,
+        expected: Option<&LocalStorageRootCapability>,
+        error: KinDbError,
+    ) -> LocalStorageRootProbeFault {
+        let Some(expected) = expected else {
+            return LocalStorageRootProbeFault::Unavailable(error);
+        };
+        let visible = match std::fs::symlink_metadata(&self.base_path) {
+            Ok(visible) => visible,
+            Err(observation_error) if observation_error.kind() == std::io::ErrorKind::NotFound => {
+                return LocalStorageRootProbeFault::IdentityLost(
+                    LocalNamespaceIdentityFault::StorageRoot(KinDbError::StorageError(format!(
+                        "local storage root {} was detached after this backend opened",
+                        self.base_path.display()
+                    ))),
+                )
+            }
+            Err(_) => return LocalStorageRootProbeFault::Unavailable(error),
+        };
+        if visible.file_type().is_symlink() || !visible.is_dir() {
+            return LocalStorageRootProbeFault::IdentityLost(
+                LocalNamespaceIdentityFault::StorageRoot(KinDbError::StorageError(format!(
+                    "local storage root {} changed to a non-directory or link since this backend opened; refusing replacement authority",
+                    self.base_path.display()
+                ))),
+            );
+        }
+        if Self::visible_directory_identity(&visible)
+            .is_some_and(|identity| identity != expected.identity)
+        {
+            return LocalStorageRootProbeFault::IdentityLost(
+                LocalNamespaceIdentityFault::StorageRoot(KinDbError::StorageError(format!(
+                    "local storage root {} changed since this backend opened; refusing to bind a replacement repository namespace",
+                    self.base_path.display()
+                ))),
+            );
+        }
+        LocalStorageRootProbeFault::Unavailable(error)
     }
 
     fn open_repository_from_root(
@@ -9019,6 +9093,40 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_a_namespace_displaced_during_creation_as_identity_lost() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let visible = dir.path().join("repo-a");
+        let detached = dir.path().join("repo-a-detached");
+        let replacement = dir.path().join("repo-a-replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        let visible_for_swap = visible.clone();
+        set_local_directory_after_preopen_hook(LocalDirectoryBindKind::Repository, move || {
+            std::fs::rename(&visible_for_swap, &detached).unwrap();
+            std::fs::rename(&replacement, &visible_for_swap).unwrap();
+        });
+
+        backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("repository creation must reject a post-publication replacement");
+
+        match backend.probe_pinned_repository_namespace("repo-a") {
+            LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::Namespace(error)) => {
+                assert!(
+                    error.to_string().contains("displaced during creation"),
+                    "unexpected displaced-namespace probe error: {error}"
+                );
+            }
+            other => panic!("a displaced namespace must be an identity loss, got {other:?}"),
+        }
+    }
+
     /// The identity question and the authority-readable question are different.
     /// A namespace this backend still reaches stays retained even when its
     /// snapshot no longer decodes, so a caller cannot report a corrupt payload
@@ -9149,6 +9257,105 @@ mod tests {
                 );
             }
             other => panic!("a replaced storage root must be an identity loss, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_a_symlinked_storage_root_as_identity_lost() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("kindb");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = LocalFileBackend::new(&root);
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        let replacement = dir.path().join("kindb-replacement");
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::rename(&root, dir.path().join("kindb-original")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &root).unwrap();
+
+        match backend.probe_pinned_repository_namespace("repo-a") {
+            LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::StorageRoot(error)) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("changed to a non-directory or link"),
+                    "unexpected symlinked-root probe error: {error}"
+                );
+            }
+            other => panic!("a symlinked storage root must be an identity loss, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_a_non_directory_storage_root_as_identity_lost() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("kindb");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = LocalFileBackend::new(&root);
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        std::fs::rename(&root, dir.path().join("kindb-original")).unwrap();
+        std::fs::write(&root, b"not a storage root").unwrap();
+
+        match backend.probe_pinned_repository_namespace("repo-a") {
+            LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::StorageRoot(error)) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("changed to a non-directory or link"),
+                    "unexpected non-directory-root probe error: {error}"
+                );
+            }
+            other => {
+                panic!("a non-directory storage root must be an identity loss, got {other:?}")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_an_uninspectable_storage_root_as_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("parent");
+        let root = parent.join("kindb");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = LocalFileBackend::new(&root);
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &bytes, GENERATION_INIT)
+            .unwrap();
+        assert!(matches!(
+            backend.probe_pinned_repository_namespace("repo-a"),
+            LocalNamespaceProbe::Retained
+        ));
+
+        let original_permissions = std::fs::metadata(&parent).unwrap().permissions();
+        let mut inaccessible_permissions = original_permissions.clone();
+        inaccessible_permissions.set_mode(0o0);
+        std::fs::set_permissions(&parent, inaccessible_permissions).unwrap();
+        let probe = backend.probe_pinned_repository_namespace("repo-a");
+        std::fs::set_permissions(&parent, original_permissions).unwrap();
+
+        match probe {
+            LocalNamespaceProbe::Unavailable(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("failed to inspect local storage root"),
+                    "unexpected unavailable-root probe error: {error}"
+                );
+            }
+            other => panic!("an uninspectable storage root must be unavailable, got {other:?}"),
         }
     }
 
