@@ -4333,11 +4333,11 @@ impl LocalFileBackend {
                 record.snapshot_sha256
             )));
         }
-        GraphSnapshot::from_bytes(&snapshot_bytes).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "authoritative snapshot payload for repo {repo_id} is invalid: {error}"
-            ))
-        })?;
+        // Payload decoding and structural admission belong to
+        // `load_recovered_snapshot`, which is the shared recovery boundary for
+        // every backend. Decoding here would throw the validated value away
+        // and make local recovery deserialize and validate the same exact
+        // content-addressed bytes twice before repository open can use them.
         namespace.confirm_surface_visible(&snapshots)?;
         Ok(snapshot_bytes)
     }

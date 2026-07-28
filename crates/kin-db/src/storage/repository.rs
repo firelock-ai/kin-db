@@ -777,6 +777,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
         let started = std::time::Instant::now();
         let recovered = load_recovered_snapshot(backend.as_ref(), repository_id.as_str())?;
+        let recovered_authority = recovered.is_some();
         let recovered_at = started.elapsed();
         let reopen_proof = recovered
             .as_ref()
@@ -825,10 +826,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             (snapshot, SnapshotCursor::INITIAL)
         };
 
-        // Structural validation is never skipped. It is linear in the
-        // envelope, it recomputes the root bundle, and it is the check that
-        // makes the durable validation record safe to consult at all.
-        snapshot.validate_storage_admission()?;
+        // `load_recovered_snapshot` has already decoded and structurally
+        // admitted every recovered snapshot, including all delta-applied
+        // states. Validate only the generation-zero authority constructed
+        // here; validating recovered authority again would repeat the same
+        // root-bundle and envelope checks over identical bytes.
+        if !recovered_authority {
+            snapshot.validate_storage_admission()?;
+        }
         let structural_at = started.elapsed();
 
         // Whole-history replay is the one step a validation record buys back.
