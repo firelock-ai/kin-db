@@ -162,6 +162,18 @@ jobs:
           --skip test_vector_index_dimension_mismatch_auto_recovery
           --skip many_vectors_search_quality
 
+      - name: 100K hydration smoke guard
+        # This is a wall-clock guard, so run it outside the parallel suite.
+        # `--exact` preserves the macOS/Linux coverage while one test thread
+        # prevents the long save/reload test from competing for the runner.
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --test scale_and_failure scale_100k_entities --
+          --ignored
+          --exact
+          --test-threads=1
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:
