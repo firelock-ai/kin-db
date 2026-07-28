@@ -779,6 +779,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let reopen_proof = recovered
             .as_ref()
             .and_then(|recovered| verified_history_validation(&repository_id, recovered));
+        // The digest of the bytes that were actually loaded. Binding a record
+        // must never re-serialize the snapshot to obtain one: the persist path
+        // deliberately writes the original bytes rather than re-serialized ones,
+        // so a round-trip digest is not guaranteed to be the persisted digest.
+        let loaded_digest = recovered
+            .as_ref()
+            .filter(|recovered| recovered.deltas_applied == 0)
+            .map(|recovered| recovered.snapshot_sha256.clone());
         let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
             if recovered.deltas_seen != 0 {
                 return Err(storage(format!(
@@ -855,8 +863,8 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 generation,
                 "repository authority reopened against a durable history validation"
             );
-        } else {
-            manager.bind_history_validation(backend_cursor);
+        } else if let Some(digest) = loaded_digest {
+            manager.bind_history_validation(backend_cursor, &digest);
         }
         Ok(manager)
     }
@@ -873,33 +881,25 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Record that the state just validated in full is durably validated, so
     /// the next open of these exact bytes does not repeat the work.
     ///
+    /// `digest` must be the digest of the bytes this open actually loaded, not
+    /// a digest of a re-serialized snapshot. Persistence writes the original
+    /// bytes rather than re-serialized ones precisely because a round trip is
+    /// not promised to be byte-identical, and a record that named
+    /// re-serialized bytes would silently never verify.
+    ///
     /// Best effort by construction: a repository that cannot record this is
     /// still correct, it is only slow again next time. Failing an open that
     /// passed complete validation because a cache write lost a race would be
     /// strictly worse than revalidating.
-    fn bind_history_validation(&self, backend_cursor: SnapshotCursor) {
+    fn bind_history_validation(&self, backend_cursor: SnapshotCursor, digest: &str) {
         let generation = backend_cursor.backend_generation();
         if generation == SnapshotCursor::INITIAL.backend_generation() {
             return;
         }
-        let digest = {
-            let lease = self.read_authority();
-            match lease.snapshot().to_bytes() {
-                Ok(bytes) => hex::encode(Sha256::digest(&bytes)),
-                Err(error) => {
-                    tracing::debug!(
-                        repository = %self.repository_id,
-                        error = %error,
-                        "could not re-serialize validated authority to record its validation"
-                    );
-                    return;
-                }
-            }
-        };
         match self.backend.record_history_validation(
             self.repository_id.as_str(),
             generation,
-            &digest,
+            digest,
             HISTORY_VALIDATION_VERSION,
         ) {
             Ok(true) => tracing::debug!(
