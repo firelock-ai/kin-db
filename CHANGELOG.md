@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.5] - 2026-07-28
+## [0.6.6] - 2026-07-28
 
 ### Fixed
 
@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved, and `Unavailable` for everything that says nothing about identity. The
   first probe on a fresh backend still takes the pin, so the ordering the
   authority reads rely on is unchanged.
+
+### Changed
+
+- The two fixtures guarding merge-carrying-second-parent replay now say what
+  goes wrong when entity revisions are derived along first-parent lineage alone,
+  and name the upstream commit that first reaches the shape. Documentation only,
+  no behavior change.
 
 ## [0.6.4] - 2026-07-27
 
