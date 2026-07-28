@@ -21,14 +21,14 @@ use kin_model::{
     EntityDelta, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
     ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
     GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind,
-    MergeTransactionRecord, ModelError, OperationId, RefExpectation, RefMutation, RefName,
-    RefTarget, RefUpdatePolicy, RelationDelta, RepoPath, RepositoryAuthorityStore,
-    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
-    RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
-    RootBundle, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp,
-    TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
-    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
-    REPOSITORY_ROOT_SCHEMA_VERSION,
+    MergeEntryResolution, MergeResolutionPayload, MergeTransactionRecord, ModelError, OperationId,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RelationDelta, RepoPath,
+    RepositoryAuthorityStore, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
+    RepositoryOperationRecord, RepositoryRef, RepositoryRefState, RepositoryTransaction,
+    ResolvedArtifact, ResolvedTree, RootBundle, SemanticChangeId, SensitiveArtifactKind,
+    SharedAdmissionPolicy, Timestamp, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
+    WorkspaceSemanticOverlay, WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact,
+    WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::admission::{
@@ -44,7 +44,7 @@ use crate::storage::authority::{
 use crate::storage::backend::{
     load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
     Generation, LocalAuthorityFreezeLock, LocalFileBackend, RecoveredSnapshot, SnapshotCursor,
-    SnapshotSaveOutcome, SourceBlobValidationRequest, StorageBackend, VerifiedSourceBlob,
+    SnapshotSaveOutcome, SourceBlobValidationRequest, StorageBackend, VerifiedSourceBlobBatch,
     MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
@@ -713,6 +713,15 @@ impl StorageBackend for FrozenLocalBodyBackend<'_> {
             .load_source_blob_bounded_while_frozen(self.freeze, repo_id, digest, max_bytes)
     }
 
+    fn with_verified_source_blob_batch(
+        &self,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        self.backend
+            .with_verified_source_blob_batch_while_frozen(self.freeze, repo_id, operation)
+    }
+
     fn save_snapshot(
         &self,
         _repo_id: &str,
@@ -784,21 +793,22 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         )?;
         let recovered_authority = recovered.is_some();
         let recovered_at = started.elapsed();
-        let reopen_proof = recovered.as_ref().and_then(|recovered| {
-            recovered
-                .reused_complete_validation
-                .then(|| verified_history_validation(&repository_id, recovered))
-                .flatten()
-        });
+        let reopen_proof = recovered
+            .as_ref()
+            .filter(|recovered| recovered.reused_complete_validation)
+            .and_then(|recovered| {
+                verified_history_validation(&repository_id, &recovered.recovered)
+            });
         // The digest of the bytes that were actually loaded. Binding a record
         // must never re-serialize the snapshot to obtain one: the persist path
         // deliberately writes the original bytes rather than re-serialized ones,
         // so a round-trip digest is not guaranteed to be the persisted digest.
         let loaded_digest = recovered
             .as_ref()
-            .filter(|recovered| recovered.deltas_applied == 0)
-            .map(|recovered| recovered.snapshot_sha256.clone());
+            .filter(|recovered| recovered.recovered.deltas_applied == 0)
+            .map(|recovered| recovered.recovered.snapshot_sha256.clone());
         let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
+            let recovered = recovered.recovered;
             if recovered.deltas_seen != 0 {
                 return Err(storage(format!(
                     "repository {} has an incremental graph journal; repository authority requires full-snapshot CAS only",
@@ -1421,6 +1431,11 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     )?;
     apply_workspace(backend, &snapshot, &mut metadata, transaction)?;
     apply_merge_transaction(&mut metadata, transaction)?;
+    validate_merge_transaction_delta_bodies(
+        backend,
+        &transaction.repository_id,
+        transaction.merge_transaction_delta.as_ref(),
+    )?;
     verify_transaction_admission(backend, current, &snapshot, &metadata, transaction)?;
     validate_new_change_bodies(
         backend,
@@ -3586,6 +3601,46 @@ fn validate_new_change_bodies<B: StorageBackend + ?Sized>(
     Ok(())
 }
 
+fn validate_merge_transaction_delta_bodies<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    delta: Option<&kin_model::MergeTransactionDelta>,
+) -> Result<(), KinDbError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    let mut validated = BTreeSet::new();
+    for record in [delta.old.as_ref(), delta.new.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        for entry in &record.entries {
+            let MergeEntryResolution::Payload {
+                payload: MergeResolutionPayload::Artifact(artifact),
+                ..
+            } = &entry.resolution
+            else {
+                continue;
+            };
+            let Some(digest) = artifact.entry.blob_identity() else {
+                continue;
+            };
+            if validated.insert(digest) {
+                load_unbounded_body(
+                    backend,
+                    repository_id,
+                    digest,
+                    &format!(
+                        "merge transaction {} authored artifact {}",
+                        record.workspace_id, artifact.path
+                    ),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct AuthorityBodyRequirement {
     expected_len: Option<u64>,
@@ -3665,6 +3720,142 @@ fn collect_shared_policy_body_requirements(
     Ok(())
 }
 
+fn collect_git_authority_body_requirements(
+    requirements: &mut BTreeMap<Hash256, AuthorityBodyRequirement>,
+    authority: &GitExternalAuthority,
+    label: &str,
+) -> Result<(), KinDbError> {
+    for entry in &authority.closure.objects {
+        require_authority_body(
+            requirements,
+            entry.record.body_hash,
+            Some(entry.record.body_len),
+            format!("{label} {}", entry.record.object.oid),
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_tree_delta_body_requirements(
+    requirements: &mut BTreeMap<Hash256, AuthorityBodyRequirement>,
+    deltas: &[TreeDelta],
+    label: &str,
+) -> Result<(), KinDbError> {
+    for delta in deltas {
+        for (state, side) in [(delta.old_state(), "old"), (delta.new_state(), "new")] {
+            let Some(state) = state else {
+                continue;
+            };
+            if let Some(digest) = state.entry.blob_identity() {
+                require_authority_body(
+                    requirements,
+                    digest,
+                    None,
+                    format!("{label} {side} artifact {}", state.path),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_local_overlay_body_requirements(
+    requirements: &mut BTreeMap<Hash256, AuthorityBodyRequirement>,
+    overlay: &FrozenLocalOverlay,
+    label: &str,
+) -> Result<(), KinDbError> {
+    for source in &overlay.sources {
+        require_authority_body(
+            requirements,
+            source.body_hash,
+            Some(source.body_len),
+            format!("{label} {:?} precedence {}", source.kind, source.precedence),
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_merge_transaction_body_requirements(
+    requirements: &mut BTreeMap<Hash256, AuthorityBodyRequirement>,
+    record: &MergeTransactionRecord,
+) -> Result<(), KinDbError> {
+    for entry in &record.entries {
+        let MergeEntryResolution::Payload {
+            payload: MergeResolutionPayload::Artifact(artifact),
+            ..
+        } = &entry.resolution
+        else {
+            continue;
+        };
+        if let Some(digest) = artifact.entry.blob_identity() {
+            require_authority_body(
+                requirements,
+                digest,
+                None,
+                format!(
+                    "merge transaction {} authored artifact {}",
+                    record.workspace_id, artifact.path
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_operation_body_requirements(
+    requirements: &mut BTreeMap<Hash256, AuthorityBodyRequirement>,
+    operation: &RepositoryOperationRecord,
+) -> Result<(), KinDbError> {
+    if let Some(delta) = &operation.git_authority_delta {
+        for (authority, state) in [(delta.old.as_ref(), "old"), (delta.new.as_ref(), "new")] {
+            if let Some(authority) = authority {
+                collect_git_authority_body_requirements(
+                    requirements,
+                    authority,
+                    &format!("operation {} {state} Git object", operation.operation_id),
+                )?;
+            }
+        }
+    }
+    if let Some(mutation) = &operation.workspace_mutation {
+        collect_tree_delta_body_requirements(
+            requirements,
+            &mutation.tree_deltas,
+            &format!(
+                "operation {} workspace {}",
+                operation.operation_id, mutation.workspace_id
+            ),
+        )?;
+        collect_shared_policy_body_requirements(
+            requirements,
+            &mutation.new_shared_admission_policy,
+        )?;
+    }
+    if let Some(delta) = &operation.local_overlay_delta {
+        for (overlay, state) in [(delta.old.as_ref(), "old"), (delta.new.as_ref(), "new")] {
+            if let Some(overlay) = overlay {
+                collect_local_overlay_body_requirements(
+                    requirements,
+                    overlay,
+                    &format!(
+                        "operation {} {state} local admission source",
+                        operation.operation_id
+                    ),
+                )?;
+            }
+        }
+    }
+    if let Some(delta) = &operation.merge_transaction_delta {
+        for record in [delta.old.as_ref(), delta.new.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            collect_merge_transaction_body_requirements(requirements, record)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_all_authority_body_requirements(
     snapshot: &GraphSnapshot,
 ) -> Result<BTreeMap<Hash256, AuthorityBodyRequirement>, KinDbError> {
@@ -3682,31 +3873,18 @@ fn collect_all_authority_body_requirements(
         )?;
     }
     if let Some(authority) = &metadata.git_external_authority {
-        for entry in &authority.closure.objects {
-            require_authority_body(
-                &mut requirements,
-                entry.record.body_hash,
-                Some(entry.record.body_len),
-                format!("Git external object {}", entry.record.object.oid),
-            )?;
-        }
+        collect_git_authority_body_requirements(
+            &mut requirements,
+            authority,
+            "Git external object",
+        )?;
     }
     for change in snapshot.changes.values() {
-        for delta in &change.tree_deltas {
-            for (state, side) in [(delta.old_state(), "old"), (delta.new_state(), "new")] {
-                let Some(state) = state else {
-                    continue;
-                };
-                if let Some(digest) = state.entry.blob_identity() {
-                    require_authority_body(
-                        &mut requirements,
-                        digest,
-                        None,
-                        format!("change {} {side} artifact {}", change.id, state.path),
-                    )?;
-                }
-            }
-        }
+        collect_tree_delta_body_requirements(
+            &mut requirements,
+            &change.tree_deltas,
+            &format!("change {}", change.id),
+        )?;
     }
     for workspace in &metadata.workspaces {
         collect_tree_body_requirements(
@@ -3725,43 +3903,118 @@ fn collect_all_authority_body_requirements(
         }
     }
     for overlay in &metadata.local_overlays {
-        for source in &overlay.sources {
-            require_authority_body(
-                &mut requirements,
-                source.body_hash,
-                Some(source.body_len),
-                "local admission rule source",
-            )?;
-        }
+        collect_local_overlay_body_requirements(
+            &mut requirements,
+            overlay,
+            "local admission rule source",
+        )?;
+    }
+    for record in &metadata.merge_transactions {
+        collect_merge_transaction_body_requirements(&mut requirements, record)?;
+    }
+    for operation in &metadata.operation_log {
+        collect_operation_body_requirements(&mut requirements, operation)?;
     }
     Ok(requirements)
 }
 
-struct VerifiedRepositoryGitObjectBodyLoader<'a> {
-    bodies: &'a BTreeMap<[u8; 32], VerifiedSourceBlob>,
-    body_lengths: BTreeMap<Hash256, u64>,
+fn load_verified_authority_body(
+    batch: &dyn VerifiedSourceBlobBatch,
+    digest: Hash256,
+    requirement: &AuthorityBodyRequirement,
+) -> Result<Option<Vec<u8>>, KinDbError> {
+    let Some(body) = batch.load_verified(SourceBlobValidationRequest {
+        digest: *digest.as_bytes(),
+        max_bytes: requirement.expected_len.unwrap_or(MAX_SOURCE_BLOB_BYTES),
+    })?
+    else {
+        return Ok(None);
+    };
+    if body.digest() != *digest.as_bytes() {
+        return Err(storage(format!(
+            "backend returned immutable body {} for requested {digest}",
+            hex::encode(body.digest())
+        )));
+    }
+    let body_len = u64::try_from(body.bytes().len()).map_err(|_| {
+        storage(format!(
+            "{} body length does not fit u64",
+            requirement.label
+        ))
+    })?;
+    validate_source_blob_size(body_len, &requirement.label)?;
+    if requirement
+        .expected_len
+        .is_some_and(|expected| expected != body_len)
+    {
+        return Err(storage(format!(
+            "{} body {digest} has length {body_len}, expected {}",
+            requirement.label,
+            requirement
+                .expected_len
+                .expect("checked exact length above")
+        )));
+    }
+    Ok(Some(body.into_bytes()))
 }
 
-impl GitObjectBodyLoader for VerifiedRepositoryGitObjectBodyLoader<'_> {
+fn validate_external_records_for_body(
+    metadata: &PersistedRepositoryAuthority,
+    indexes: &BTreeMap<Hash256, Vec<usize>>,
+    digest: Hash256,
+    body: &[u8],
+) -> Result<(), KinDbError> {
+    if let Some(indexes) = indexes.get(&digest) {
+        for index in indexes {
+            metadata.external_objects[*index].validate_raw(body)?;
+        }
+    }
+    Ok(())
+}
+
+struct StreamingRepositoryGitObjectBodyLoader<'a> {
+    batch: &'a dyn VerifiedSourceBlobBatch,
+    metadata: &'a PersistedRepositoryAuthority,
+    requirements: &'a BTreeMap<Hash256, AuthorityBodyRequirement>,
+    external_record_indexes: &'a BTreeMap<Hash256, Vec<usize>>,
+    validated_digests: &'a mut BTreeSet<Hash256>,
+    verified_bytes: &'a mut u64,
+}
+
+impl GitObjectBodyLoader for StreamingRepositoryGitObjectBodyLoader<'_> {
     type Error = KinDbError;
 
     fn load_body(
         &mut self,
         body_hash: &Hash256,
     ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
-        let Some(body_len) = self.body_lengths.get(body_hash).copied() else {
+        let Some(requirement) = self.requirements.get(body_hash) else {
             return Ok(None);
         };
-        let Some(body) = self.bodies.get(body_hash.as_bytes()) else {
+        let Some(body) = load_verified_authority_body(self.batch, *body_hash, requirement)? else {
             return Ok(None);
         };
-        if u64::try_from(body.bytes().len()).ok() != Some(body_len) {
-            return Err(storage(format!(
-                "Git authority body {body_hash} has length {}, expected {body_len}",
-                body.bytes().len()
-            )));
+        // Git object identity includes the object kind while Kin's source CAS
+        // identity does not. The same raw bytes can therefore back (for
+        // example) both a blob and a tag. The model loader asks once per Git
+        // object; re-read that rare cross-kind duplicate instead of retaining
+        // an unbounded aggregate cache. All other authority surfaces remain
+        // globally de-duplicated by `requirements`.
+        if self.validated_digests.insert(*body_hash) {
+            validate_external_records_for_body(
+                self.metadata,
+                self.external_record_indexes,
+                *body_hash,
+                &body,
+            )?;
+            *self.verified_bytes = self
+                .verified_bytes
+                .checked_add(body.len() as u64)
+                .ok_or_else(|| {
+                    storage("verified authority body byte count overflowed".to_string())
+                })?;
         }
-        Ok(Some(body.bytes().to_vec()))
+        Ok(Some(body))
     }
 }
 
@@ -3779,53 +4032,108 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
             tracing::info_span!("kindb.repository.collect_authority_body_requirements").entered();
         collect_all_authority_body_requirements(snapshot)?
     };
-    let requests = requirements
-        .iter()
-        .map(|(digest, requirement)| SourceBlobValidationRequest {
-            digest: *digest.as_bytes(),
-            max_bytes: requirement.expected_len.unwrap_or(MAX_SOURCE_BLOB_BYTES),
-        })
-        .collect::<Vec<_>>();
-    let bodies = {
-        let _span = tracing::info_span!("kindb.repository.load_authority_body_batch").entered();
-        backend.load_source_blobs_verified(repository_id.as_str(), &requests)?
-    };
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    let mut external_record_indexes = BTreeMap::<Hash256, Vec<usize>>::new();
+    for (index, record) in metadata.external_objects.iter().enumerate() {
+        external_record_indexes
+            .entry(record.body_hash)
+            .or_default()
+            .push(index);
+    }
+    let mut git_digests = BTreeSet::new();
+    if let Some(authority) = metadata.git_external_authority.as_ref() {
+        for entry in &authority.closure.objects {
+            git_digests.insert(entry.record.body_hash);
+        }
+    }
+    let mut validated_digests = BTreeSet::new();
     let mut verified_bytes = 0u64;
-    for (digest, requirement) in &requirements {
-        let body = bodies.get(digest.as_bytes()).ok_or_else(|| {
-            storage(format!(
-                "{} body {digest} is absent from immutable source CAS",
-                requirement.label
-            ))
-        })?;
-        if body.digest() != *digest.as_bytes() {
-            return Err(storage(format!(
-                "backend returned immutable body {} for requested {digest}",
-                hex::encode(body.digest())
-            )));
-        }
-        let body_len = u64::try_from(body.bytes().len()).map_err(|_| {
-            storage(format!(
-                "{} body length does not fit u64",
-                requirement.label
-            ))
-        })?;
-        validate_source_blob_size(body_len, &requirement.label)?;
-        if requirement
-            .expected_len
-            .is_some_and(|expected| expected != body_len)
-        {
-            return Err(storage(format!(
-                "{} body {digest} has length {body_len}, expected {}",
-                requirement.label,
-                requirement
-                    .expected_len
-                    .expect("checked exact length above")
-            )));
-        }
-        verified_bytes = verified_bytes
-            .checked_add(body_len)
-            .ok_or_else(|| storage("verified authority body byte count overflowed".to_string()))?;
+    let mut validation_invocations = 0usize;
+    let mut validation_completed = false;
+    let backend_result = {
+        let mut validate_batch = |batch: &dyn VerifiedSourceBlobBatch| {
+            validation_invocations = validation_invocations.checked_add(1).ok_or_else(|| {
+                storage("authority body batch invocation count overflowed".to_string())
+            })?;
+            if validation_invocations != 1 {
+                return Err(storage(
+                    "storage backend invoked the authority body batch more than once".to_string(),
+                ));
+            }
+            for (digest, requirement) in &requirements {
+                if git_digests.contains(digest) {
+                    continue;
+                }
+                let body = load_verified_authority_body(batch, *digest, requirement)?.ok_or_else(
+                    || {
+                        storage(format!(
+                            "{} body {digest} is absent from immutable source CAS",
+                            requirement.label
+                        ))
+                    },
+                )?;
+                validate_external_records_for_body(
+                    metadata,
+                    &external_record_indexes,
+                    *digest,
+                    &body,
+                )?;
+                validated_digests.insert(*digest);
+                verified_bytes =
+                    verified_bytes
+                        .checked_add(body.len() as u64)
+                        .ok_or_else(|| {
+                            storage("verified authority body byte count overflowed".to_string())
+                        })?;
+            }
+            if let Some(authority) = metadata.git_external_authority.as_ref() {
+                let mut loader = StreamingRepositoryGitObjectBodyLoader {
+                    batch,
+                    metadata,
+                    requirements: &requirements,
+                    external_record_indexes: &external_record_indexes,
+                    validated_digests: &mut validated_digests,
+                    verified_bytes: &mut verified_bytes,
+                };
+                authority
+                    .validate_with_body_loader(&mut loader)
+                    .map_err(|error| {
+                        KinDbError::from(ModelError::InvalidOperation(format!(
+                            "Git external authority body validation failed: {error}"
+                        )))
+                    })?;
+            }
+            validation_completed = true;
+            Ok(())
+        };
+        let _span = tracing::info_span!("kindb.repository.load_authority_body_batch").entered();
+        backend.with_verified_source_blob_batch(repository_id.as_str(), &mut validate_batch)
+    };
+    backend_result?;
+    if validation_invocations != 1 {
+        return Err(storage(format!(
+            "storage backend invoked the authority body batch {validation_invocations} times; expected exactly once"
+        )));
+    }
+    if !validation_completed {
+        return Err(storage(
+            "storage backend returned success after authority body validation failed".to_string(),
+        ));
+    }
+    if validated_digests.len() != requirements.len() {
+        let missing = requirements
+            .keys()
+            .find(|digest| !validated_digests.contains(digest))
+            .expect("different set lengths imply a missing requirement");
+        return Err(storage(format!(
+            "{} body {missing} is absent from immutable source CAS",
+            requirements
+                .get(missing)
+                .expect("missing digest came from requirements")
+                .label
+        )));
     }
     tracing::debug!(
         repository = %repository_id,
@@ -3833,41 +4141,6 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
         verified_bytes,
         "loaded distinct repository authority bodies"
     );
-    let _semantic_span =
-        tracing::info_span!("kindb.repository.validate_authority_body_semantics").entered();
-    for record in &metadata.external_objects {
-        let body = bodies
-            .get(record.body_hash.as_bytes())
-            .expect("all collected external bodies were checked above");
-        record.validate_raw(body.bytes())?;
-    }
-    if let Some(authority) = metadata.git_external_authority.as_ref() {
-        let mut body_lengths = BTreeMap::new();
-        for entry in &authority.closure.objects {
-            if let Some(previous) =
-                body_lengths.insert(entry.record.body_hash, entry.record.body_len)
-            {
-                if previous != entry.record.body_len {
-                    return Err(ModelError::InvalidOperation(format!(
-                        "Git authority body {} is declared with both length {} and {}",
-                        entry.record.body_hash, previous, entry.record.body_len
-                    ))
-                    .into());
-                }
-            }
-        }
-        let mut loader = VerifiedRepositoryGitObjectBodyLoader {
-            bodies: &bodies,
-            body_lengths,
-        };
-        authority
-            .validate_with_body_loader(&mut loader)
-            .map_err(|error| {
-                KinDbError::from(ModelError::InvalidOperation(format!(
-                    "Git external authority body validation failed: {error}"
-                )))
-            })?;
-    }
     Ok(())
 }
 
@@ -4298,7 +4571,7 @@ fn storage(message: String) -> KinDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::backend::HistoryValidationProof;
+    use crate::storage::backend::{HistoryValidationProof, VerifiedSourceBlob};
     use kin_model::{
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
         AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId, AuthorId,
@@ -4327,7 +4600,25 @@ mod tests {
         blobs: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         fail_next_snapshot: AtomicBool,
         source_load_count: AtomicUsize,
+        verified_batch_behavior: AtomicUsize,
         source_load_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    }
+
+    struct MemoryVerifiedSourceBlobBatch<'a> {
+        backend: &'a MemoryBackend,
+        repo_id: &'a str,
+    }
+
+    impl VerifiedSourceBlobBatch for MemoryVerifiedSourceBlobBatch<'_> {
+        fn load_verified(
+            &self,
+            request: SourceBlobValidationRequest,
+        ) -> Result<Option<VerifiedSourceBlob>, KinDbError> {
+            self.backend
+                .load_source_blob_bounded(self.repo_id, request.digest, request.max_bytes)?
+                .map(|bytes| VerifiedSourceBlob::from_verified_bytes(request.digest, bytes))
+                .transpose()
+        }
     }
 
     impl StorageBackend for MemoryBackend {
@@ -4389,6 +4680,30 @@ mod tests {
                 });
             }
             Ok(value)
+        }
+
+        fn with_verified_source_blob_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+        ) -> Result<(), KinDbError> {
+            let batch = MemoryVerifiedSourceBlobBatch {
+                backend: self,
+                repo_id,
+            };
+            match self.verified_batch_behavior.load(Ordering::SeqCst) {
+                1 => Ok(()),
+                2 => {
+                    let _ = operation(&batch);
+                    Ok(())
+                }
+                3 => {
+                    operation(&batch)?;
+                    let _ = operation(&batch);
+                    Ok(())
+                }
+                _ => operation(&batch),
+            }
         }
 
         fn save_snapshot(
@@ -5049,6 +5364,95 @@ mod tests {
 
         let lease = manager.read_authority();
         assert!(lease.metadata().merge_transactions[0].state.is_terminal());
+    }
+
+    #[test]
+    fn authored_merge_artifact_requires_exact_cas_on_commit_and_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let record = open_merge_record(&manager, 0xb000);
+        let mut opening = transaction_shell(&manager, 0xb000);
+        opening.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        manager.commit_repository_transaction(opening).unwrap();
+
+        let authored_body = b"authored merge resolution\n";
+        let authored_hash = digest(authored_body);
+        let settled = record
+            .resolve_entry(
+                &record.entries[0].subject,
+                MergeEntryResolution::Payload {
+                    payload: MergeResolutionPayload::Artifact(LocatedEntry::new(
+                        RepoPath::from_utf8("src/lib.rs").unwrap(),
+                        TreeEntry::blob(authored_hash, false),
+                    )),
+                    provenance: merge_provenance(0xb001),
+                },
+            )
+            .unwrap();
+        let mut resolving = transaction_shell(&manager, 0xb001);
+        resolving.merge_transaction_delta =
+            Some(MergeTransactionDelta::update(record, settled.clone()));
+
+        let error = manager
+            .commit_repository_transaction(resolving.clone())
+            .expect_err("an authored merge payload cannot name absent immutable bytes");
+        assert!(
+            error.to_string().contains("merge transaction")
+                && error
+                    .to_string()
+                    .contains("absent from immutable source CAS"),
+            "unexpected missing merge-body error: {error}"
+        );
+
+        manager
+            .save_source_blob(authored_hash, authored_body)
+            .unwrap();
+        manager.commit_repository_transaction(resolving).unwrap();
+
+        let mut dropping = transaction_shell(&manager, 0xb002);
+        dropping.merge_transaction_delta =
+            Some(MergeTransactionDelta::drop_record(settled.clone()));
+        backend.blobs.lock().insert(
+            *authored_hash.as_bytes(),
+            b"tampered before merge drop\n".to_vec(),
+        );
+        let error = manager
+            .commit_repository_transaction(dropping.clone())
+            .expect_err("dropping a merge must revalidate its historical old body");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected pre-drop tamper result: {error}"
+        );
+        backend
+            .blobs
+            .lock()
+            .insert(*authored_hash.as_bytes(), authored_body.to_vec());
+        manager.commit_repository_transaction(dropping).unwrap();
+        assert!(
+            manager
+                .read_authority()
+                .metadata()
+                .merge_transactions
+                .is_empty(),
+            "the authored body must now be referenced only by historical operation authority"
+        );
+        backend.blobs.lock().insert(
+            *authored_hash.as_bytes(),
+            b"tampered merge resolution\n".to_vec(),
+        );
+
+        let error = match RepositoryAuthorityManager::open(repository_id(), backend) {
+            Ok(_) => panic!("reopen must reject a tampered historical merge payload"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected tampered merge-body error: {error}"
+        );
     }
 
     /// A merge record is workspace authority, so it cannot name a workspace the
@@ -8250,6 +8654,65 @@ mod tests {
     }
 
     #[test]
+    fn authority_body_validation_requires_backend_to_invoke_batch_once() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let (transaction, _, _) = imported_repository_transaction(&manager);
+        manager.commit_repository_transaction(transaction).unwrap();
+        let lease = manager.read_authority();
+
+        backend.verified_batch_behavior.store(1, Ordering::SeqCst);
+        let error =
+            validate_all_authority_bodies(backend.as_ref(), &repository_id(), lease.snapshot())
+                .expect_err("a backend cannot omit the validation callback");
+        assert!(
+            error.to_string().contains("0 times; expected exactly once"),
+            "unexpected omitted-callback error: {error}"
+        );
+
+        backend.verified_batch_behavior.store(3, Ordering::SeqCst);
+        let error =
+            validate_all_authority_bodies(backend.as_ref(), &repository_id(), lease.snapshot())
+                .expect_err("a backend cannot invoke the validation callback twice");
+        assert!(
+            error.to_string().contains("more than once")
+                || error.to_string().contains("2 times; expected exactly once"),
+            "unexpected repeated-callback error: {error}"
+        );
+    }
+
+    #[test]
+    fn authority_body_validation_refuses_swallowed_backend_error() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let (transaction, _, _) = imported_repository_transaction(&manager);
+        manager.commit_repository_transaction(transaction).unwrap();
+        let lease = manager.read_authority();
+        let digest = *collect_all_authority_body_requirements(lease.snapshot())
+            .unwrap()
+            .keys()
+            .next()
+            .expect("the imported fixture has immutable bodies")
+            .as_bytes();
+        backend
+            .blobs
+            .lock()
+            .get_mut(&digest)
+            .expect("the body was persisted")[0] ^= 0x01;
+        backend.verified_batch_behavior.store(2, Ordering::SeqCst);
+
+        let error =
+            validate_all_authority_bodies(backend.as_ref(), &repository_id(), lease.snapshot())
+                .expect_err("a backend cannot swallow validation failure");
+        assert!(
+            error
+                .to_string()
+                .contains("returned success after authority body validation failed"),
+            "unexpected swallowed-error result: {error}"
+        );
+    }
+
+    #[test]
     fn authority_body_collection_rejects_conflicting_exact_lengths() {
         let digest = digest(b"one immutable body");
         let mut requirements = BTreeMap::new();
@@ -9254,6 +9717,63 @@ mod tests {
     }
 
     #[test]
+    fn repository_recovery_skip_path_requires_every_exact_proof_field() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let original = read_authority_json(directory.path());
+
+        let recovered = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            recovered.reused_complete_validation,
+            "the exact proof must select the validation-reuse decoder"
+        );
+
+        for (field, mismatch) in [
+            (
+                "validator_version",
+                serde_json::json!(HISTORY_VALIDATION_VERSION + 1),
+            ),
+            ("repository_id", serde_json::json!("another-repository")),
+            (
+                "generation",
+                serde_json::json!(
+                    original["history_validation"]["generation"]
+                        .as_u64()
+                        .unwrap()
+                        + 1
+                ),
+            ),
+            (
+                "snapshot_sha256",
+                serde_json::json!(hex::encode(Sha256::digest(b"other snapshot bytes"))),
+            ),
+        ] {
+            let mut mismatched = original.clone();
+            mismatched["history_validation"][field] = mismatch;
+            write_authority_json(directory.path(), &mismatched);
+
+            let recovered = load_recovered_repository_authority(
+                &LocalFileBackend::new(directory.path()),
+                repository_id().as_str(),
+                HISTORY_VALIDATION_VERSION,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                !recovered.reused_complete_validation,
+                "a mismatched {field} must take the full storage-admission decoder"
+            );
+        }
+        write_authority_json(directory.path(), &original);
+    }
+
+    #[test]
     fn reopen_without_a_record_replays_in_full_and_then_binds_one() {
         let directory = TempDir::new().unwrap();
         drop(committed_local_repository(&directory));
@@ -9314,7 +9834,6 @@ mod tests {
             generation: authority.head_generation,
             deltas_applied: 0,
             deltas_seen: 0,
-            reused_complete_validation: true,
             snapshot_sha256: hex::encode(Sha256::digest(&authority.snapshot_bytes)),
             history_validation: Some(proof),
         };

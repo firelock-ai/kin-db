@@ -8,7 +8,6 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -87,17 +86,31 @@ pub struct SourceBlobValidationRequest {
 /// Immutable source bytes whose storage backend verified their SHA-256
 /// content identity while loading them.
 ///
-/// Construction stays inside this module so callers cannot promote arbitrary
-/// bytes to a verified body. Higher-level validators may still apply
-/// domain-specific checks such as exact Git object identity.
+/// The only constructor re-verifies the content identity, so an optimized
+/// backend implementation cannot promote arbitrary bytes to a verified body.
+/// Higher-level validators may still apply domain-specific checks such as
+/// exact Git object identity.
 #[derive(Debug)]
 pub struct VerifiedSourceBlob {
     digest: [u8; 32],
     bytes: Vec<u8>,
 }
 
+/// One integrity-checking immutable-body read session.
+///
+/// A backend may retain a repository capability or remote read context for
+/// the lifetime of this value. Every returned body still passes through
+/// [`VerifiedSourceBlob::from_verified_bytes`].
+pub trait VerifiedSourceBlobBatch {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError>;
+}
+
 impl VerifiedSourceBlob {
-    fn new(digest: [u8; 32], bytes: Vec<u8>) -> Result<Self, KinDbError> {
+    /// Bind bytes to `digest` after recomputing their SHA-256 identity.
+    pub fn from_verified_bytes(digest: [u8; 32], bytes: Vec<u8>) -> Result<Self, KinDbError> {
         verify_source_blob_digest(digest, &bytes, "verified source blob batch")?;
         Ok(Self { digest, bytes })
     }
@@ -1370,9 +1383,6 @@ pub struct RecoveredSnapshot {
     pub generation: Generation,
     pub deltas_applied: usize,
     pub deltas_seen: usize,
-    /// Whether this process reused a durable complete-validation proof bound
-    /// to the exact base snapshot bytes.
-    pub reused_complete_validation: bool,
     /// SHA-256 recomputed here over the exact base snapshot bytes that were
     /// deserialized, never copied from a backend's own claim about them.
     pub snapshot_sha256: String,
@@ -1380,6 +1390,11 @@ pub struct RecoveredSnapshot {
     /// validation. Cleared once any delta is applied, because the recovered
     /// state is then no longer the bytes the claim names.
     pub history_validation: Option<HistoryValidationProof>,
+}
+
+pub(crate) struct RecoveredRepositoryAuthority {
+    pub recovered: RecoveredSnapshot,
+    pub reused_complete_validation: bool,
 }
 
 /// Load a backend snapshot and replay its complete authoritative delta chain.
@@ -1394,6 +1409,7 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
     repo_id: &str,
 ) -> Result<Option<RecoveredSnapshot>, KinDbError> {
     load_recovered_snapshot_inner(backend, repo_id, None)
+        .map(|recovered| recovered.map(|recovered| recovered.recovered))
 }
 
 /// Load repository authority while permitting an exact, durable
@@ -1407,7 +1423,7 @@ pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
     expected_validator_version: u32,
-) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
     load_recovered_snapshot_inner(backend, repo_id, Some(expected_validator_version))
 }
 
@@ -1415,7 +1431,7 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
     expected_validator_version: Option<u32>,
-) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
     let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
 
     let Some(authority) = loaded else {
@@ -1454,14 +1470,16 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
     };
     if authority.snapshot_generation == authority.head_generation {
-        return Ok(Some(RecoveredSnapshot {
-            snapshot,
-            generation: authority.head_generation,
-            deltas_applied: 0,
-            deltas_seen,
+        return Ok(Some(RecoveredRepositoryAuthority {
+            recovered: RecoveredSnapshot {
+                snapshot,
+                generation: authority.head_generation,
+                deltas_applied: 0,
+                deltas_seen,
+                snapshot_sha256,
+                history_validation: authority.history_validation,
+            },
             reused_complete_validation,
-            snapshot_sha256,
-            history_validation: authority.history_validation,
         }));
     }
     let mut expected_generation = checked_next_generation(
@@ -1520,16 +1538,18 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         )));
     }
 
-    Ok(Some(RecoveredSnapshot {
-        snapshot,
-        generation: authority.head_generation,
-        deltas_applied: applied,
-        deltas_seen,
+    Ok(Some(RecoveredRepositoryAuthority {
+        recovered: RecoveredSnapshot {
+            snapshot,
+            generation: authority.head_generation,
+            deltas_applied: applied,
+            deltas_seen,
+            snapshot_sha256,
+            // The recovered state is the base snapshot plus a delta chain, so no
+            // claim about the base bytes describes it any more.
+            history_validation: None,
+        },
         reused_complete_validation: false,
-        snapshot_sha256,
-        // The recovered state is the base snapshot plus a delta chain, so no
-        // claim about the base bytes describes it any more.
-        history_validation: None,
     }))
 }
 
@@ -1681,36 +1701,29 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
-    /// Load and integrity-check a globally de-duplicated set of immutable
-    /// source bodies.
+    /// Execute integrity-checked immutable-body reads in one backend batch.
     ///
-    /// The safe default preserves backend compatibility by delegating each
-    /// distinct request to [`load_source_blob_bounded`](Self::load_source_blob_bounded).
-    /// Local storage overrides this to retain one repository lock across the
-    /// complete batch instead of reacquiring it for every content address.
-    fn load_source_blobs_verified(
+    /// The safe default preserves backend compatibility by delegating each read
+    /// to [`load_source_blob_bounded`](Self::load_source_blob_bounded). Local
+    /// storage overrides this to retain one repository lock across the complete
+    /// operation instead of reacquiring it for every content address.
+    ///
+    /// The callback shape lets callers stream globally de-duplicated bodies
+    /// instead of materializing their aggregate bytes in memory.
+    ///
+    /// Implementations must invoke `operation` exactly once. If it returns an
+    /// error, the backend must propagate that failure and must not return
+    /// success. Repository authority callers enforce both rules fail closed.
+    fn with_verified_source_blob_batch(
         &self,
         repo_id: &str,
-        requests: &[SourceBlobValidationRequest],
-    ) -> Result<BTreeMap<[u8; 32], VerifiedSourceBlob>, KinDbError> {
-        let mut loaded = BTreeMap::new();
-        for request in requests {
-            if loaded.contains_key(&request.digest) {
-                return Err(KinDbError::StorageError(format!(
-                    "duplicate immutable source blob request for {}",
-                    hex::encode(request.digest)
-                )));
-            }
-            if let Some(bytes) =
-                self.load_source_blob_bounded(repo_id, request.digest, request.max_bytes)?
-            {
-                loaded.insert(
-                    request.digest,
-                    VerifiedSourceBlob::new(request.digest, bytes)?,
-                );
-            }
-        }
-        Ok(loaded)
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        let batch = DefaultVerifiedSourceBlobBatch {
+            backend: self,
+            repo_id,
+        };
+        operation(&batch)
     }
 
     /// Load the exact byte length of an immutable source blob.
@@ -1864,6 +1877,23 @@ pub trait StorageBackend: Send + Sync {
     /// For local: list subdirectories in the base path that contain `authority.json`.
     /// For GCS: list top-level prefixes in the bucket under the configured prefix.
     fn list_repos(&self) -> Result<Vec<String>, KinDbError>;
+}
+
+struct DefaultVerifiedSourceBlobBatch<'a, B: StorageBackend + ?Sized> {
+    backend: &'a B,
+    repo_id: &'a str,
+}
+
+impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSourceBlobBatch<'_, B> {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError> {
+        self.backend
+            .load_source_blob_bounded(self.repo_id, request.digest, request.max_bytes)?
+            .map(|bytes| VerifiedSourceBlob::from_verified_bytes(request.digest, bytes))
+            .transpose()
+    }
 }
 
 /// Local filesystem storage backend for developer machines.
@@ -2031,6 +2061,30 @@ struct LocalRepositoryCapability {
         parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
     lock_identity: parking_lot::Mutex<Option<LocalRepositoryLockIdentity>>,
     lock_publication_sync_pending: std::sync::atomic::AtomicBool,
+}
+
+struct LocalVerifiedSourceBlobBatch<'a> {
+    backend: &'a LocalFileBackend,
+    namespace: &'a LocalRepositoryCapability,
+}
+
+impl VerifiedSourceBlobBatch for LocalVerifiedSourceBlobBatch<'_> {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError> {
+        self.backend
+            .load_source_blob_bounded_from_namespace(
+                self.namespace,
+                request.digest,
+                request.max_bytes,
+                false,
+                false,
+                false,
+            )?
+            .map(|bytes| VerifiedSourceBlob::from_verified_bytes(request.digest, bytes))
+            .transpose()
+    }
 }
 
 struct LocalSurfaceCapability {
@@ -4071,7 +4125,43 @@ impl LocalFileBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         freeze.require_repository(repo_id)?;
         validate_source_blob_repo_id(repo_id)?;
-        self.load_source_blob_bounded_from_namespace(freeze.namespace(), digest, max_bytes, false)
+        self.load_source_blob_bounded_from_namespace(
+            freeze.namespace(),
+            digest,
+            max_bytes,
+            false,
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn with_verified_source_blob_batch_while_frozen(
+        &self,
+        freeze: &LocalAuthorityFreezeLock,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        freeze.require_repository(repo_id)?;
+        validate_source_blob_repo_id(repo_id)?;
+        self.with_verified_source_blob_batch_from_namespace(freeze.namespace(), operation)
+    }
+
+    fn with_verified_source_blob_batch_from_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        self.confirm_existing_lock_visible(namespace)?;
+        let batch = LocalVerifiedSourceBlobBatch {
+            backend: self,
+            namespace,
+        };
+        let operation_result = operation(&batch);
+        let identity_result = self.confirm_existing_lock_visible(namespace);
+        match identity_result {
+            Ok(()) => operation_result,
+            Err(error) => Err(error),
+        }
     }
 
     fn load_source_blob_bounded_from_namespace(
@@ -4080,10 +4170,19 @@ impl LocalFileBackend {
         digest: [u8; 32],
         max_bytes: u64,
         create_missing_ancestors: bool,
+        confirm_repository_each_read: bool,
+        verify_digest_in_reader: bool,
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (namespace, digest, max_bytes, create_missing_ancestors);
+            let _ = (
+                namespace,
+                digest,
+                max_bytes,
+                create_missing_ancestors,
+                confirm_repository_each_read,
+                verify_digest_in_reader,
+            );
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
@@ -4091,7 +4190,9 @@ impl LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             let capability = open_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -4112,26 +4213,34 @@ impl LocalFileBackend {
                 false,
             )?
             else {
-                self.confirm_repository_visible(namespace)?;
+                if confirm_repository_each_read {
+                    self.confirm_repository_visible(namespace)?;
+                }
                 return Ok(None);
             };
-            verify_source_blob_digest(
-                digest,
-                &data.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
+            if verify_digest_in_reader {
+                verify_source_blob_digest(
+                    digest,
+                    &data.data,
+                    &capability.leaf_path.display().to_string(),
+                )?;
+            }
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
                 &capability,
             )?;
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             return Ok(Some(data.data));
         }
         #[cfg(unix)]
         {
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             let capability = open_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -4148,21 +4257,27 @@ impl LocalFileBackend {
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
-                self.confirm_repository_visible(namespace)?;
+                if confirm_repository_each_read {
+                    self.confirm_repository_visible(namespace)?;
+                }
                 return Ok(None);
             };
-            verify_source_blob_digest(
-                digest,
-                &data.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
+            if verify_digest_in_reader {
+                verify_source_blob_digest(
+                    digest,
+                    &data.data,
+                    &capability.leaf_path.display().to_string(),
+                )?;
+            }
             confirm_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
                 &capability,
             )?;
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             Ok(Some(data.data))
         }
     }
@@ -5630,23 +5745,22 @@ impl StorageBackend for LocalFileBackend {
         }
     }
 
-    fn load_source_blobs_verified(
+    fn with_verified_source_blob_batch(
         &self,
         repo_id: &str,
-        requests: &[SourceBlobValidationRequest],
-    ) -> Result<BTreeMap<[u8; 32], VerifiedSourceBlob>, KinDbError> {
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
-        if requests.is_empty() {
-            return Ok(BTreeMap::new());
-        }
         if self.existing_repository_path(repo_id)?.is_none() {
-            return Ok(BTreeMap::new());
+            return Err(KinDbError::StorageError(format!(
+                "local repository {repo_id} is absent during immutable source batch access"
+            )));
         }
         #[cfg(any(unix, windows))]
         let authority_lock = self.acquire_existing_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = requests;
+            let _ = operation;
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
@@ -5655,28 +5769,7 @@ impl StorageBackend for LocalFileBackend {
         #[cfg(any(unix, windows))]
         {
             let namespace = &authority_lock.namespace;
-            let mut loaded = BTreeMap::new();
-            for request in requests {
-                if loaded.contains_key(&request.digest) {
-                    return Err(KinDbError::StorageError(format!(
-                        "duplicate immutable source blob request for {}",
-                        hex::encode(request.digest)
-                    )));
-                }
-                if let Some(bytes) = self.load_source_blob_bounded_from_namespace(
-                    namespace,
-                    request.digest,
-                    request.max_bytes,
-                    false,
-                )? {
-                    loaded.insert(
-                        request.digest,
-                        VerifiedSourceBlob::new(request.digest, bytes)?,
-                    );
-                }
-            }
-            self.confirm_existing_lock_visible(namespace)?;
-            Ok(loaded)
+            self.with_verified_source_blob_batch_from_namespace(namespace, operation)
         }
     }
 
@@ -6670,6 +6763,47 @@ mod tests {
             .expect_err("growth beyond the pinned descriptor length must fail closed");
         assert!(error.to_string().contains("changed length while reading"));
         assert!(error.to_string().contains("allocation safety limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_verified_batch_refuses_repository_displacement_at_final_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"batch-pinned immutable source";
+        let digest = source_digest(data);
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+
+        let repo = dir.path().join("repo-a");
+        let displaced_repo = dir.path().join("repo-a-displaced");
+        let outside_path = outside.path().to_path_buf();
+        set_source_file_after_metadata_hook(move || {
+            std::fs::rename(&repo, &displaced_repo).unwrap();
+            symlink(outside_path, repo).unwrap();
+        });
+
+        let mut operation = |batch: &dyn VerifiedSourceBlobBatch| {
+            let body = batch
+                .load_verified(SourceBlobValidationRequest {
+                    digest,
+                    max_bytes: data.len() as u64,
+                })?
+                .expect("the retained capability still reaches the exact body");
+            assert_eq!(body.bytes(), data);
+            Ok(())
+        };
+        let error = backend
+            .with_verified_source_blob_batch("repo-a", &mut operation)
+            .expect_err("batch success must wait for final repository identity confirmation");
+        assert!(
+            error.to_string().contains("not a real directory")
+                || error.to_string().contains("changed")
+                || error.to_string().contains("detached"),
+            "unexpected batch displacement error: {error}"
+        );
     }
 
     #[test]

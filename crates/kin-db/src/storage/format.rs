@@ -417,7 +417,8 @@ impl GraphSnapshot {
     ///
     /// This remains a checksum-verifying decoder. It skips only the semantic
     /// storage-admission pass whose result is already bound to these exact
-    /// bytes by [`HistoryValidationProof`](crate::storage::HistoryValidationProof).
+    /// bytes by
+    /// [`HistoryValidationProof`](crate::storage::backend::HistoryValidationProof).
     /// Callers must establish that proof against a freshly recomputed digest,
     /// repository identity, generation, validator version, and a journal-free
     /// authority before entering this boundary.
