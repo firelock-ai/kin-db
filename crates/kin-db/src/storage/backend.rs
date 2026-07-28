@@ -1306,6 +1306,10 @@ pub struct SnapshotAuthority {
     /// Last acknowledged generation. Every generation in
     /// `(snapshot_generation, head_generation]` must have one exact delta.
     pub head_generation: Generation,
+    /// Durable claim that `snapshot_bytes` already passed complete open-time
+    /// validation. Backends with no durable place to bind such a claim leave
+    /// this `None`, and their repositories revalidate in full on every open.
+    pub history_validation: Option<HistoryValidationProof>,
 }
 
 impl SnapshotAuthority {
@@ -1326,6 +1330,13 @@ pub struct RecoveredSnapshot {
     pub generation: Generation,
     pub deltas_applied: usize,
     pub deltas_seen: usize,
+    /// SHA-256 recomputed here over the exact base snapshot bytes that were
+    /// deserialized, never copied from a backend's own claim about them.
+    pub snapshot_sha256: String,
+    /// Backend claim that the base snapshot already passed complete open-time
+    /// validation. Cleared once any delta is applied, because the recovered
+    /// state is then no longer the bytes the claim names.
+    pub history_validation: Option<HistoryValidationProof>,
 }
 
 /// Load a backend snapshot and replay its complete authoritative delta chain.
@@ -1359,6 +1370,7 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
     }
 
     let mut snapshot = GraphSnapshot::from_bytes(&authority.snapshot_bytes)?;
+    let snapshot_sha256 = hex::encode(Sha256::digest(&authority.snapshot_bytes));
     let deltas_seen = raw_deltas.len();
     if authority.snapshot_generation == authority.head_generation {
         return Ok(Some(RecoveredSnapshot {
@@ -1366,6 +1378,8 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
             generation: authority.head_generation,
             deltas_applied: 0,
             deltas_seen,
+            snapshot_sha256,
+            history_validation: authority.history_validation,
         }));
     }
     let mut expected_generation = checked_next_generation(
@@ -1429,6 +1443,10 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
         generation: authority.head_generation,
         deltas_applied: applied,
         deltas_seen,
+        snapshot_sha256,
+        // The recovered state is the base snapshot plus a delta chain, so no
+        // claim about the base bytes describes it any more.
+        history_validation: None,
     }))
 }
 
@@ -1457,7 +1475,46 @@ pub trait StorageBackend: Send + Sync {
                 snapshot_bytes,
                 snapshot_generation: generation,
                 head_generation: generation,
+                history_validation: None,
             }))
+    }
+
+    /// Persist a full snapshot, optionally binding a durable record that these
+    /// exact bytes already passed complete open-time validation.
+    ///
+    /// `history_validator_version` is `Some` only when the caller has just
+    /// validated the very bytes it is handing over. Backends with nowhere to
+    /// bind that record ignore it, which costs correctness nothing: their
+    /// repositories simply revalidate in full on every open.
+    fn save_snapshot_validated(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let _ = history_validator_version;
+        self.save_snapshot_classified(repo_id, data, expected)
+    }
+
+    /// Bind a validation record to the snapshot a repository already holds,
+    /// without rewriting it.
+    ///
+    /// This is how the first full validation after an upgrade, an import, or a
+    /// store written by an older build pays for itself. The backend must
+    /// verify that the durable snapshot still is exactly `snapshot_sha256` at
+    /// exactly `generation` before binding anything, and refuse otherwise.
+    ///
+    /// `Ok(false)` means the backend has no durable place for the record.
+    fn record_history_validation(
+        &self,
+        repo_id: &str,
+        generation: Generation,
+        snapshot_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let _ = (repo_id, generation, snapshot_sha256, validator_version);
+        Ok(false)
     }
 
     /// Read snapshot authority and its journal from one coherent backend view.
@@ -2154,6 +2211,26 @@ impl LocalAuthorityFreezeLock {
 
 const LOCAL_AUTHORITY_VERSION: u32 = 3;
 
+/// Durable record that one exact snapshot already passed complete open-time
+/// validation.
+///
+/// The record is content-bound: it names the SHA-256 of the exact snapshot
+/// bytes it stands for, so it can never be transplanted onto different bytes,
+/// a different generation, or a different repository. A reader that recomputes
+/// a different digest holds no proof at all and must revalidate in full.
+///
+/// `validator_version` is supplied by the validator that minted the record,
+/// not by storage. Any change to what open-time validation checks bumps it,
+/// which refuses every previously minted record and re-establishes the proof
+/// with one full validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryValidationProof {
+    pub validator_version: u32,
+    pub repository_id: String,
+    pub generation: Generation,
+    pub snapshot_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LocalDeltaIdentity {
     generation: Generation,
@@ -2173,6 +2250,11 @@ struct LocalAuthorityRecord {
     /// Exact journal bytes already represented by the promoted full snapshot
     /// but not necessarily removed yet. Cleanup may act only on these bytes.
     retired_deltas: Vec<LocalDeltaIdentity>,
+    /// Content-bound record that the authoritative snapshot already passed
+    /// complete open-time validation. Absent on records written before this
+    /// field existed and on every authority that advanced through a delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_validation: Option<HistoryValidationProof>,
 }
 
 impl LocalFileBackend {
@@ -4371,6 +4453,7 @@ impl LocalFileBackend {
             snapshot_bytes,
             snapshot_generation: record.snapshot_generation,
             head_generation: record.head_generation,
+            history_validation: record.history_validation,
         }))
     }
 
@@ -4489,6 +4572,7 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         data: &[u8],
         expected_gen: Generation,
+        history_validator_version: Option<u32>,
     ) -> Result<Generation, KinDbError> {
         let repo_id = &namespace.repo_id;
         let current = self.load_authority_unlocked(namespace)?;
@@ -4616,9 +4700,17 @@ impl LocalFileBackend {
             snapshot_generation: new_gen,
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
-            snapshot_sha256: requested_digest,
+            snapshot_sha256: requested_digest.clone(),
             acknowledged_deltas: Vec::new(),
             retired_deltas: Self::delta_identities(&captured_for_cleanup),
+            history_validation: history_validator_version.map(|validator_version| {
+                HistoryValidationProof {
+                    validator_version,
+                    repository_id: repo_id.clone(),
+                    generation: new_gen,
+                    snapshot_sha256: requested_digest,
+                }
+            }),
         };
         self.write_authority_unlocked(namespace, &record)?;
         #[cfg(test)]
@@ -4639,6 +4731,26 @@ impl LocalFileBackend {
         Ok(new_gen)
     }
 
+    fn save_snapshot_locked(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
+        self.save_snapshot_unlocked(
+            &lock.namespace,
+            data,
+            expected_gen,
+            history_validator_version,
+        )
+    }
+
     /// Persist a local full-snapshot CAS and return the same still-held
     /// repository lock that protected its commit point.
     pub(crate) fn save_snapshot_and_freeze(
@@ -4646,6 +4758,7 @@ impl LocalFileBackend {
         repo_id: &str,
         data: &[u8],
         expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
     ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
         let expected_gen = expected_cursor.backend_generation();
         let lock = if expected_gen == GENERATION_INIT {
@@ -4653,12 +4766,25 @@ impl LocalFileBackend {
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        let generation = self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)?;
+        let generation = self.save_snapshot_unlocked(
+            &lock.namespace,
+            data,
+            expected_gen,
+            history_validator_version,
+        )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
             snapshot_bytes: data.to_vec(),
             snapshot_generation: generation,
             head_generation: generation,
+            history_validation: history_validator_version.map(|validator_version| {
+                HistoryValidationProof {
+                    validator_version,
+                    repository_id: repo_id.to_string(),
+                    generation,
+                    snapshot_sha256: hex::encode(Sha256::digest(data)),
+                }
+            }),
         };
         Ok((
             cursor,
@@ -5227,12 +5353,7 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let lock = if expected_gen == GENERATION_INIT {
-            self.acquire_lock_for_initialization(repo_id)?
-        } else {
-            self.acquire_existing_lock(repo_id)?
-        };
-        self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)
+        self.save_snapshot_locked(repo_id, data, expected_gen, None)
     }
 
     fn save_snapshot_classified(
@@ -5241,7 +5362,22 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_cursor: SnapshotCursor,
     ) -> SnapshotSaveOutcome {
-        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+        self.save_snapshot_validated(repo_id, data, expected_cursor, None)
+    }
+
+    fn save_snapshot_validated(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot_locked(
+            repo_id,
+            data,
+            expected_cursor.backend_generation(),
+            history_validator_version,
+        ) {
             Ok(generation) => SnapshotSaveOutcome::Committed {
                 cursor: SnapshotCursor::from_backend_generation(generation),
             },
@@ -5250,6 +5386,47 @@ impl StorageBackend for LocalFileBackend {
             }
             Err(error) => SnapshotSaveOutcome::NotCommitted(error),
         }
+    }
+
+    fn record_history_validation(
+        &self,
+        repo_id: &str,
+        generation: Generation,
+        snapshot_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let namespace = &lock.namespace;
+        let Some(mut record) = self.read_authority_record_raw_unlocked(namespace)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no authority record to bind a history validation to"
+            )));
+        };
+        // Bind only to the exact durable state that was validated. Anything
+        // else means the repository moved underneath the validator and the
+        // record would vouch for bytes nobody checked.
+        if record.snapshot_generation != generation
+            || record.head_generation != generation
+            || record.snapshot_sha256 != snapshot_sha256
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} authority moved to generation {} while binding a history validation for generation {generation}",
+                record.head_generation
+            )));
+        }
+        let proof = HistoryValidationProof {
+            validator_version,
+            repository_id: repo_id.to_string(),
+            generation,
+            snapshot_sha256: snapshot_sha256.to_string(),
+        };
+        if record.history_validation.as_ref() == Some(&proof) {
+            return Ok(true);
+        }
+        record.history_validation = Some(proof);
+        self.write_authority_unlocked(namespace, &record)?;
+        self.confirm_repository_visible(namespace)?;
+        Ok(true)
     }
 
     fn save_delta(
@@ -5342,6 +5519,9 @@ impl StorageBackend for LocalFileBackend {
             hook();
         }
         record.version = LOCAL_AUTHORITY_VERSION;
+        // Authority now advances past the snapshot the validation record was
+        // bound to, so that record no longer describes this repository.
+        record.history_validation = None;
         record
             .retired_deltas
             .retain(|identity| identity.generation != new_gen);
@@ -6856,6 +7036,7 @@ mod tests {
                 "repo-a",
                 &snapshot,
                 SnapshotCursor::from_backend_generation(GENERATION_INIT),
+                None,
             )
             .expect_err("an exact retry must not return a freeze for a detached surface epoch");
         assert!(

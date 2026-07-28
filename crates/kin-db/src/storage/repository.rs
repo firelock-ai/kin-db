@@ -43,13 +43,23 @@ use crate::storage::authority::{
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
-    LocalAuthorityFreezeLock, LocalFileBackend, SnapshotCursor, SnapshotSaveOutcome,
-    StorageBackend, MAX_SOURCE_BLOB_BYTES,
+    LocalAuthorityFreezeLock, LocalFileBackend, RecoveredSnapshot, SnapshotCursor,
+    SnapshotSaveOutcome, StorageBackend, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 
 /// Persisted repository-envelope schema.
 pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
+
+/// Version of the complete open-time validation a durable history-validation
+/// record stands for.
+///
+/// Bump this whenever anything reachable from `open`'s full validation path
+/// changes what it accepts or rejects. Every record minted by an earlier
+/// version is then refused, and one full validation re-establishes the proof.
+/// The envelope schema is folded in so an envelope change cannot silently
+/// inherit a proof minted against the old shape.
+pub const HISTORY_VALIDATION_VERSION: u32 = 1_000 + REPOSITORY_AUTHORITY_SCHEMA_VERSION;
 
 /// Shared admission policy resolved at one exact semantic change.
 ///
@@ -503,10 +513,17 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
+    /// Every successor persisted here descends from an open that established
+    /// complete history validity, and carries its own new changes through
+    /// `validate_history_replay` in `prepare_successor`. So the bytes being
+    /// written are validated bytes, and the durable record says exactly that.
     fn persist_bytes(&self, bytes: &[u8], cursor: &mut SnapshotCursor) -> PersistOutcome {
-        let outcome =
-            self.backend
-                .save_snapshot_classified(self.repository_id.as_str(), bytes, *cursor);
+        let outcome = self.backend.save_snapshot_validated(
+            self.repository_id.as_str(),
+            bytes,
+            *cursor,
+            Some(HISTORY_VALIDATION_VERSION),
+        );
         Self::record_save_outcome(cursor, outcome)
     }
 }
@@ -521,10 +538,12 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
             Err(error) => return RetainedPersistOutcome::NotCommitted(error),
         };
         let mut cursor = self.backend_cursor.lock();
-        match self
-            .backend
-            .save_snapshot_and_freeze(self.repository_id.as_str(), &bytes, *cursor)
-        {
+        match self.backend.save_snapshot_and_freeze(
+            self.repository_id.as_str(),
+            &bytes,
+            *cursor,
+            Some(HISTORY_VALIDATION_VERSION),
+        ) {
             Ok((committed_cursor, retained)) if committed_cursor != *cursor => {
                 *cursor = committed_cursor;
                 RetainedPersistOutcome::Committed { retained }
@@ -748,8 +767,15 @@ impl StorageBackend for FrozenLocalBodyBackend<'_> {
 
 impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
+    ///
+    /// Full history validation is the default and the fallback. It is skipped
+    /// only for a reopen that carries a durable validation record naming the
+    /// exact bytes being opened; see [`verified_history_validation`].
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
         let recovered = load_recovered_snapshot(backend.as_ref(), repository_id.as_str())?;
+        let reopen_proof = recovered
+            .as_ref()
+            .and_then(|recovered| verified_history_validation(&repository_id, recovered));
         let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
             if recovered.deltas_seen != 0 {
                 return Err(storage(format!(
@@ -786,9 +812,28 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             (snapshot, SnapshotCursor::INITIAL)
         };
 
+        // Structural validation is never skipped. It is linear in the
+        // envelope, it recomputes the root bundle, and it is the check that
+        // makes the durable validation record safe to consult at all.
         snapshot.validate_storage_admission()?;
-        let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-        validate_history_replay(&snapshot, &all_changes)?;
+
+        // Whole-history replay is the one step a validation record buys back.
+        // It resolves the complete graph at every change, so it grows with
+        // history length times resolved graph size, and at real repository
+        // scale it is minutes of work to re-derive a conclusion already
+        // reached about these exact bytes.
+        if reopen_proof.is_none() {
+            #[cfg(test)]
+            WHOLE_HISTORY_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
+            validate_history_replay(&snapshot, &all_changes)?;
+        }
+
+        // Every persisted body is re-verified against its content address on
+        // every open, proof or no proof. This is linear in stored bytes rather
+        // than superlinear in history, and keeping it unconditional is what
+        // keeps "a tampered store still refuses" true of the fast path and not
+        // only of the fallback.
         validate_all_authority_bodies(backend.as_ref(), &repository_id, &snapshot)?;
 
         let initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
@@ -797,11 +842,68 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             repository_id: repository_id.clone(),
             backend_cursor: Mutex::new(backend_cursor),
         };
-        Ok(Self {
+        let manager = Self {
             repository_id,
             backend,
             publication: AuthorityPublication::new(initial, persistence),
-        })
+        };
+        if let Some(generation) = reopen_proof {
+            tracing::debug!(
+                repository = %manager.repository_id,
+                generation,
+                "repository authority reopened against a durable history validation"
+            );
+        } else {
+            manager.bind_history_validation(backend_cursor);
+        }
+        Ok(manager)
+    }
+
+    /// Record that the state just validated in full is durably validated, so
+    /// the next open of these exact bytes does not repeat the work.
+    ///
+    /// Best effort by construction: a repository that cannot record this is
+    /// still correct, it is only slow again next time. Failing an open that
+    /// passed complete validation because a cache write lost a race would be
+    /// strictly worse than revalidating.
+    fn bind_history_validation(&self, backend_cursor: SnapshotCursor) {
+        let generation = backend_cursor.backend_generation();
+        if generation == SnapshotCursor::INITIAL.backend_generation() {
+            return;
+        }
+        let digest = {
+            let lease = self.read_authority();
+            match lease.snapshot().to_bytes() {
+                Ok(bytes) => hex::encode(Sha256::digest(&bytes)),
+                Err(error) => {
+                    tracing::debug!(
+                        repository = %self.repository_id,
+                        error = %error,
+                        "could not re-serialize validated authority to record its validation"
+                    );
+                    return;
+                }
+            }
+        };
+        match self.backend.record_history_validation(
+            self.repository_id.as_str(),
+            generation,
+            &digest,
+            HISTORY_VALIDATION_VERSION,
+        ) {
+            Ok(true) => tracing::debug!(
+                repository = %self.repository_id,
+                generation,
+                "recorded a durable history validation for the opened authority"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                repository = %self.repository_id,
+                generation,
+                error = %error,
+                "could not record a durable history validation; the next open revalidates in full"
+            ),
+        }
     }
 
     /// Load one coherent authority generation for an entire request.
@@ -2638,6 +2740,43 @@ fn resolve_change_tree(
     graph.resolve_tree_at(&change_id)
 }
 
+/// Counts whole-history replays performed by `open`, so a test can assert one
+/// did not happen. That absence is the only half of reopen-by-proof with no
+/// externally visible effect.
+#[cfg(test)]
+static WHOLE_HISTORY_REPLAYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Decide whether a recovered repository carries a durable record that these
+/// exact bytes already passed complete open-time validation.
+///
+/// Every field has to agree with what was actually loaded, and the digest is
+/// the one this process recomputed over the deserialized bytes, never the one
+/// the record claims for itself. So the record can only ever vouch for the
+/// content it is stored beside: edit a persisted snapshot and the digest moves,
+/// the record stops applying, and the open falls back to full validation, which
+/// is the check that refuses the edit. A record is likewise refused when it was
+/// minted by a different validator version, names a different repository, names
+/// a different generation, or when any delta was replayed on top of the base
+/// snapshot it describes.
+///
+/// What this does not claim: a writer who can rewrite kin-db's own authority
+/// record alongside the snapshot can mint a record for bytes nobody validated.
+/// That writer already holds the repository's control plane. The guarantee here
+/// is content binding, not authentication against such a writer.
+fn verified_history_validation(
+    repository_id: &RepositoryId,
+    recovered: &RecoveredSnapshot,
+) -> Option<Generation> {
+    let proof = recovered.history_validation.as_ref()?;
+    let matches = proof.validator_version == HISTORY_VALIDATION_VERSION
+        && proof.repository_id == repository_id.as_str()
+        && proof.generation == recovered.generation
+        && proof.snapshot_sha256 == recovered.snapshot_sha256
+        && recovered.deltas_applied == 0;
+    matches.then_some(recovered.generation)
+}
+
 fn validate_history_replay(
     snapshot: &GraphSnapshot,
     new_changes: &[kin_model::SemanticChange],
@@ -3892,6 +4031,7 @@ fn storage(message: String) -> KinDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::backend::HistoryValidationProof;
     use kin_model::{
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
         AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId, AuthorId,
@@ -8683,5 +8823,279 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot be mutated through incremental graph deltas"));
+    }
+
+    /// The replay counter is process-global, so the tests that read it take
+    /// turns rather than racing each other's deltas.
+    static REPLAY_COUNTER: Mutex<()> = Mutex::new(());
+
+    fn authority_json_path(base: &std::path::Path) -> std::path::PathBuf {
+        base.join(repository_id().as_str()).join("authority.json")
+    }
+
+    fn read_authority_json(base: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(authority_json_path(base)).unwrap()).unwrap()
+    }
+
+    fn write_authority_json(base: &std::path::Path, record: &serde_json::Value) {
+        std::fs::write(
+            authority_json_path(base),
+            serde_json::to_vec(record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn whole_history_replays() -> usize {
+        WHOLE_HISTORY_REPLAYS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn committed_local_repository(directory: &TempDir) -> Arc<LocalFileBackend> {
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        backend
+    }
+
+    #[test]
+    fn commit_binds_a_history_validation_record_to_the_exact_persisted_bytes() {
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+
+        let authority = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap();
+        let proof = authority
+            .history_validation
+            .expect("a committed local repository carries a history validation record");
+        assert_eq!(proof.validator_version, HISTORY_VALIDATION_VERSION);
+        assert_eq!(proof.repository_id, repository_id().as_str());
+        assert_eq!(proof.generation, authority.head_generation);
+        assert_eq!(
+            proof.snapshot_sha256,
+            hex::encode(Sha256::digest(&authority.snapshot_bytes)),
+            "the record must name the exact bytes it was minted beside"
+        );
+    }
+
+    #[test]
+    fn reopen_with_a_verified_record_skips_whole_history_replay() {
+        let _serialized = REPLAY_COUNTER.lock();
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        let before = whole_history_replays();
+
+        let reopened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("a repository with a verified record reopens");
+
+        assert_eq!(reopened.read_authority().generation(), 1);
+        assert_eq!(
+            whole_history_replays(),
+            before,
+            "a verified record must make the reopen skip whole-history replay"
+        );
+        drop(backend);
+    }
+
+    #[test]
+    fn reopen_without_a_record_replays_in_full_and_then_binds_one() {
+        let _serialized = REPLAY_COUNTER.lock();
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        drop(backend);
+
+        // A store written by a build that had no validation record at all, or
+        // by one whose validator has since changed. Both reach open the same
+        // way: nothing to verify, so validate everything.
+        let mut record = read_authority_json(directory.path());
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation")
+            .expect("the committed record carried a validation to remove");
+        write_authority_json(directory.path(), &record);
+
+        let before = whole_history_replays();
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("a valid store without a record still opens");
+        assert_eq!(
+            whole_history_replays(),
+            before + 1,
+            "no record means the open pays full validation"
+        );
+
+        let rebound = read_authority_json(directory.path());
+        assert!(
+            rebound.get("history_validation").is_some(),
+            "an open that validated in full must leave a record behind"
+        );
+
+        let after_binding = whole_history_replays();
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(
+            whole_history_replays(),
+            after_binding,
+            "the record minted by the previous open must make this one fast"
+        );
+    }
+
+    #[test]
+    fn reopen_refuses_a_record_minted_by_a_different_validator() {
+        let _serialized = REPLAY_COUNTER.lock();
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        drop(backend);
+
+        let mut record = read_authority_json(directory.path());
+        record["history_validation"]["validator_version"] =
+            serde_json::json!(HISTORY_VALIDATION_VERSION + 1);
+        write_authority_json(directory.path(), &record);
+
+        let before = whole_history_replays();
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(
+            whole_history_replays(),
+            before + 1,
+            "a record from another validator version proves nothing about this one"
+        );
+    }
+
+    #[test]
+    fn reopen_refuses_a_record_that_names_other_bytes_or_another_repository() {
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        let authority = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap();
+        let recovered = |proof: HistoryValidationProof| RecoveredSnapshot {
+            snapshot: GraphSnapshot::empty(),
+            generation: authority.head_generation,
+            deltas_applied: 0,
+            deltas_seen: 0,
+            snapshot_sha256: hex::encode(Sha256::digest(&authority.snapshot_bytes)),
+            history_validation: Some(proof),
+        };
+        let honest = authority.history_validation.clone().unwrap();
+        assert!(
+            verified_history_validation(&repository_id(), &recovered(honest.clone())).is_some(),
+            "the record minted for these bytes must verify"
+        );
+
+        let other_bytes = HistoryValidationProof {
+            snapshot_sha256: hex::encode(Sha256::digest(b"other bytes")),
+            ..honest.clone()
+        };
+        let other_repository = HistoryValidationProof {
+            repository_id: "some-other-repository".to_string(),
+            ..honest.clone()
+        };
+        let other_generation = HistoryValidationProof {
+            generation: honest.generation + 1,
+            ..honest.clone()
+        };
+        for forged in [other_bytes, other_repository, other_generation] {
+            assert!(
+                verified_history_validation(&repository_id(), &recovered(forged)).is_none(),
+                "a record that disagrees with what was loaded must not be honored"
+            );
+        }
+
+        let replayed_delta = RecoveredSnapshot {
+            deltas_applied: 1,
+            ..recovered(honest)
+        };
+        assert!(
+            verified_history_validation(&repository_id(), &replayed_delta).is_none(),
+            "a record about base bytes cannot describe a delta-replayed state"
+        );
+    }
+
+    #[test]
+    fn reopen_refuses_a_tampered_snapshot_even_with_its_record_present() {
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        let generation = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap()
+            .head_generation;
+        drop(backend);
+
+        let snapshot_path = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("snapshots")
+            .join(format!("{generation:020}.kndb"));
+        let mut bytes = std::fs::read(&snapshot_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&snapshot_path, &bytes).unwrap();
+
+        let error = match RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        ) {
+            Ok(_) => panic!("a flipped byte in the persisted snapshot must refuse the open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("digest mismatch") || error.to_string().contains("invalid"),
+            "unexpected tampered-snapshot error: {error}"
+        );
+    }
+
+    #[test]
+    fn binding_a_record_refuses_a_generation_or_digest_that_moved() {
+        let directory = TempDir::new().unwrap();
+        let backend = committed_local_repository(&directory);
+        let authority = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap();
+        let digest = hex::encode(Sha256::digest(&authority.snapshot_bytes));
+
+        let moved_generation = backend
+            .record_history_validation(
+                repository_id().as_str(),
+                authority.head_generation + 1,
+                &digest,
+                HISTORY_VALIDATION_VERSION,
+            )
+            .expect_err("a record must never be bound to a generation that is not durable");
+        assert!(
+            moved_generation.to_string().contains("authority moved"),
+            "unexpected moved-generation error: {moved_generation}"
+        );
+
+        let other_digest = backend
+            .record_history_validation(
+                repository_id().as_str(),
+                authority.head_generation,
+                &hex::encode(Sha256::digest(b"bytes nobody validated")),
+                HISTORY_VALIDATION_VERSION,
+            )
+            .expect_err("a record must never be bound to bytes that are not durable");
+        assert!(
+            other_digest.to_string().contains("authority moved"),
+            "unexpected other-digest error: {other_digest}"
+        );
     }
 }
