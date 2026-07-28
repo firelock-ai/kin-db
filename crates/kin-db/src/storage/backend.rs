@@ -8,6 +8,7 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,44 @@ pub enum SnapshotSaveOutcome {
 /// Archive consumers may apply a lower aggregate limit, but no individual
 /// object is allowed to force an allocation larger than this boundary.
 pub const MAX_SOURCE_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One distinct immutable source body requested for a validated batch read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBlobValidationRequest {
+    pub digest: [u8; 32],
+    pub max_bytes: u64,
+}
+
+/// Immutable source bytes whose storage backend verified their SHA-256
+/// content identity while loading them.
+///
+/// Construction stays inside this module so callers cannot promote arbitrary
+/// bytes to a verified body. Higher-level validators may still apply
+/// domain-specific checks such as exact Git object identity.
+#[derive(Debug)]
+pub struct VerifiedSourceBlob {
+    digest: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+impl VerifiedSourceBlob {
+    fn new(digest: [u8; 32], bytes: Vec<u8>) -> Result<Self, KinDbError> {
+        verify_source_blob_digest(digest, &bytes, "verified source blob batch")?;
+        Ok(Self { digest, bytes })
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
 
 #[cfg(all(test, unix))]
 std::thread_local! {
@@ -1331,6 +1370,9 @@ pub struct RecoveredSnapshot {
     pub generation: Generation,
     pub deltas_applied: usize,
     pub deltas_seen: usize,
+    /// Whether this process reused a durable complete-validation proof bound
+    /// to the exact base snapshot bytes.
+    pub reused_complete_validation: bool,
     /// SHA-256 recomputed here over the exact base snapshot bytes that were
     /// deserialized, never copied from a backend's own claim about them.
     pub snapshot_sha256: String,
@@ -1351,6 +1393,29 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
 ) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+    load_recovered_snapshot_inner(backend, repo_id, None)
+}
+
+/// Load repository authority while permitting an exact, durable
+/// complete-validation proof to skip deterministic semantic revalidation.
+///
+/// General snapshot consumers continue to use [`load_recovered_snapshot`] and
+/// always perform full storage admission. This narrower entrypoint is reserved
+/// for [`RepositoryAuthorityManager`](crate::storage::RepositoryAuthorityManager),
+/// which still revalidates every referenced immutable body after recovery.
+pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: u32,
+) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+    load_recovered_snapshot_inner(backend, repo_id, Some(expected_validator_version))
+}
+
+fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: Option<u32>,
+) -> Result<Option<RecoveredSnapshot>, KinDbError> {
     let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
 
     let Some(authority) = loaded else {
@@ -1370,15 +1435,31 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
         )));
     }
 
-    let mut snapshot = GraphSnapshot::from_bytes(&authority.snapshot_bytes)?;
     let snapshot_sha256 = hex::encode(Sha256::digest(&authority.snapshot_bytes));
     let deltas_seen = raw_deltas.len();
+    let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
+        authority.snapshot_generation == authority.head_generation
+            && raw_deltas.is_empty()
+            && authority.history_validation.as_ref().is_some_and(|proof| {
+                proof.validator_version == expected
+                    && proof.repository_id == repo_id
+                    && proof.generation == authority.head_generation
+                    && proof.snapshot_sha256 == snapshot_sha256
+            })
+    });
+    let mut snapshot = if reused_complete_validation {
+        let _span = tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
+        GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+    } else {
+        GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
+    };
     if authority.snapshot_generation == authority.head_generation {
         return Ok(Some(RecoveredSnapshot {
             snapshot,
             generation: authority.head_generation,
             deltas_applied: 0,
             deltas_seen,
+            reused_complete_validation,
             snapshot_sha256,
             history_validation: authority.history_validation,
         }));
@@ -1444,6 +1525,7 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
         generation: authority.head_generation,
         deltas_applied: applied,
         deltas_seen,
+        reused_complete_validation: false,
         snapshot_sha256,
         // The recovered state is the base snapshot plus a delta chain, so no
         // claim about the base bytes describes it any more.
@@ -1597,6 +1679,38 @@ pub trait StorageBackend: Send + Sync {
         Err(KinDbError::StorageError(
             "bounded immutable source blob reads are not supported by this backend".to_string(),
         ))
+    }
+
+    /// Load and integrity-check a globally de-duplicated set of immutable
+    /// source bodies.
+    ///
+    /// The safe default preserves backend compatibility by delegating each
+    /// distinct request to [`load_source_blob_bounded`](Self::load_source_blob_bounded).
+    /// Local storage overrides this to retain one repository lock across the
+    /// complete batch instead of reacquiring it for every content address.
+    fn load_source_blobs_verified(
+        &self,
+        repo_id: &str,
+        requests: &[SourceBlobValidationRequest],
+    ) -> Result<BTreeMap<[u8; 32], VerifiedSourceBlob>, KinDbError> {
+        let mut loaded = BTreeMap::new();
+        for request in requests {
+            if loaded.contains_key(&request.digest) {
+                return Err(KinDbError::StorageError(format!(
+                    "duplicate immutable source blob request for {}",
+                    hex::encode(request.digest)
+                )));
+            }
+            if let Some(bytes) =
+                self.load_source_blob_bounded(repo_id, request.digest, request.max_bytes)?
+            {
+                loaded.insert(
+                    request.digest,
+                    VerifiedSourceBlob::new(request.digest, bytes)?,
+                );
+            }
+        }
+        Ok(loaded)
     }
 
     /// Load the exact byte length of an immutable source blob.
@@ -3957,9 +4071,19 @@ impl LocalFileBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         freeze.require_repository(repo_id)?;
         validate_source_blob_repo_id(repo_id)?;
+        self.load_source_blob_bounded_from_namespace(freeze.namespace(), digest, max_bytes, false)
+    }
+
+    fn load_source_blob_bounded_from_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        digest: [u8; 32],
+        max_bytes: u64,
+        create_missing_ancestors: bool,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (digest, max_bytes);
+            let _ = (namespace, digest, max_bytes, create_missing_ancestors);
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
@@ -3967,13 +4091,12 @@ impl LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let namespace = freeze.namespace();
             self.confirm_repository_visible(namespace)?;
             let capability = open_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                false,
+                create_missing_ancestors,
             )?;
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
@@ -4008,13 +4131,12 @@ impl LocalFileBackend {
         }
         #[cfg(unix)]
         {
-            let namespace = freeze.namespace();
             self.confirm_repository_visible(namespace)?;
             let capability = open_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                false,
+                create_missing_ancestors,
                 false,
             )?;
             confirm_source_blob_namespace_from_repository(
@@ -5505,6 +5627,56 @@ impl StorageBackend for LocalFileBackend {
             )?;
             self.confirm_repository_visible(namespace)?;
             Ok(Some(data.data))
+        }
+    }
+
+    fn load_source_blobs_verified(
+        &self,
+        repo_id: &str,
+        requests: &[SourceBlobValidationRequest],
+    ) -> Result<BTreeMap<[u8; 32], VerifiedSourceBlob>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        if requests.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(BTreeMap::new());
+        }
+        #[cfg(any(unix, windows))]
+        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = requests;
+            return Err(KinDbError::StorageError(
+                "secure local immutable source storage is unavailable on this platform; use the GCS backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let namespace = &authority_lock.namespace;
+            let mut loaded = BTreeMap::new();
+            for request in requests {
+                if loaded.contains_key(&request.digest) {
+                    return Err(KinDbError::StorageError(format!(
+                        "duplicate immutable source blob request for {}",
+                        hex::encode(request.digest)
+                    )));
+                }
+                if let Some(bytes) = self.load_source_blob_bounded_from_namespace(
+                    namespace,
+                    request.digest,
+                    request.max_bytes,
+                    false,
+                )? {
+                    loaded.insert(
+                        request.digest,
+                        VerifiedSourceBlob::new(request.digest, bytes)?,
+                    );
+                }
+            }
+            self.confirm_existing_lock_visible(namespace)?;
+            Ok(loaded)
         }
     }
 
