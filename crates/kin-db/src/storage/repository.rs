@@ -644,6 +644,9 @@ pub struct RepositoryAuthorityManager<B: StorageBackend + ?Sized + 'static> {
     repository_id: RepositoryId,
     backend: Arc<B>,
     publication: AuthorityPublication<RepositoryAuthorityState, RepositorySnapshotPersistence<B>>,
+    /// Whether the open that produced this manager trusted a durable history
+    /// validation rather than replaying the whole history.
+    opened_by_history_validation: bool,
 }
 
 /// Exclusive, cross-process lease over one fully revalidated local repository
@@ -823,8 +826,6 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            #[cfg(test)]
-            WHOLE_HISTORY_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
             validate_history_replay(&snapshot, &all_changes)?;
         }
@@ -846,6 +847,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             repository_id,
             backend,
             publication: AuthorityPublication::new(initial, persistence),
+            opened_by_history_validation: reopen_proof.is_some(),
         };
         if let Some(generation) = reopen_proof {
             tracing::debug!(
@@ -857,6 +859,15 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             manager.bind_history_validation(backend_cursor);
         }
         Ok(manager)
+    }
+
+    /// Whether this open trusted a durable history validation instead of
+    /// replaying the whole history.
+    ///
+    /// Surfaced so operators and tests can tell the fast path from the slow one
+    /// directly, rather than inferring it from how long an open took.
+    pub const fn opened_by_history_validation(&self) -> bool {
+        self.opened_by_history_validation
     }
 
     /// Record that the state just validated in full is durably validated, so
@@ -2739,13 +2750,6 @@ fn resolve_change_tree(
     let graph = InMemoryGraph::from_snapshot(replay)?;
     graph.resolve_tree_at(&change_id)
 }
-
-/// Counts whole-history replays performed by `open`, so a test can assert one
-/// did not happen. That absence is the only half of reopen-by-proof with no
-/// externally visible effect.
-#[cfg(test)]
-static WHOLE_HISTORY_REPLAYS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// Decide whether a recovered repository carries a durable record that these
 /// exact bytes already passed complete open-time validation.
@@ -8825,10 +8829,6 @@ mod tests {
             .contains("cannot be mutated through incremental graph deltas"));
     }
 
-    /// The replay counter is process-global, so the tests that read it take
-    /// turns rather than racing each other's deltas.
-    static REPLAY_COUNTER: Mutex<()> = Mutex::new(());
-
     fn authority_json_path(base: &std::path::Path) -> std::path::PathBuf {
         base.join(repository_id().as_str()).join("authority.json")
     }
@@ -8845,8 +8845,12 @@ mod tests {
         .unwrap();
     }
 
-    fn whole_history_replays() -> usize {
-        WHOLE_HISTORY_REPLAYS.load(std::sync::atomic::Ordering::SeqCst)
+    fn reopen(directory: &TempDir) -> RepositoryAuthorityManager<LocalFileBackend> {
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("a valid store reopens")
     }
 
     fn committed_local_repository(directory: &TempDir) -> Arc<LocalFileBackend> {
@@ -8883,32 +8887,22 @@ mod tests {
 
     #[test]
     fn reopen_with_a_verified_record_skips_whole_history_replay() {
-        let _serialized = REPLAY_COUNTER.lock();
         let directory = TempDir::new().unwrap();
-        let backend = committed_local_repository(&directory);
-        let before = whole_history_replays();
+        drop(committed_local_repository(&directory));
 
-        let reopened = RepositoryAuthorityManager::open(
-            repository_id(),
-            Arc::new(LocalFileBackend::new(directory.path())),
-        )
-        .expect("a repository with a verified record reopens");
+        let reopened = reopen(&directory);
 
         assert_eq!(reopened.read_authority().generation(), 1);
-        assert_eq!(
-            whole_history_replays(),
-            before,
+        assert!(
+            reopened.opened_by_history_validation(),
             "a verified record must make the reopen skip whole-history replay"
         );
-        drop(backend);
     }
 
     #[test]
     fn reopen_without_a_record_replays_in_full_and_then_binds_one() {
-        let _serialized = REPLAY_COUNTER.lock();
         let directory = TempDir::new().unwrap();
-        let backend = committed_local_repository(&directory);
-        drop(backend);
+        drop(committed_local_repository(&directory));
 
         // A store written by a build that had no validation record at all, or
         // by one whose validator has since changed. Both reach open the same
@@ -8921,15 +8915,8 @@ mod tests {
             .expect("the committed record carried a validation to remove");
         write_authority_json(directory.path(), &record);
 
-        let before = whole_history_replays();
-        RepositoryAuthorityManager::open(
-            repository_id(),
-            Arc::new(LocalFileBackend::new(directory.path())),
-        )
-        .expect("a valid store without a record still opens");
-        assert_eq!(
-            whole_history_replays(),
-            before + 1,
+        assert!(
+            !reopen(&directory).opened_by_history_validation(),
             "no record means the open pays full validation"
         );
 
@@ -8938,41 +8925,24 @@ mod tests {
             rebound.get("history_validation").is_some(),
             "an open that validated in full must leave a record behind"
         );
-
-        let after_binding = whole_history_replays();
-        RepositoryAuthorityManager::open(
-            repository_id(),
-            Arc::new(LocalFileBackend::new(directory.path())),
-        )
-        .unwrap();
-        assert_eq!(
-            whole_history_replays(),
-            after_binding,
+        assert!(
+            reopen(&directory).opened_by_history_validation(),
             "the record minted by the previous open must make this one fast"
         );
     }
 
     #[test]
     fn reopen_refuses_a_record_minted_by_a_different_validator() {
-        let _serialized = REPLAY_COUNTER.lock();
         let directory = TempDir::new().unwrap();
-        let backend = committed_local_repository(&directory);
-        drop(backend);
+        drop(committed_local_repository(&directory));
 
         let mut record = read_authority_json(directory.path());
         record["history_validation"]["validator_version"] =
             serde_json::json!(HISTORY_VALIDATION_VERSION + 1);
         write_authority_json(directory.path(), &record);
 
-        let before = whole_history_replays();
-        RepositoryAuthorityManager::open(
-            repository_id(),
-            Arc::new(LocalFileBackend::new(directory.path())),
-        )
-        .unwrap();
-        assert_eq!(
-            whole_history_replays(),
-            before + 1,
+        assert!(
+            !reopen(&directory).opened_by_history_validation(),
             "a record from another validator version proves nothing about this one"
         );
     }
