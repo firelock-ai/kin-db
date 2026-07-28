@@ -775,7 +775,9 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// only for a reopen that carries a durable validation record naming the
     /// exact bytes being opened; see [`verified_history_validation`].
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
+        let started = std::time::Instant::now();
         let recovered = load_recovered_snapshot(backend.as_ref(), repository_id.as_str())?;
+        let recovered_at = started.elapsed();
         let reopen_proof = recovered
             .as_ref()
             .and_then(|recovered| verified_history_validation(&repository_id, recovered));
@@ -827,6 +829,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // envelope, it recomputes the root bundle, and it is the check that
         // makes the durable validation record safe to consult at all.
         snapshot.validate_storage_admission()?;
+        let structural_at = started.elapsed();
 
         // Whole-history replay is the one step a validation record buys back.
         // It resolves the complete graph at every change, so it grows with
@@ -837,6 +840,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
             validate_history_replay(&snapshot, &all_changes)?;
         }
+        let replay_at = started.elapsed();
 
         // Every persisted body is re-verified against its content address on
         // every open, proof or no proof. This is linear in stored bytes rather
@@ -844,6 +848,20 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // keeps "a tampered store still refuses" true of the fast path and not
         // only of the fallback.
         validate_all_authority_bodies(backend.as_ref(), &repository_id, &snapshot)?;
+        let bodies_at = started.elapsed();
+        // Reopen latency at real repository scale is a standing concern, and it
+        // is not obvious from outside which phase dominates. Report the split
+        // rather than leaving it to be inferred from a stopwatch.
+        tracing::debug!(
+            repository = %repository_id,
+            by_history_validation = reopen_proof.is_some(),
+            recover_ms = recovered_at.as_millis(),
+            structural_ms = (structural_at - recovered_at).as_millis(),
+            replay_ms = (replay_at - structural_at).as_millis(),
+            bodies_ms = (bodies_at - replay_at).as_millis(),
+            total_ms = bodies_at.as_millis(),
+            "repository authority open"
+        );
 
         let initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
         let persistence = RepositorySnapshotPersistence {
