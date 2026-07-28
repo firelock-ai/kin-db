@@ -38,6 +38,17 @@ jobs:
           --skip test_vector_index_dimension_mismatch_auto_recovery
           --skip many_vectors_search_quality
 
+      - name: 100K hydration smoke guard
+        # Keep the release gate identical to CI: the timed assertion runs alone
+        # on both matrix operating systems instead of racing another scale test.
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --test scale_and_failure scale_100k_entities --
+          --ignored
+          --exact
+          --test-threads=1
+
   release:
     name: Publish Release
     needs: validate
