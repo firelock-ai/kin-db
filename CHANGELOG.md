@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-28
+
+### Added
+
+- Persisted `kin-model` 0.7 external references as first-class graph endpoints.
+  Transactions now add or remove immutable resolver-issued coordinates
+  atomically with their relations, reject stale records and dangling endpoints,
+  return the referenced records in mixed-node traversal, and preserve them
+  across owned, zero-clone, locate-only, and delta-backed reopen paths.
+
+### Changed
+
+- Advanced the fail-closed graph snapshot format to v13 and incremental delta
+  format to v5. The external-reference collections are append-only positional
+  fields, and old snapshot/delta formats remain rejected instead of being
+  reinterpreted.
+- Retrieval-authority hashing is now v2 and repo-truth hashing is v5 so both
+  bind the full immutable external-reference record, not only a relation
+  endpoint ID.
+
+## [0.6.7] - 2026-07-28
+
+### Changed
+
+- Repository-authority reopen can reuse a durable whole-history validation only
+  when it binds the exact loaded snapshot bytes, repository, generation,
+  validator version, and a journal-free authority. Every mismatch falls back
+  to full replay, while structural and content-addressed body validation remain
+  unconditional.
+- Exact-open phase timings and the trusted-validation decision are observable,
+  and the timed 100K-entity hydration guard runs in isolation instead of racing
+  the parallel default suite.
+
 ## [0.6.6] - 2026-07-28
 
 ### Fixed
