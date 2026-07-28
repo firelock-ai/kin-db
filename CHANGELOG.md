@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-07-28
+
+### Fixed
+
+- `LocalFileBackend::list_repos` no longer hard-fails on a storage root that
+  holds the engine's own files. A live `.kin/kindb/` keeps `graph.kndb`,
+  `graph.kvec`, `graph.kidx`, `head-generation`, and `generation` beside the
+  repository namespaces, and every one of those names is a valid repository id,
+  so binding them as namespaces refused with `local directory namespace <path>
+  is not a real directory` and the listing failed outright once any of them
+  existed. Listing now skips regular files, which can never be a namespace. The
+  bind is unchanged for everything else, so a symlink or any other non-directory
+  claiming a namespace name is still refused rather than dropped from the
+  listing.
+
+### Added
+
+- `LocalFileBackend::probe_pinned_repository_namespace`, a side-effect-free
+  identity probe returning the typed `LocalNamespaceProbe`. Revalidating a
+  retained binding through `load_snapshot_authority` acquires the repository
+  lock, decodes the whole snapshot, and finalizes retired quarantines, so
+  callers classifying on its error reported a truncated snapshot, a missing
+  lock file, or a quarantined state on an intact namespace as a replaced
+  repository. The probe answers the identity question alone: `Retained`,
+  `Absent`, `IdentityLost` carrying whether the storage root or the namespace
+  moved, and `Unavailable` for everything that says nothing about identity. The
+  first probe on a fresh backend still takes the pin, so the ordering the
+  authority reads rely on is unchanged.
+
+### Changed
+
+- The two fixtures guarding merge-carrying-second-parent replay now say what
+  goes wrong when entity revisions are derived along first-parent lineage alone,
+  and name the upstream commit that first reaches the shape. Documentation only,
+  no behavior change.
+
 ## [0.6.4] - 2026-07-27
 
 ### Fixed
