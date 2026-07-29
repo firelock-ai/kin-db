@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validator is refused, each affected store pays one full validation on its next
   open, and that open rebinds a record at the current version.
 
+  Opening a store alternately with binaries either side of this change pays a
+  full validation every time, because the record version is compared for
+  equality and each binary rebinds to its own value. That is inherent to
+  equality-versioned records rather than new here, but this is the first change
+  to move the version, so it is the first release where it is reachable.
+
+## [0.7.3] - 2026-07-29
+
 ### Fixed
 
 - Updated the exact `kin-model` dependency to 0.7.1 so an unlabelled

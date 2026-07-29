@@ -69,6 +69,27 @@ pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 /// removed, or changes what it admits. Records minted by an earlier revision are
 /// then refused, each affected store pays one full validation, and that open
 /// rebinds a record at the current revision.
+///
+/// The rule tracks the **accept/reject set**, not the shape of the code that
+/// computes it. What a record has to stand for is the verdict a validator would
+/// reach about those exact bytes, so a change that reorganizes, consolidates, or
+/// speeds up the checks without changing which histories are admitted does
+/// **not** bump this, and bumping it anyway costs every existing store a full
+/// revalidation for no integrity gain.
+///
+/// Read literally, "added, removed, or changes what it admits" invites the wrong
+/// answer for a refactor that deletes call sites: replacing a per-target replay
+/// loop with one equivalent pass removes calls while removing no check. That is
+/// not a coverage change. The test to apply is whether some history's verdict
+/// moves, and the standard of evidence is a differential harness showing the old
+/// and new paths accept and refuse the same inputs.
+///
+/// One caveat, because this constant also gates a validator *implementation*: a
+/// value must never be minted by two binaries whose validation differs. If a
+/// coverage-neutral rewrite of that path lands **after** a release already
+/// minting this revision, records from the earlier binary are honored by the
+/// later one, so the two must land in the order that keeps each value
+/// unambiguous, or the revision must move to separate them.
 const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 2;
 
 /// Version of the complete open-time validation a durable history-validation
@@ -10728,29 +10749,28 @@ mod tests {
             HISTORY_VALIDATION_VERSION, 1_302,
             "envelope schema 3 and coverage revision 2 compose to 1302"
         );
-        assert_eq!(
-            HISTORY_VALIDATION_VERSION,
-            1_000
-                + REPOSITORY_AUTHORITY_SCHEMA_VERSION * HISTORY_VALIDATION_SCHEMA_STRIDE
-                + HISTORY_VALIDATION_COVERAGE_REVISION
-        );
-
-        // Either term moving alone has to move the composed version, otherwise
-        // one of the two classes of change stays invisible to a stored record.
-        assert_ne!(
-            1_000
-                + REPOSITORY_AUTHORITY_SCHEMA_VERSION * HISTORY_VALIDATION_SCHEMA_STRIDE
-                + (HISTORY_VALIDATION_COVERAGE_REVISION + 1),
-            HISTORY_VALIDATION_VERSION,
-            "a coverage bump must refuse records minted at the current revision"
-        );
-        assert_ne!(
-            1_000
-                + (REPOSITORY_AUTHORITY_SCHEMA_VERSION + 1) * HISTORY_VALIDATION_SCHEMA_STRIDE
-                + HISTORY_VALIDATION_COVERAGE_REVISION,
-            HISTORY_VALIDATION_VERSION,
-            "a schema bump must refuse records minted under the current schema"
-        );
+        // That literal is the whole test. The rest of this comment exists so
+        // nobody reads the test as stronger than it is, or pads it with
+        // assertions that cannot fail.
+        //
+        // Restating the composition here, or adding one to a single term of it,
+        // asserts nothing: both restate arithmetic the compiler already did, and
+        // neither can fail while the constants are referenced at all. Sweeping
+        // (schema, coverage) pairs for collisions is the same trap one level up,
+        // because `1_000 + schema * STRIDE + coverage` over `coverage < STRIDE` is
+        // positional encoding and cannot collide by construction. The property
+        // those reach for, that neither term can alias the other, is enforced
+        // where it belongs: a compile-time assertion beside the constants.
+        //
+        // What this test does catch is a revert to schema-only derivation, and
+        // either constant moving without this expectation moving with it.
+        //
+        // What it cannot catch is the failure that motivated the change:
+        // validation coverage moving while the revision stays put. The version is
+        // then still 1302, this assertion still passes, and stores reopen against
+        // checks their record never stood for. Closing that needs the covered
+        // checks enumerated or dispatched so that adding one fails to compile,
+        // not another assertion here.
     }
 
     #[test]
