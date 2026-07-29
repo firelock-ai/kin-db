@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-29
+
+### Fixed
+
+- Updated the exact `kin-model` dependency to 0.7.1 so an unlabelled
+  `MergeConflictEntry` retains its positional `label` slot and round-trips
+  without decoding the following resolution into the wrong field.
+
 ## [0.7.2] - 2026-07-29
 
 ### Added
