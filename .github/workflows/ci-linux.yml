@@ -33,14 +33,12 @@ jobs:
     name: Linux Build & Test (no Metal)
     runs-on: ubuntu-latest
     steps:
-      # kin-db's committed .cargo/config.toml resolves the kin-registry crates
-      # (kin-model / kin-infer / kin-vector / kin-search) via pinned PUBLIC-git
-      # [patch.kin] revs — no sibling checkouts and no registry auth needed. The
-      # Check & Test workflow (ci.yml) proves these git patches resolve cleanly
-      # from a single kin-db checkout; this Linux workflow now mirrors that.
-      # (It previously laid out ../kin-* siblings for an older PATH-patch scheme
-      # that "make public dependency resolution reproducible" replaced with git
-      # revs, leaving the siblings stale and the git clone the actual resolver.)
+      # kin-db's committed .cargo/config.toml resolves kin-model, kin-infer,
+      # kin-vector, and kin-search through the Kin sparse registry. No sibling
+      # checkout or local [patch.kin] entry participates. The Check & Test
+      # workflow (ci.yml) proves the same single-checkout dependency path; this
+      # Linux workflow mirrors it without reconstructing the retired sibling-
+      # checkout or public-git patch schemes.
       - name: Checkout kin-db
         uses: actions/checkout@v7
         with:
