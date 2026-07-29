@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.3] - 2026-07-29
+### Fixed
+
+- Moved the durable history-validation record's validator version with what
+  `open`'s full validation path accepts, not only with the persisted envelope
+  schema. External-reference entry admission and Git projection tree replay were
+  both added to the validation an exact record lets an open skip while the
+  envelope schema stayed at 3, so records minted before either check existed
+  still verified against the validator that added them and those stores reopened
+  without ever running the new checks. The version now composes the envelope
+  schema with an explicit coverage revision. Every record minted by an earlier
+  validator is refused, each affected store pays one full validation on its next
+  open, and that open rebinds a record at the current version.
 
 ### Fixed
 
