@@ -7245,6 +7245,72 @@ mod tests {
     }
 
     #[test]
+    fn git_projection_tree_replay_rejects_missing_first_parent_and_cycles() {
+        let missing_parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x99; 32]));
+        let missing_oid = projection_test_oid(201);
+        let missing = projection_test_change(
+            missing_oid,
+            vec![missing_parent],
+            Vec::new(),
+            "missing first parent",
+        );
+        let missing_targets = BTreeMap::from([(
+            missing.id,
+            GitProjectionTreeTarget {
+                commit_oid: missing_oid,
+                raw_tree_oid: projection_test_oid(301),
+            },
+        )]);
+        let mut missing_snapshot = GraphSnapshot::empty();
+        missing_snapshot.changes.insert(missing.id, missing);
+        let error =
+            validate_git_projection_tree_replay(&missing_snapshot, &missing_targets, |_| {
+                panic!("a structurally incomplete projection must fail before materialization")
+            })
+            .expect_err("a projected first parent must also have an exact tree target");
+        assert!(
+            error.to_string().contains(&missing_parent.to_string()),
+            "unexpected missing-parent error: {error}"
+        );
+
+        let left_oid = projection_test_oid(202);
+        let right_oid = projection_test_oid(203);
+        let mut left = projection_test_change(left_oid, Vec::new(), Vec::new(), "cycle left");
+        let mut right = projection_test_change(right_oid, Vec::new(), Vec::new(), "cycle right");
+        left.parents = vec![right.id];
+        right.parents = vec![left.id];
+        let cycle_targets = BTreeMap::from([
+            (
+                left.id,
+                GitProjectionTreeTarget {
+                    commit_oid: left_oid,
+                    raw_tree_oid: projection_test_oid(302),
+                },
+            ),
+            (
+                right.id,
+                GitProjectionTreeTarget {
+                    commit_oid: right_oid,
+                    raw_tree_oid: projection_test_oid(303),
+                },
+            ),
+        ]);
+        let mut cycle_snapshot = GraphSnapshot::empty();
+        cycle_snapshot.changes.insert(left.id, left);
+        cycle_snapshot.changes.insert(right.id, right);
+        let error = validate_git_projection_tree_replay(&cycle_snapshot, &cycle_targets, |_| {
+            panic!("a cyclic projection forest must fail before materialization")
+        })
+        .expect_err("a first-parent projection cycle must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cycle in first-parent Git projection history"),
+            "unexpected cycle error: {error}"
+        );
+    }
+
+    #[test]
     fn git_authority_requires_projection_alias_ordered_parents_and_exact_tree_plan() {
         let alias_backend = Arc::new(MemoryBackend::default());
         let alias_manager = initial_manager(alias_backend);
