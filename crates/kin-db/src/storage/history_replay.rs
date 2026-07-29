@@ -325,8 +325,9 @@ enum Frame {
 fn collect_first_parent_lineage(
     changes: &HashMap<SemanticChangeId, SemanticChange>,
     targets: &[SemanticChangeId],
-) -> Result<HashSet<SemanticChangeId>, KinDbError> {
-    let mut lineage = HashSet::new();
+) -> Result<BTreeSet<SemanticChangeId>, KinDbError> {
+    // Ordered, so the change a cycle refusal names is the same on every run.
+    let mut lineage = BTreeSet::new();
     for target in targets {
         let mut current = Some(*target);
         while let Some(change_id) = current {
@@ -644,4 +645,785 @@ fn dangling_reference(
          {reference_id}; relation removal must be explicit"
     ))
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use kin_model::{
+        compute_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore, EntityKind,
+        EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
+        LocatedEntry, RelationKind, RelationOrigin, RepoPath, SemanticFingerprint, Timestamp,
+        TreeEntry, Visibility,
+    };
+    use kin_model::{ArtifactId, EntityRevision};
+    use uuid::Uuid;
+
+    /// The exact per-change replay this module replaced, over the same fixture.
+    ///
+    /// Reading changes straight out of the fixture map isolates the comparison
+    /// to the replay itself: an `InMemoryGraph` would additionally revalidate
+    /// storage admission and derive revision timelines, so a fixture refused
+    /// there would never reach the behavior under test.
+    struct LegacyReplayStore {
+        changes: HashMap<SemanticChangeId, SemanticChange>,
+    }
+
+    impl ChangeStore for LegacyReplayStore {
+        type Error = KinDbError;
+
+        fn get_change(
+            &self,
+            id: &SemanticChangeId,
+        ) -> Result<Option<SemanticChange>, Self::Error> {
+            Ok(self.changes.get(id).cloned())
+        }
+
+        fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>, Self::Error> {
+            unimplemented!("the replay under test never reads entity history")
+        }
+
+        fn get_entity_revisions(
+            &self,
+            _id: &EntityId,
+        ) -> Result<Vec<EntityRevision>, Self::Error> {
+            unimplemented!("the replay under test never reads entity revisions")
+        }
+
+        fn find_merge_bases(
+            &self,
+            _a: &SemanticChangeId,
+            _b: &SemanticChangeId,
+        ) -> Result<Vec<SemanticChangeId>, Self::Error> {
+            unimplemented!("the replay under test never reads merge bases")
+        }
+
+        fn create_change(&self, _change: &SemanticChange) -> Result<(), Self::Error> {
+            unimplemented!("the replay under test never writes")
+        }
+
+        fn get_changes_since(
+            &self,
+            _base: &SemanticChangeId,
+            _head: &SemanticChangeId,
+        ) -> Result<Vec<SemanticChange>, Self::Error> {
+            unimplemented!("the replay under test never reads change ranges")
+        }
+    }
+
+    fn legacy_outcome(
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+    ) -> Result<(), String> {
+        let store = LegacyReplayStore {
+            changes: changes.clone(),
+        };
+        for target in targets {
+            store
+                .build_change_order_at(target)
+                .map_err(|error| error.to_string())?;
+            store
+                .resolve_graph_at(target)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn incremental_outcome(
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+    ) -> Result<(), String> {
+        validate_first_parent_history(changes, targets).map_err(|error| error.to_string())
+    }
+
+    /// Assert both replays reach the same verdict, with the same words.
+    ///
+    /// Message equality is asserted, not just the accept/refuse split, because
+    /// an operator reading a refusal must not be able to tell which
+    /// implementation produced it. Every fixture here carries exactly one
+    /// violation so the reported identity is determined.
+    fn assert_replays_agree(
+        label: &str,
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+    ) -> Result<(), String> {
+        let legacy = legacy_outcome(changes, targets);
+        let incremental = incremental_outcome(changes, targets);
+        assert_eq!(
+            legacy, incremental,
+            "{label}: per-change replay and incremental replay disagree"
+        );
+        incremental
+    }
+
+    fn assert_agreed_refusal(
+        label: &str,
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+        expected: &str,
+    ) {
+        let error = assert_replays_agree(label, changes, targets)
+            .expect_err("an invalid history must be refused");
+        assert!(
+            error.contains(expected),
+            "{label}: expected a refusal naming {expected:?}, got {error:?}"
+        );
+    }
+
+    fn entity(name: &str, fingerprint_byte: u8) -> Entity {
+        let path = format!("src/{name}.rs");
+        Entity {
+            id: EntityId::from_content(&path, name, "function", 1),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([fingerprint_byte; 32]),
+                signature_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(1); 32]),
+                behavior_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(2); 32]),
+                equivalence_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(3); 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(&path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn revise(base: &Entity, fingerprint_byte: u8) -> Entity {
+        let mut revised = base.clone();
+        revised.signature = format!("fn {}(value: i{fingerprint_byte})", base.name);
+        revised.fingerprint.signature_hash = Hash256::from_bytes([fingerprint_byte; 32]);
+        revised
+    }
+
+    fn relation(src: GraphNodeId, dst: GraphNodeId, tag: &str) -> Relation {
+        Relation {
+            id: RelationId::from_content(&format!("{src:?}"), &format!("{dst:?}"), tag),
+            kind: RelationKind::Calls,
+            src,
+            dst,
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn blob(path: &str, artifact: u128, byte: u8) -> (ArtifactId, LocatedEntry) {
+        let repo_path = RepoPath::from_utf8(path).unwrap();
+        (
+            ArtifactId(Uuid::from_u128(artifact)),
+            LocatedEntry::new(
+                repo_path,
+                TreeEntry::blob(Hash256::from_bytes([byte; 32]), false),
+            ),
+        )
+    }
+
+    /// One change with the given lineage and deltas, carrying its real identity.
+    #[derive(Default)]
+    struct ChangeSpec {
+        parents: Vec<SemanticChangeId>,
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+        external_reference_deltas: Vec<ExternalReferenceDelta>,
+        tree_deltas: Vec<TreeDelta>,
+    }
+
+    fn change(message: &str, spec: ChangeSpec) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: spec.parents,
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("history-replay-test"),
+            message: message.to_string(),
+            entity_deltas: spec.entity_deltas,
+            relation_deltas: spec.relation_deltas,
+            tree_deltas: spec.tree_deltas,
+            admission_policy_delta: None,
+            external_reference_deltas: spec.external_reference_deltas,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn history(
+        changes: Vec<SemanticChange>,
+    ) -> (HashMap<SemanticChangeId, SemanticChange>, Vec<SemanticChangeId>) {
+        let mut targets: Vec<_> = changes.iter().map(|change| change.id).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let map = changes
+            .into_iter()
+            .map(|change| (change.id, change))
+            .collect();
+        (map, targets)
+    }
+
+    /// A branching, merging history exercising every carried state at once.
+    #[test]
+    fn incremental_and_per_change_replay_agree_on_a_branching_history() {
+        let alpha = entity("alpha", 0x11);
+        let beta = entity("beta", 0x21);
+        let alpha_revised = revise(&alpha, 0x31);
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let internal = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::Entity(beta.id),
+            "calls",
+        );
+        let external = relation(
+            GraphNodeId::Entity(beta.id),
+            GraphNodeId::ExternalReference(reference.id),
+            "imports",
+        );
+        let (root_artifact, root_entry) = blob("src/root.rs", 0xa1, 0x41);
+        let (leaf_artifact, leaf_entry) = blob("src/leaf.rs", 0xa2, 0x51);
+
+        let genesis = change(
+            "seed both entities and a tree",
+            ChangeSpec {
+                entity_deltas: vec![
+                    EntityDelta::Added { new: alpha.clone() },
+                    EntityDelta::Added { new: beta.clone() },
+                ],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: internal.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: root_artifact,
+                    new: root_entry.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let trunk = change(
+            "revise alpha and take an external dependency",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: alpha.clone(),
+                    new: alpha_revised.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: external.clone(),
+                }],
+                external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: leaf_artifact,
+                    new: leaf_entry.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        // A sibling of `trunk` off the same parent. Its state must not carry any
+        // of `trunk`'s deltas, which only holds if the rewind is exact.
+        let sibling = change(
+            "remove beta on a divergent branch",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Removed { old: beta.clone() }],
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: internal.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        // A merge is material against its first parent only; `sibling` stays
+        // ancestry, so beta is still present here.
+        let merge = change(
+            "merge the divergent branch",
+            ChangeSpec {
+                parents: vec![trunk.id, sibling.id],
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: alpha_revised.clone(),
+                    new: revise(&alpha, 0x61),
+                }],
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: leaf_artifact,
+                    old: leaf_entry,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, trunk, sibling, merge]);
+        assert_replays_agree("branching history", &changes, &targets)
+            .expect("a coherent branching history must replay");
+    }
+
+    /// The property a broken rewind breaks first: sibling branches that each
+    /// introduce the same identity are both valid, and neither may observe the
+    /// other's state.
+    #[test]
+    fn sibling_branches_never_observe_each_other() {
+        let shared = entity("shared", 0x71);
+        let genesis = change("empty root", ChangeSpec::default());
+        let left = change(
+            "add shared on the left branch",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: shared.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let right = change(
+            "add the same identity on the right branch",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: shared.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, left, right]);
+        assert_replays_agree("sibling branches", &changes, &targets)
+            .expect("divergent branches may each introduce the same identity");
+    }
+
+    #[test]
+    fn refuses_adding_an_entity_its_lineage_already_carries() {
+        let alpha = entity("alpha", 0x11);
+        let genesis = change(
+            "add alpha",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: alpha.clone() }],
+                ..ChangeSpec::default()
+            },
+        );
+        let duplicate = change(
+            "add alpha again on the same lineage",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Added { new: alpha.clone() }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, duplicate]);
+        assert_agreed_refusal(
+            "duplicate entity",
+            &changes,
+            &targets,
+            "adds existing entity",
+        );
+    }
+
+    #[test]
+    fn refuses_an_entity_modification_with_a_stale_old_payload() {
+        let alpha = entity("alpha", 0x11);
+        let never_published = revise(&alpha, 0x22);
+        let genesis = change(
+            "add alpha",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: alpha }],
+                ..ChangeSpec::default()
+            },
+        );
+        let stale = change(
+            "revise a payload this lineage never published",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: never_published.clone(),
+                    new: revise(&never_published, 0x33),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, stale]);
+        assert_agreed_refusal(
+            "stale entity modification",
+            &changes,
+            &targets,
+            "stale old payload for entity",
+        );
+    }
+
+    #[test]
+    fn refuses_an_entity_removal_with_a_stale_old_payload() {
+        let alpha = entity("alpha", 0x11);
+        let genesis = change(
+            "add alpha",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: alpha.clone() }],
+                ..ChangeSpec::default()
+            },
+        );
+        let stale = change(
+            "remove a payload this lineage never published",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: revise(&alpha, 0x44),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, stale]);
+        assert_agreed_refusal(
+            "stale entity removal",
+            &changes,
+            &targets,
+            "stale old payload for removed entity",
+        );
+    }
+
+    #[test]
+    fn refuses_a_relation_its_lineage_already_carries() {
+        let alpha = entity("alpha", 0x11);
+        let beta = entity("beta", 0x21);
+        let call = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::Entity(beta.id),
+            "calls",
+        );
+        let genesis = change(
+            "add both entities and the call",
+            ChangeSpec {
+                entity_deltas: vec![
+                    EntityDelta::Added { new: alpha },
+                    EntityDelta::Added { new: beta },
+                ],
+                relation_deltas: vec![RelationDelta::Added { new: call.clone() }],
+                ..ChangeSpec::default()
+            },
+        );
+        let duplicate = change(
+            "add the same relation again",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                relation_deltas: vec![RelationDelta::Added { new: call }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, duplicate]);
+        assert_agreed_refusal(
+            "duplicate relation",
+            &changes,
+            &targets,
+            "adds existing relation",
+        );
+    }
+
+    #[test]
+    fn refuses_a_relation_removal_with_a_stale_old_payload() {
+        let alpha = entity("alpha", 0x11);
+        let beta = entity("beta", 0x21);
+        let call = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::Entity(beta.id),
+            "calls",
+        );
+        let mut drifted = call.clone();
+        drifted.confidence = 0.5;
+        let genesis = change(
+            "add both entities and the call",
+            ChangeSpec {
+                entity_deltas: vec![
+                    EntityDelta::Added { new: alpha },
+                    EntityDelta::Added { new: beta },
+                ],
+                relation_deltas: vec![RelationDelta::Added { new: call }],
+                ..ChangeSpec::default()
+            },
+        );
+        let stale = change(
+            "remove a relation payload this lineage never published",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                relation_deltas: vec![RelationDelta::Removed { old: drifted }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, stale]);
+        assert_agreed_refusal(
+            "stale relation removal",
+            &changes,
+            &targets,
+            "stale old payload for removed relation",
+        );
+    }
+
+    /// The dangling scan narrowed to touched endpoints must still catch a
+    /// removal that orphans a relation the same change never mentioned.
+    #[test]
+    fn refuses_an_entity_removal_that_orphans_an_untouched_relation() {
+        let alpha = entity("alpha", 0x11);
+        let beta = entity("beta", 0x21);
+        let call = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::Entity(beta.id),
+            "calls",
+        );
+        let genesis = change(
+            "add both entities and the call",
+            ChangeSpec {
+                entity_deltas: vec![
+                    EntityDelta::Added { new: alpha },
+                    EntityDelta::Added { new: beta.clone() },
+                ],
+                relation_deltas: vec![RelationDelta::Added { new: call }],
+                ..ChangeSpec::default()
+            },
+        );
+        let orphaning = change(
+            "remove beta while the call still names it",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                entity_deltas: vec![EntityDelta::Removed { old: beta }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, orphaning]);
+        assert_agreed_refusal(
+            "orphaned relation",
+            &changes,
+            &targets,
+            "dangling from entity",
+        );
+    }
+
+    #[test]
+    fn refuses_a_relation_added_onto_an_absent_entity() {
+        let alpha = entity("alpha", 0x11);
+        let missing = entity("missing", 0x81);
+        let call = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::Entity(missing.id),
+            "calls",
+        );
+        let genesis = change(
+            "add only one endpoint",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: alpha }],
+                ..ChangeSpec::default()
+            },
+        );
+        let dangling = change(
+            "add a relation naming an entity nobody published",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                relation_deltas: vec![RelationDelta::Added { new: call }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, dangling]);
+        assert_agreed_refusal(
+            "relation onto an absent entity",
+            &changes,
+            &targets,
+            "dangling from entity",
+        );
+    }
+
+    #[test]
+    fn refuses_an_external_reference_removal_that_orphans_a_relation() {
+        let alpha = entity("alpha", 0x11);
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let import = relation(
+            GraphNodeId::Entity(alpha.id),
+            GraphNodeId::ExternalReference(reference.id),
+            "imports",
+        );
+        let genesis = change(
+            "add the entity, the reference, and the import",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: alpha }],
+                relation_deltas: vec![RelationDelta::Added { new: import }],
+                external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let orphaning = change(
+            "drop the reference while the import still names it",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed { old: reference }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, orphaning]);
+        assert_agreed_refusal(
+            "orphaned external import",
+            &changes,
+            &targets,
+            "dangling from external reference",
+        );
+    }
+
+    #[test]
+    fn refuses_an_invalid_repository_tree_transition() {
+        let (artifact, entry) = blob("src/root.rs", 0xa3, 0x41);
+        let (_, wrong_path) = blob("src/other.rs", 0xa4, 0x41);
+        let genesis = change(
+            "add one file",
+            ChangeSpec {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: artifact,
+                    new: entry,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let tampered = change(
+            "update the file from a path it never occupied",
+            ChangeSpec {
+                parents: vec![genesis.id],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: artifact,
+                    old: wrong_path,
+                    new: blob("src/root.rs", 0xa3, 0x99).1,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        let (changes, targets) = history(vec![genesis, tampered]);
+        assert_agreed_refusal(
+            "tampered tree transition",
+            &changes,
+            &targets,
+            "invalid repository tree transition",
+        );
+    }
+
+    #[test]
+    fn refuses_a_change_whose_first_parent_is_absent() {
+        let orphan = change(
+            "claim a lineage nobody persisted",
+            ChangeSpec {
+                parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xaa; 32]))],
+                ..ChangeSpec::default()
+            },
+        );
+        let (changes, targets) = history(vec![orphan]);
+        assert_replays_agree("absent first parent", &changes, &targets)
+            .expect_err("a change whose first parent is not persisted must be refused");
+    }
+
+    /// Both replays refuse a first-parent cycle. Which change each names is not
+    /// a contract: the per-change walk reports the head it started from, while
+    /// one forest pass has no head to start from at all.
+    #[test]
+    fn refuses_a_first_parent_cycle() {
+        let left = SemanticChangeId::from_hash(Hash256::from_bytes([0xb1; 32]));
+        let right = SemanticChangeId::from_hash(Hash256::from_bytes([0xb2; 32]));
+        let mut changes = HashMap::new();
+        for (id, parent) in [(left, right), (right, left)] {
+            let mut cyclic = change("cyclic", ChangeSpec::default());
+            cyclic.id = id;
+            cyclic.parents = vec![parent];
+            changes.insert(id, cyclic);
+        }
+        let targets = vec![left, right];
+
+        let legacy = legacy_outcome(&changes, &targets)
+            .expect_err("the per-change replay must refuse a first-parent cycle");
+        let incremental = incremental_outcome(&changes, &targets)
+            .expect_err("the incremental replay must refuse a first-parent cycle");
+        for (label, error) in [("per-change", legacy), ("incremental", incremental)] {
+            assert!(
+                error.contains("cycle in first-parent history"),
+                "{label} replay refused a cycle for the wrong reason: {error}"
+            );
+        }
+    }
+
+    /// A deep trunk fanning out to many tips, which is the shape whose
+    /// per-change replay cost grows with tips times history.
+    #[test]
+    fn replays_a_deep_history_with_many_tips() {
+        const TRUNK: usize = 400;
+        const TIPS: usize = 40;
+
+        let seed = entity("trunk", 0x11);
+        let mut changes = vec![change(
+            "seed the trunk",
+            ChangeSpec {
+                entity_deltas: vec![EntityDelta::Added { new: seed.clone() }],
+                ..ChangeSpec::default()
+            },
+        )];
+        let mut live = seed;
+        for step in 0..TRUNK {
+            let next = revise(&live, u8::try_from(step % 200).unwrap().wrapping_add(1));
+            let parent = changes.last().expect("the trunk always has a head").id;
+            changes.push(change(
+                &format!("trunk step {step}"),
+                ChangeSpec {
+                    parents: vec![parent],
+                    entity_deltas: vec![EntityDelta::Modified {
+                        old: live.clone(),
+                        new: next.clone(),
+                    }],
+                    ..ChangeSpec::default()
+                },
+            ));
+            live = next;
+        }
+
+        let head = changes.last().expect("the trunk always has a head").id;
+        for tip in 0..TIPS {
+            let (artifact, entry) = blob(&format!("src/tip{tip}.rs"), 0xb000 + tip as u128, 0x41);
+            changes.push(change(
+                &format!("tip {tip}"),
+                ChangeSpec {
+                    parents: vec![head],
+                    tree_deltas: vec![TreeDelta::Added {
+                        artifact_id: artifact,
+                        new: entry,
+                    }],
+                    ..ChangeSpec::default()
+                },
+            ));
+        }
+
+        let (changes, targets) = history(changes);
+        assert_eq!(changes.len(), TRUNK + 1 + TIPS);
+        validate_first_parent_history(&changes, &targets)
+            .expect("a deep history with many tips must replay");
+
+        // Every tip shares the whole trunk, so the lineage is collected once
+        // rather than once per tip.
+        let lineage = collect_first_parent_lineage(&changes, &targets).unwrap();
+        assert_eq!(lineage.len(), changes.len());
+    }
 }
