@@ -1843,10 +1843,7 @@ struct GitProjectionTreeTarget {
 
 enum GitProjectionTreeFrame {
     Enter(SemanticChangeId),
-    Exit {
-        change_id: SemanticChangeId,
-        inverse: Vec<TreeDelta>,
-    },
+    Exit(SemanticChangeId),
 }
 
 /// Cross-check every Git projection against semantic tree identity in one
@@ -1859,7 +1856,9 @@ enum GitProjectionTreeFrame {
 /// each change while backtracking between branches. Every forward and inverse
 /// step still passes through `ResolvedTree::apply`, so stable artifact
 /// identity, old-side equality, path occupancy, and rename-cycle semantics
-/// remain the same fail-closed contract as ordinary graph replay.
+/// remain the same fail-closed contract as ordinary graph replay. Exit frames
+/// retain only change identities; inverse deltas are built one change at a
+/// time so a deep history does not duplicate its whole delta chain on-stack.
 fn validate_git_projection_tree_replay<F>(
     snapshot: &GraphSnapshot,
     targets: &BTreeMap<SemanticChangeId, GitProjectionTreeTarget>,
@@ -1929,17 +1928,23 @@ where
                     .into());
                 }
 
-                frames.push(GitProjectionTreeFrame::Exit {
-                    change_id,
-                    inverse: change.tree_deltas.iter().map(TreeDelta::inverse).collect(),
-                });
+                frames.push(GitProjectionTreeFrame::Exit(change_id));
                 if let Some(next) = children.get(&change_id) {
                     for child in next.iter().rev() {
                         frames.push(GitProjectionTreeFrame::Enter(*child));
                     }
                 }
             }
-            GitProjectionTreeFrame::Exit { change_id, inverse } => {
+            GitProjectionTreeFrame::Exit(change_id) => {
+                let change = snapshot
+                    .changes
+                    .get(&change_id)
+                    .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+                let inverse = change
+                    .tree_deltas
+                    .iter()
+                    .map(TreeDelta::inverse)
+                    .collect::<Vec<_>>();
                 semantic_tree = semantic_tree.apply(&inverse).map_err(|error| {
                     storage(format!(
                         "failed to rewind validated Git projection tree at change {change_id}: {error}"
