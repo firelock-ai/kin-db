@@ -38,7 +38,6 @@ use crate::admission::{
 };
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
-use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
@@ -50,6 +49,7 @@ use crate::storage::backend::{
     StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
+use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 
 /// Persisted repository-envelope schema.
 pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;

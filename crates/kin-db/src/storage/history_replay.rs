@@ -252,7 +252,10 @@ pub(crate) fn validate_first_parent_history(
             // Every first parent of a lineage member is itself a lineage
             // member, so this edge always stays inside the walked forest.
             Some(first_parent) => {
-                children.entry(*first_parent).or_default().insert(*change_id);
+                children
+                    .entry(*first_parent)
+                    .or_default()
+                    .insert(*change_id);
             }
             None => {
                 roots.insert(*change_id);
@@ -673,10 +676,7 @@ mod tests {
     impl ChangeStore for LegacyReplayStore {
         type Error = KinDbError;
 
-        fn get_change(
-            &self,
-            id: &SemanticChangeId,
-        ) -> Result<Option<SemanticChange>, Self::Error> {
+        fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, Self::Error> {
             Ok(self.changes.get(id).cloned())
         }
 
@@ -684,10 +684,7 @@ mod tests {
             unimplemented!("the replay under test never reads entity history")
         }
 
-        fn get_entity_revisions(
-            &self,
-            _id: &EntityId,
-        ) -> Result<Vec<EntityRevision>, Self::Error> {
+        fn get_entity_revisions(&self, _id: &EntityId) -> Result<Vec<EntityRevision>, Self::Error> {
             unimplemented!("the replay under test never reads entity revisions")
         }
 
@@ -869,7 +866,10 @@ mod tests {
 
     fn history(
         changes: Vec<SemanticChange>,
-    ) -> (HashMap<SemanticChangeId, SemanticChange>, Vec<SemanticChangeId>) {
+    ) -> (
+        HashMap<SemanticChangeId, SemanticChange>,
+        Vec<SemanticChangeId>,
+    ) {
         let mut targets: Vec<_> = changes.iter().map(|change| change.id).collect();
         targets.sort_unstable();
         targets.dedup();
@@ -936,7 +936,6 @@ mod tests {
                     artifact_id: leaf_artifact,
                     new: leaf_entry.clone(),
                 }],
-                ..ChangeSpec::default()
             },
         );
         // A sibling of `trunk` off the same parent. Its state must not carry any
@@ -1367,6 +1366,53 @@ mod tests {
         }
     }
 
+    /// Measure the replaced per-change replay against the single pass.
+    ///
+    /// Ignored by default: it is a shape measurement for the owning lane, not a
+    /// gate, and a wall-clock assertion would be flaky under a loaded host.
+    /// Numbers from it are local dev-lane observations and are not citable.
+    #[test]
+    #[ignore = "timing measurement, run explicitly"]
+    fn measures_per_change_against_single_pass_replay() {
+        /// Above this the per-change replay is too slow to keep the measurement
+        /// bounded, which is the finding rather than a limitation of it.
+        const PER_CHANGE_CEILING: usize = 1_600;
+
+        for trunk in [200usize, 400, 800, 1_600, 3_200] {
+            let (changes, targets) = deep_history(trunk, 40);
+            let legacy = (changes.len() <= PER_CHANGE_CEILING).then(|| {
+                let started = Instant::now();
+                legacy_outcome(&changes, &targets).expect("the fixture is a valid history");
+                started.elapsed()
+            });
+
+            // Repeated so allocator warmup is not read as replay cost at the
+            // sub-millisecond sizes.
+            let mut single_pass = Duration::MAX;
+            for _ in 0..5 {
+                let started = Instant::now();
+                validate_first_parent_history(&changes, &targets)
+                    .expect("the fixture is a valid history");
+                single_pass = single_pass.min(started.elapsed());
+            }
+
+            match legacy {
+                Some(legacy) => println!(
+                    "changes={} per_change={:?} single_pass={:?} speedup={:.1}x",
+                    changes.len(),
+                    legacy,
+                    single_pass,
+                    legacy.as_secs_f64() / single_pass.as_secs_f64().max(f64::EPSILON)
+                ),
+                None => println!(
+                    "changes={} per_change=skipped single_pass={:?}",
+                    changes.len(),
+                    single_pass
+                ),
+            }
+        }
+    }
+
     /// A deep trunk fanning out to many tips, which is the shape whose
     /// per-change replay cost grows with tips times history.
     #[test]
@@ -1374,6 +1420,24 @@ mod tests {
         const TRUNK: usize = 400;
         const TIPS: usize = 40;
 
+        let (changes, targets) = deep_history(TRUNK, TIPS);
+        assert_eq!(changes.len(), TRUNK + 1 + TIPS);
+        validate_first_parent_history(&changes, &targets)
+            .expect("a deep history with many tips must replay");
+
+        // Every tip shares the whole trunk, so the lineage is collected once
+        // rather than once per tip.
+        let lineage = collect_first_parent_lineage(&changes, &targets).unwrap();
+        assert_eq!(lineage.len(), changes.len());
+    }
+
+    fn deep_history(
+        trunk_steps: usize,
+        tips: usize,
+    ) -> (
+        HashMap<SemanticChangeId, SemanticChange>,
+        Vec<SemanticChangeId>,
+    ) {
         let seed = entity("trunk", 0x11);
         let mut changes = vec![change(
             "seed the trunk",
@@ -1383,7 +1447,7 @@ mod tests {
             },
         )];
         let mut live = seed;
-        for step in 0..TRUNK {
+        for step in 0..trunk_steps {
             let next = revise(&live, u8::try_from(step % 200).unwrap().wrapping_add(1));
             let parent = changes.last().expect("the trunk always has a head").id;
             changes.push(change(
@@ -1401,8 +1465,12 @@ mod tests {
         }
 
         let head = changes.last().expect("the trunk always has a head").id;
-        for tip in 0..TIPS {
-            let (artifact, entry) = blob(&format!("src/tip{tip}.rs"), 0xb000 + tip as u128, 0x41);
+        for tip in 0..tips {
+            let (artifact, entry) = blob(
+                &format!("src/tip{tip}.rs"),
+                0xb000 + u128::try_from(tip).unwrap(),
+                0x41,
+            );
             changes.push(change(
                 &format!("tip {tip}"),
                 ChangeSpec {
@@ -1416,14 +1484,6 @@ mod tests {
             ));
         }
 
-        let (changes, targets) = history(changes);
-        assert_eq!(changes.len(), TRUNK + 1 + TIPS);
-        validate_first_parent_history(&changes, &targets)
-            .expect("a deep history with many tips must replay");
-
-        // Every tip shares the whole trunk, so the lineage is collected once
-        // rather than once per tip.
-        let lineage = collect_first_parent_lineage(&changes, &targets).unwrap();
-        assert_eq!(lineage.len(), changes.len());
+        history(changes)
     }
 }
