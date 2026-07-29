@@ -73,10 +73,18 @@ pub(crate) struct ReplayProgress {
     validated: usize,
     started: Instant,
     last_report: Instant,
+    /// Held per instance rather than read from the constant so a test can drive
+    /// the periodic emit without waiting out a real interval.
+    interval: Duration,
+    reports: usize,
 }
 
 impl ReplayProgress {
     pub(crate) fn new(phase: &'static str, total: usize) -> Self {
+        Self::with_interval(phase, total, PROGRESS_INTERVAL)
+    }
+
+    fn with_interval(phase: &'static str, total: usize, interval: Duration) -> Self {
         let now = Instant::now();
         if total >= PROGRESS_MIN_TOTAL {
             tracing::info!(
@@ -91,6 +99,8 @@ impl ReplayProgress {
             validated: 0,
             started: now,
             last_report: now,
+            interval,
+            reports: 0,
         }
     }
 
@@ -101,10 +111,11 @@ impl ReplayProgress {
             return;
         }
         let now = Instant::now();
-        if now.duration_since(self.last_report) < PROGRESS_INTERVAL {
+        if now.duration_since(self.last_report) < self.interval {
             return;
         }
         self.last_report = now;
+        self.reports += 1;
         let elapsed_secs = self.started.elapsed().as_secs();
         let (phase, validated, total) = (self.phase, self.validated, self.total);
         tracing::info!(
@@ -127,6 +138,30 @@ impl ReplayProgress {
             validated,
             elapsed_secs,
             "kindb: validated {validated} changes in {elapsed_secs}s"
+        );
+    }
+
+    #[cfg(test)]
+    fn reports(&self) -> usize {
+        self.reports
+    }
+
+    /// Close the phase out when the replay refused.
+    ///
+    /// The error itself propagates, but without this the reporter opens a phase
+    /// and never closes it, so a long refused admission reads as a run that
+    /// simply stopped emitting. An observable terminus is the whole point.
+    pub(crate) fn abandon(self) {
+        if self.total < PROGRESS_MIN_TOTAL {
+            return;
+        }
+        let elapsed_secs = self.started.elapsed().as_secs();
+        let (phase, validated) = (self.phase, self.validated);
+        tracing::info!(
+            phase,
+            validated,
+            elapsed_secs,
+            "kindb: refused after validating {validated} changes in {elapsed_secs}s"
         );
     }
 }
@@ -263,13 +298,33 @@ pub(crate) fn validate_first_parent_history(
         }
     }
 
+    let mut progress = ReplayProgress::new("history_replay", lineage.len());
+    match walk_first_parent_forest(changes, &lineage, &children, &roots, &mut progress) {
+        Ok(()) => {
+            progress.finish();
+            Ok(())
+        }
+        Err(error) => {
+            progress.abandon();
+            Err(error)
+        }
+    }
+}
+
+/// Enter and unwind every lineage member exactly once, carrying one state.
+fn walk_first_parent_forest(
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
+    lineage: &BTreeSet<SemanticChangeId>,
+    children: &BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>>,
+    roots: &BTreeSet<SemanticChangeId>,
+    progress: &mut ReplayProgress,
+) -> Result<(), KinDbError> {
     let mut frames = Vec::with_capacity(lineage.len().saturating_mul(2));
     for root in roots.iter().rev() {
         frames.push(Frame::Enter(*root));
     }
     let mut visited = HashSet::with_capacity(lineage.len());
     let mut state = ReplayState::default();
-    let mut progress = ReplayProgress::new("history_replay", lineage.len());
     while let Some(frame) = frames.pop() {
         match frame {
             Frame::Enter(change_id) => {
@@ -311,7 +366,6 @@ pub(crate) fn validate_first_parent_history(
             "first-parent history replay did not restore the empty root state".to_string(),
         ));
     }
-    progress.finish();
     Ok(())
 }
 
@@ -358,9 +412,17 @@ fn lineage_change<'a>(
 /// Apply or unwind one change's complete transition.
 ///
 /// Forward order is entities, external references, relations, then the
-/// repository tree. Rewind is the exact reverse, which matters when one change
-/// touches the same identity twice: unwinding in author order would check the
-/// second delta's inverse against a state the first delta had already undone.
+/// repository tree. Rewind is the exact reverse.
+///
+/// Reverse order is not load-bearing today, and the reason is worth stating so
+/// nobody reasons from the wrong premise. Within-order would only matter if one
+/// change carried two deltas for one identity, and the model forbids exactly
+/// that: change identity refuses a second delta for the same entity, relation,
+/// external reference, or artifact, so no validly constructed change can reach
+/// this function with a double touch. `a_change_cannot_touch_one_identity_twice`
+/// pins that. Rewinding in reverse anyway keeps the unwind a strict mirror of the
+/// forward application, so it stays correct if that rule is ever relaxed rather
+/// than depending on it.
 fn apply_change(
     state: &mut ReplayState,
     change: &SemanticChange,
@@ -550,8 +612,18 @@ fn apply_relation_delta(
 fn apply_tree_deltas(
     state: &mut ReplayState,
     change_id: SemanticChangeId,
-    deltas: &[kin_model::TreeDelta],
+    deltas: &[TreeDelta],
 ) -> Result<(), KinDbError> {
+    // `ResolvedTree::apply` full-clones both of its indexes unconditionally, so
+    // calling it for a change that touches no artifact costs two whole-tree
+    // clones to produce the tree it was already holding. Most changes in a real
+    // history touch no artifact at all, and this pass applies deltas in both
+    // directions, so skipping the empty case removes the dominant per-change
+    // allocation without changing the result: applying no deltas validates
+    // nothing and returns an equal tree.
+    if deltas.is_empty() {
+        return Ok(());
+    }
     state.tree = state.tree.apply(deltas).map_err(|error| {
         ModelError::Conflict(format!(
             "invalid repository tree transition in change {change_id}: {error}"
@@ -738,8 +810,18 @@ mod tests {
     ///
     /// Message equality is asserted, not just the accept/refuse split, because
     /// an operator reading a refusal must not be able to tell which
-    /// implementation produced it. Every fixture here carries exactly one
-    /// violation so the reported identity is determined.
+    /// implementation produced it.
+    ///
+    /// It holds only for **single-violation** histories, which is why every
+    /// fixture here carries exactly one, and it is not a general property of the
+    /// two paths. Two known divergence classes, both on already-refused input:
+    /// the per-change replay resolves every change's graph deltas before any
+    /// change's tree deltas while this pass interleaves per change, so a history
+    /// with both a tree fault and a graph fault can report either first; and a
+    /// history with two dangling relations names whichever the underlying
+    /// collection yields, a `HashMap` order for the per-change scan against the
+    /// minimum `RelationId` here. Verdict equality is the property the version
+    /// gate depends on, and that holds unconditionally.
     fn assert_replays_agree(
         label: &str,
         changes: &HashMap<SemanticChangeId, SemanticChange>,
@@ -880,6 +962,37 @@ mod tests {
         (map, targets)
     }
 
+    /// The periodic emit is gated on a five-second interval, so a fixture that
+    /// finishes in milliseconds crosses the count threshold and still never
+    /// reaches the emit. Drive the reporter directly with a zero interval so the
+    /// branch actually executes, and hold the threshold behavior with it.
+    #[test]
+    fn progress_reports_periodically_once_past_the_threshold() {
+        let mut reporting =
+            ReplayProgress::with_interval("test", PROGRESS_MIN_TOTAL, Duration::ZERO);
+        for _ in 0..PROGRESS_CLOCK_STRIDE * 2 {
+            reporting.record();
+        }
+        assert_eq!(
+            reporting.reports(),
+            2,
+            "one report per stride is expected once the interval never blocks"
+        );
+        reporting.finish();
+
+        let mut below =
+            ReplayProgress::with_interval("test", PROGRESS_MIN_TOTAL - 1, Duration::ZERO);
+        for _ in 0..PROGRESS_CLOCK_STRIDE * 2 {
+            below.record();
+        }
+        assert_eq!(
+            below.reports(),
+            0,
+            "a small replay must stay silent no matter how fast the interval elapses"
+        );
+        below.abandon();
+    }
+
     /// A branching, merging history exercising every carried state at once.
     #[test]
     fn incremental_and_per_change_replay_agree_on_a_branching_history() {
@@ -972,6 +1085,77 @@ mod tests {
         let (changes, targets) = history(vec![genesis, trunk, sibling, merge]);
         assert_replays_agree("branching history", &changes, &targets)
             .expect("a coherent branching history must replay");
+    }
+
+    /// The rewind's within-change ordering can never be exercised, because the
+    /// model refuses a change that carries two deltas for one identity.
+    ///
+    /// This is the fixture an earlier pass tried to write as a differential case
+    /// and could not: change identity itself rejects the shape. Pinning the
+    /// refusal here is what makes the ordering argument in `apply_change` checkable
+    /// rather than asserted, and it fails loudly if the rule is ever relaxed, at
+    /// which point that ordering stops being merely defensive.
+    #[test]
+    fn a_change_cannot_touch_one_identity_twice() {
+        let first = entity("twice", 0x11);
+        let revised = revise(&first, 0x12);
+        let mut double = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("history-replay-test"),
+            message: "revise then drop the same identity".to_string(),
+            entity_deltas: vec![
+                EntityDelta::Modified {
+                    old: first,
+                    new: revised.clone(),
+                },
+                EntityDelta::Removed { old: revised },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+
+        let error = compute_semantic_change_id(&double)
+            .expect_err("two deltas for one entity must not yield a change identity");
+        assert!(
+            error.to_string().contains("more than one delta for entity"),
+            "unexpected double-touch refusal: {error}"
+        );
+
+        // The same prohibition holds for the tree, so no delta domain can reach
+        // the replay with a double touch.
+        double.entity_deltas = Vec::new();
+        let (artifact, entry) = blob("src/twice.rs", 0xc1, 0x41);
+        double.tree_deltas = vec![
+            TreeDelta::Added {
+                artifact_id: artifact,
+                new: entry.clone(),
+            },
+            TreeDelta::Removed {
+                artifact_id: artifact,
+                old: entry,
+            },
+        ];
+        let error = compute_semantic_change_id(&double)
+            .expect_err("two deltas for one artifact must not yield a change identity");
+        assert!(
+            error
+                .to_string()
+                .contains("more than one delta for artifact"),
+            "unexpected double-touch refusal: {error}"
+        );
     }
 
     /// The property a broken rewind breaks first: sibling branches that each

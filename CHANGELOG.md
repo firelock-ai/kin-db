@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - History and Git-projection replay now report `validated/total` and elapsed
   seconds periodically, so a long admission is observable instead of silent.
 
+## [0.7.3] - 2026-07-29
+
 ### Fixed
 
 - Updated the exact `kin-model` dependency to 0.7.1 so an unlabelled

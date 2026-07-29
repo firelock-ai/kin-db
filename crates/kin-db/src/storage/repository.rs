@@ -1902,13 +1902,44 @@ where
         }
     }
 
+    let mut progress = ReplayProgress::new("git_projection_replay", targets.len());
+    match walk_git_projection_forest(
+        snapshot,
+        targets,
+        &children,
+        &roots,
+        &mut materialize,
+        &mut progress,
+    ) {
+        Ok(()) => {
+            progress.finish();
+            Ok(())
+        }
+        Err(error) => {
+            progress.abandon();
+            Err(error)
+        }
+    }
+}
+
+/// Enter and unwind every projected change once, carrying one resolved tree.
+fn walk_git_projection_forest<F>(
+    snapshot: &GraphSnapshot,
+    targets: &BTreeMap<SemanticChangeId, GitProjectionTreeTarget>,
+    children: &BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>>,
+    roots: &BTreeSet<SemanticChangeId>,
+    materialize: &mut F,
+    progress: &mut ReplayProgress,
+) -> Result<(), KinDbError>
+where
+    F: FnMut(GitObjectId) -> Result<BTreeMap<RepoPath, TreeEntry>, KinDbError>,
+{
     let mut frames = Vec::with_capacity(targets.len().saturating_mul(2));
     for root in roots.iter().rev() {
         frames.push(GitProjectionTreeFrame::Enter(*root));
     }
     let mut visited = BTreeSet::new();
     let mut semantic_tree = ResolvedTree::default();
-    let mut progress = ReplayProgress::new("git_projection_replay", targets.len());
     while let Some(frame) = frames.pop() {
         match frame {
             GitProjectionTreeFrame::Enter(change_id) => {
@@ -1986,7 +2017,6 @@ where
             "Git projection tree traversal did not restore the empty root state".to_string(),
         ));
     }
-    progress.finish();
     Ok(())
 }
 
