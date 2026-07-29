@@ -1415,10 +1415,19 @@ mod tests {
 
     /// A deep trunk fanning out to many tips, which is the shape whose
     /// per-change replay cost grows with tips times history.
+    ///
+    /// Sized past `PROGRESS_MIN_TOTAL` on purpose, so the progress reporter's
+    /// start, stride, and finish paths all execute here rather than only in the
+    /// ignored measurement.
     #[test]
     fn replays_a_deep_history_with_many_tips() {
-        const TRUNK: usize = 400;
+        const TRUNK: usize = 1_200;
         const TIPS: usize = 40;
+
+        assert!(
+            TRUNK + 1 + TIPS > PROGRESS_MIN_TOTAL,
+            "the fixture must cross the progress threshold to exercise reporting"
+        );
 
         let (changes, targets) = deep_history(TRUNK, TIPS);
         assert_eq!(changes.len(), TRUNK + 1 + TIPS);
