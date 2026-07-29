@@ -38,6 +38,7 @@ use crate::admission::{
 };
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
+use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
@@ -1907,6 +1908,7 @@ where
     }
     let mut visited = BTreeSet::new();
     let mut semantic_tree = ResolvedTree::default();
+    let mut progress = ReplayProgress::new("git_projection_replay", targets.len());
     while let Some(frame) = frames.pop() {
         match frame {
             GitProjectionTreeFrame::Enter(change_id) => {
@@ -1942,6 +1944,7 @@ where
                     .into());
                 }
 
+                progress.record();
                 frames.push(GitProjectionTreeFrame::Exit(change_id));
                 if let Some(next) = children.get(&change_id) {
                     for child in next.iter().rev() {
@@ -1983,6 +1986,7 @@ where
             "Git projection tree traversal did not restore the empty root state".to_string(),
         ));
     }
+    progress.finish();
     Ok(())
 }
 
@@ -2988,10 +2992,19 @@ fn validate_history_replay(
     snapshot: &GraphSnapshot,
     new_changes: &[kin_model::SemanticChange],
 ) -> Result<(), KinDbError> {
+    // One Kahn pass over the whole change map proves the DAG is acyclic and
+    // that every declared parent is persisted. Resolving each change's reachable
+    // order separately re-derives exactly that, so the per-change traversal the
+    // replay below replaces carried no proof this does not already hold.
     topological_change_order(&snapshot.changes)?;
+
+    // Decoding the snapshot into a coherent graph is part of the proof rather
+    // than a convenience: it revalidates storage admission over the
+    // authority-free payload and derives every entity revision timeline, both
+    // of which fail closed. It is one pass over the snapshot, not per change.
     let mut replay_snapshot = snapshot.clone();
     replay_snapshot.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot(replay_snapshot)?;
+    InMemoryGraph::from_snapshot(replay_snapshot)?;
 
     // New transactions validate every admitted tip directly. Reopen has no
     // trusted prior process state, so replay every DAG leaf; together their
@@ -3015,11 +3028,7 @@ fn validate_history_replay(
     };
     validation_targets.sort_unstable();
     validation_targets.dedup();
-    for change_id in validation_targets {
-        graph.build_change_order_at(&change_id)?;
-        graph.resolve_graph_at(&change_id)?;
-    }
-    Ok(())
+    validate_first_parent_history(&snapshot.changes, &validation_targets)
 }
 
 fn topological_change_order(
