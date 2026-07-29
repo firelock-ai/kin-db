@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-29
+
+### Added
+
+- Added `AuthorityPayloadStats` and
+  `RepositoryAuthorityManager::open_with_payload_stats`, returning an
+  immutable open receipt for the exact serialized snapshot and acknowledged
+  delta bytes selected by coherent recovery. The receipt excludes staged,
+  retired, superseded, source-CAS, index, overlay, and backend-metadata bytes
+  and fails closed on inconsistent generations, counts, or arithmetic.
+
 ## [0.7.0] - 2026-07-28
 
 ### Added
