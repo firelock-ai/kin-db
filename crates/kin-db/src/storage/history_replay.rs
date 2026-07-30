@@ -1134,9 +1134,48 @@ mod tests {
             "unexpected double-touch refusal: {error}"
         );
 
-        // The same prohibition holds for the tree, so no delta domain can reach
-        // the replay with a double touch.
+        let relation_left = entity("relation_left", 0x21);
+        let relation_right = entity("relation_right", 0x22);
+        let call = relation(
+            GraphNodeId::Entity(relation_left.id),
+            GraphNodeId::Entity(relation_right.id),
+            "calls twice",
+        );
         double.entity_deltas = Vec::new();
+        double.relation_deltas = vec![
+            RelationDelta::Added { new: call.clone() },
+            RelationDelta::Removed { old: call },
+        ];
+        let error = compute_semantic_change_id(&double)
+            .expect_err("two deltas for one relation must not yield a change identity");
+        assert!(
+            error
+                .to_string()
+                .contains("more than one delta for relation"),
+            "unexpected double-touch refusal: {error}"
+        );
+
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        double.relation_deltas = Vec::new();
+        double.external_reference_deltas = vec![
+            ExternalReferenceDelta::Added {
+                new: reference.clone(),
+            },
+            ExternalReferenceDelta::Removed { old: reference },
+        ];
+        let error = compute_semantic_change_id(&double)
+            .expect_err("two deltas for one external reference must not yield a change identity");
+        assert!(
+            error
+                .to_string()
+                .contains("more than one delta for external reference"),
+            "unexpected double-touch refusal: {error}"
+        );
+
+        // The same prohibition holds for the tree, so every delta domain is
+        // pinned against reaching replay with a double touch.
+        double.external_reference_deltas = Vec::new();
         let (artifact, entry) = blob("src/twice.rs", 0xc1, 0x41);
         double.tree_deltas = vec![
             TreeDelta::Added {
