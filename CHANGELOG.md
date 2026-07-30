@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.4] - 2026-07-29
+## [0.7.5] - 2026-07-30
 
 ### Fixed
 
@@ -27,6 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   equality and each binary rebinds to its own value. That is inherent to
   equality-versioned records rather than new here, but this is the first change
   to move the version, so it is the first release where it is reachable.
+
+## [0.7.4] - 2026-07-29
+
+### Changed
+
+- Repository admission and every unproven authority open now replay history in
+  one first-parent forest pass instead of resolving the whole graph at each
+  validated change. The per-change replay walked that change's first-parent chain
+  to genesis, cloning every semantic change payload it touched, and rescanned the
+  complete relation set after every change, so a linear history cost
+  `O(history^2)` in walked changes. Each change is now validated once against the
+  state its own lineage published, unwound through its own delta inverses while
+  backtracking between branches, with the dangling-endpoint check narrowed to the
+  relations a change asserted plus the endpoint nodes it dropped. Entity,
+  relation, external-reference, and tree transitions keep the same fail-closed
+  refusals.
+
+### Added
+
+- History and Git-projection replay now report `validated/total` and elapsed
+  seconds periodically, so a long admission is observable instead of silent.
 
 ## [0.7.3] - 2026-07-29
 
