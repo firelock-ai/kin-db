@@ -47,6 +47,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          # Downstream release artifacts link this crate statically against musl,
+          # so musl is a Linux target this workflow owns rather than a target a
+          # release discovers.
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo registry and sources
         uses: actions/cache@v6
@@ -95,3 +100,29 @@ jobs:
           cargo test -p kin-db --lib --features gcs storage::gcs::tests
           cargo test -p kin-db --lib --features sql storage::sql::tests
           cargo check -p kin-db --all-targets --features archive
+
+      # musl-static C dependencies (ring, oniguruma) need a musl-targeting C
+      # compiler; musl-tools provides musl-gcc. The same install carries the
+      # downstream release build.
+      - name: Install musl C toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Every downstream release links this crate statically against musl, so a
+      # musl-only compile error reaches a release build before it reaches any
+      # test. Cross-check the target here instead. A check resolves and type-
+      # checks without linking, which is where an environment whose C library
+      # exports a different symbol set fails.
+      - name: Cross-check the musl target
+        working-directory: kin-db
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --target x86_64-unknown-linux-musl
+          # Consumers resolve libc through their own lockfiles, not through this
+          # workspace, and the kin release that builds these artifacts resolves
+          # 0.2.186 — the newest libc whose musl module declares no `renameat2`
+          # wrapper. A freshly resolved libc hides that difference, so pin the
+          # consumer's version and check again; without this the guard passes
+          # whether or not the musl path is sound. Move the pin only when the
+          # dependency graph stops resolving it.
+          cargo update -p libc --precise 0.2.186
+          cargo check --workspace --all-targets --target x86_64-unknown-linux-musl
