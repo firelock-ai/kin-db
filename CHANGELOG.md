@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-07-31
+
+### Fixed
+
+- Restored compilation for musl targets. Publishing a retained local directory
+  without replacing a competing target issues `renameat2` with
+  `RENAME_NOREPLACE`, behind a `target_os = "linux"` gate, but `libc` declares
+  that wrapper only for the environments whose C library exports one, which
+  through 0.2.186 excluded musl. musl is `target_os = "linux"`, so a musl build
+  entered the branch and then failed to resolve the function, and because
+  release artifacts are the only musl builds of this crate the error was first
+  seen by a downstream release rather than by any test. Environments without the
+  wrapper now issue the identical kernel call through `syscall` with
+  `SYS_renameat2`, so the no-replace guarantee that makes namespace publication
+  a race one writer can win is enforced by the kernel on every Linux
+  environment instead of by the presence of a C library wrapper. Behavior on
+  glibc, Bionic, Apple platforms, and Windows is unchanged.
+
+  The Linux workflow now cross-checks the musl target, and checks it a second
+  time against the libc version consuming releases resolve, because a freshly
+  resolved libc declares the wrapper for musl and would hide the difference the
+  guard exists to catch.
+
 ## [0.7.5] - 2026-07-30
 
 ### Fixed
