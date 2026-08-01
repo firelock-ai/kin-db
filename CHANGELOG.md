@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-08-01
+
+### Fixed
+
+- Restored native Windows durability and its permanent `windows-latest` CI
+  gate. Capability-relative directories are opened by cap-std through
+  `NtCreateFile`, but `ReOpenFile` accepts only handles created by
+  `CreateFile`; that mismatch made every repository namespace publication fail
+  with `ERROR_ACCESS_DENIED`. Windows now opens the pinned ambient name with
+  write access and no reparse traversal, binds the reopened handle back to the
+  complete retained `FILE_ID_128`, and only then flushes it. Retained directory
+  handles continue to omit delete sharing, so the identity-checked reopen
+  cannot be displaced while it is selected.
+- The derived read index now uses the shared unique-stage atomic writer instead
+  of repeatedly truncating `graph.kidx.tmp`. A still-open or memory-mapped
+  deterministic stage failed its file flush with `ERROR_ACCESS_DENIED` on
+  Windows and cascaded through graph and vector tests; unique stages retain
+  exact-byte post-install verification without that alias.
+
 ## [0.7.8] - 2026-07-31
 
 ### Fixed

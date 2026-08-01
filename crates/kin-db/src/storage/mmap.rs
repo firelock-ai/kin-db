@@ -263,28 +263,83 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
         use windows_sys::Win32::Storage::FileSystem::{
-            ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
         };
 
-        let reopened = unsafe {
-            ReOpenFile(
-                dir.as_raw_handle(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
+        fn identity(file: &File, display_path: &Path) -> Result<(u64, [u8; 16]), KinDbError> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+            };
+
+            let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle().cast(),
+                    FileIdInfo,
+                    (&raw mut info).cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect retained parent directory {} before durable metadata flush: {}",
+                    display_path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if info.VolumeSerialNumber == 0 || info.FileId.Identifier.iter().all(|byte| *byte == 0)
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "retained parent directory {} returned a zero FILE_ID_128 identity",
+                    display_path.display()
+                )));
+            }
+            Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+        }
+
+        // cap-std opens capability-relative directories through NtCreateFile.
+        // ReOpenFile is documented to accept only handles created by
+        // CreateFile, and Windows rejects the NtCreateFile handle with
+        // ERROR_ACCESS_DENIED. Open the already-pinned ambient name through
+        // CreateFile instead, refuse reparse points, and bind the writable
+        // handle back to the complete FILE_ID_128 before flushing it. Every
+        // retained capability in this path omits FILE_SHARE_DELETE, so neither
+        // the selected directory nor its pinned ancestors can be displaced
+        // during this identity-checked reopen.
+        let ambient_path = if display_path.is_absolute() {
+            display_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "failed to resolve retained parent directory {} for durable metadata flush: {error}",
+                        display_path.display()
+                    ))
+                })?
+                .join(display_path)
         };
-        if reopened == INVALID_HANDLE_VALUE {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let writable = options.open(&ambient_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open retained parent directory {} for durable metadata flush: {error}",
+                display_path.display()
+            ))
+        })?;
+        if identity(dir, display_path)? != identity(&writable, display_path)? {
             return Err(KinDbError::StorageError(format!(
-                "failed to reopen retained parent directory {} for durable metadata flush: {}",
-                display_path.display(),
-                std::io::Error::last_os_error()
+                "retained parent directory {} changed before durable metadata flush",
+                display_path.display()
             )));
         }
-        let writable = unsafe { File::from_raw_handle(reopened) };
         writable.sync_all().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to durably flush parent directory {}: {error}",
@@ -1944,6 +1999,38 @@ mod tests {
         atomic_write(&path, &snap).unwrap();
         let loaded = MmapReader::open(&path).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_nt_directory_handle_reopens_by_exact_identity_for_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let retained = open_directory_handle_at(&capability, Path::new("."), directory.path())
+            .expect("capability-relative NtCreateFile directory handle must open");
+
+        sync_directory_handle(&retained, directory.path())
+            .expect("identity-bound CreateFile reopen must flush the retained directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_flush_rejects_a_different_ambient_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let retained = open_directory_handle_at(&capability, Path::new("."), directory.path())
+            .expect("capability-relative NtCreateFile directory handle must open");
+
+        let error = sync_directory_handle(&retained, other.path())
+            .expect_err("a different FILE_ID_128 must never satisfy the flush binding");
+        assert!(error
+            .to_string()
+            .contains("changed before durable metadata flush"));
     }
 
     #[test]
