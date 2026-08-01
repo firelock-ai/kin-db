@@ -191,10 +191,21 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     let Some(parent) = normalized_parent(path) else {
         return Ok(());
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = parent;
-        Ok(())
+        // A normal `File::open` cannot open a Windows directory, and a
+        // read-only directory handle cannot be passed to FlushFileBuffers.
+        // Retain the ambient directory without delete sharing, then let the
+        // shared identity-bound CreateFile reopen acquire the write access
+        // needed for the durability barrier.
+        let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to retain parent directory {} for durable metadata flush: {error}",
+                    parent.display()
+                ))
+            })?;
+        sync_directory_handle(&directory.into_std_file(), parent)
     }
     #[cfg(unix)]
     {
@@ -205,6 +216,14 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
             ))
         })?;
         sync_directory_handle(&dir, parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        Err(KinDbError::StorageError(format!(
+            "durable parent-directory synchronization is unavailable for {} on this platform",
+            parent.display()
+        )))
     }
 }
 
@@ -389,6 +408,19 @@ pub(crate) fn open_regular_nofollow(path: &Path, role: &str) -> Result<File, Kin
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        // OPEN_REPARSE_POINT is the Windows no-follow equivalent. Include
+        // BACKUP_SEMANTICS so a directory or directory reparse point opens as
+        // an object we can inspect and reject as non-regular, instead of
+        // surfacing an ambiguous ERROR_ACCESS_DENIED before the type check.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path).map_err(|error| {
         KinDbError::StorageError(format!(

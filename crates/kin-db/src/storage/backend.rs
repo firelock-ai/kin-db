@@ -3227,27 +3227,6 @@ impl LocalFileBackend {
         component: &std::ffi::OsStr,
         display_path: &Path,
     ) -> Result<cap_std::fs::Dir, KinDbError> {
-        Self::open_local_directory_at_with_sharing(parent, component, display_path, false)
-    }
-
-    fn open_staging_local_directory_at(
-        parent: &cap_std::fs::Dir,
-        component: &std::ffi::OsStr,
-        display_path: &Path,
-    ) -> Result<cap_std::fs::Dir, KinDbError> {
-        // The randomized staging handle must permit its own same-process
-        // rename on Windows. It is never returned as the final retained
-        // capability: publication is followed by an identity-equal reopen
-        // that omits FILE_SHARE_DELETE.
-        Self::open_local_directory_at_with_sharing(parent, component, display_path, true)
-    }
-
-    fn open_local_directory_at_with_sharing(
-        parent: &cap_std::fs::Dir,
-        component: &std::ffi::OsStr,
-        display_path: &Path,
-        allow_delete_share: bool,
-    ) -> Result<cap_std::fs::Dir, KinDbError> {
         use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 
         #[cfg(windows)]
@@ -3260,17 +3239,9 @@ impl LocalFileBackend {
         #[cfg(windows)]
         {
             use cap_std::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-            let mut share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
-            if allow_delete_share {
-                share_mode |= FILE_SHARE_DELETE;
-            }
-            options.share_mode(share_mode);
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
-        #[cfg(not(windows))]
-        let _ = allow_delete_share;
         let file = parent.open_with(component, &options).map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to open retained local directory {} without following links: {error}",
@@ -3297,6 +3268,80 @@ impl LocalFileBackend {
             )));
         }
         Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+    }
+
+    fn open_staging_local_directory_at(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+    ) -> Result<cap_std::fs::Dir, KinDbError> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            validate_windows_source_component(component)?;
+            let _ = parent;
+            let ambient_path = if display_path.is_absolute() {
+                display_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!(
+                            "failed to resolve randomized local directory staging namespace {}: {error}",
+                            display_path.display()
+                        ))
+                    })?
+                    .join(display_path)
+            };
+
+            // cap-std deliberately strips FILE_SHARE_DELETE whenever
+            // `maybe_dir(true)` is set, even if the caller requested it. That
+            // is correct for a retained sandbox capability but makes a
+            // randomized staging directory block its own publication rename.
+            // Open this one transient staging handle through CreateFile with
+            // delete sharing, no leaf reparse traversal, and verify its full
+            // FILE_ID_128 against the parent-relative observations before and
+            // after this call in `bind_existing_local_directory_at`.
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(&ambient_path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to open randomized local directory staging namespace {} without following links: {error}",
+                    display_path.display()
+                ))
+            })?;
+            let metadata = file.metadata().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect randomized local directory staging namespace {}: {error}",
+                    display_path.display()
+                ))
+            })?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(KinDbError::StorageError(format!(
+                    "randomized local directory staging namespace {} is a reparse point",
+                    display_path.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(KinDbError::StorageError(format!(
+                    "randomized local directory staging namespace {} is not a directory",
+                    display_path.display()
+                )));
+            }
+            return Ok(cap_std::fs::Dir::from_std_file(file));
+        }
+
+        #[cfg(not(windows))]
+        {
+            Self::open_local_directory_at(parent, component, display_path)
+        }
     }
 
     fn open_storage_root_capability(
