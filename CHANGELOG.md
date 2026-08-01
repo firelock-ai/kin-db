@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-08-01
+
+### Fixed
+
+- Restored native Windows durability and its permanent `windows-latest` CI
+  gate. Capability-relative directories are opened by cap-std through
+  `NtCreateFile`, but `ReOpenFile` accepts only handles created by
+  `CreateFile`; that mismatch made every repository namespace publication fail
+  with `ERROR_ACCESS_DENIED`. Windows now opens the pinned ambient name with
+  write access and no reparse traversal, binds the reopened handle back to the
+  complete retained `FILE_ID_128`, and only then flushes it. Retained directory
+  handles continue to omit delete sharing, so the identity-checked reopen
+  cannot be displaced while it is selected. Randomized directory stages use
+  one transient, identity-checked `CreateFile` handle that does share delete:
+  cap-std deliberately strips `FILE_SHARE_DELETE` from every `maybe_dir` open,
+  which otherwise makes the retained stage block its own publication rename.
+  Path-based atomic writers now use the same Windows parent-directory barrier
+  instead of silently skipping it, and no-follow regular-file reads open
+  reparse points and directories only far enough to reject every reparse
+  attribute and non-file object type, including non-name-surrogate file
+  reparse points that Rust otherwise classifies as regular files.
+- The derived read index now uses the shared unique-stage atomic writer instead
+  of repeatedly truncating `graph.kidx.tmp`. A still-open or memory-mapped
+  deterministic stage failed its file flush with `ERROR_ACCESS_DENIED` on
+  Windows and cascaded through graph and vector tests; unique stages retain
+  exact-byte post-install verification without that alias.
+
 ## [0.7.8] - 2026-07-31
 
 ### Fixed
