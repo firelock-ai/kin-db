@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which otherwise makes the retained stage block its own publication rename.
   Path-based atomic writers now use the same Windows parent-directory barrier
   instead of silently skipping it, and no-follow regular-file reads open
-  reparse points and directories only far enough to reject their object type.
+  reparse points and directories only far enough to reject every reparse
+  attribute and non-file object type, including non-name-surrogate file
+  reparse points that Rust otherwise classifies as regular files.
 - The derived read index now uses the shared unique-stage atomic writer instead
   of repeatedly truncating `graph.kidx.tmp`. A still-open or memory-mapped
   deterministic stage failed its file flush with `ERROR_ACCESS_DENIED` on

@@ -392,6 +392,13 @@ fn ensure_regular_path_entry(path: &Path, role: &str) -> Result<(), KinDbError> 
             path.display()
         ))
     })?;
+    #[cfg(windows)]
+    if windows_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            path.display()
+        )));
+    }
     if !metadata.file_type().is_file() {
         return Err(KinDbError::StorageError(format!(
             "refusing non-regular {role} {}",
@@ -428,22 +435,34 @@ pub(crate) fn open_regular_nofollow(path: &Path, role: &str) -> Result<File, Kin
             path.display()
         ))
     })?;
-    if !file
-        .metadata()
-        .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to inspect opened {role} {}: {error}",
-                path.display()
-            ))
-        })?
-        .is_file()
-    {
+    let metadata = file.metadata().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect opened {role} {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    if windows_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
         return Err(KinDbError::StorageError(format!(
             "refusing non-regular {role} {}",
             path.display()
         )));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 pub(crate) fn read_regular_bounded(
@@ -2021,6 +2040,62 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn make_non_name_surrogate_file_reparse_point(path: &Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::core::GUID;
+        use windows_sys::Wdk::Storage::FileSystem::IO_REPARSE_TAG_IFSTEST_CONGRUENT;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            REPARSE_GUID_DATA_BUFFER,
+        };
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        std::fs::write(path, b"opaque reparse payload").unwrap();
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).unwrap();
+
+        // A third-party tag has its Microsoft bit clear and therefore uses a
+        // GUID buffer. IFSTEST_CONGRUENT is deliberately not a name-surrogate
+        // tag: Rust classifies the resulting object as a file even though the
+        // kernel exposes FILE_ATTRIBUTE_REPARSE_POINT.
+        let mut reparse = REPARSE_GUID_DATA_BUFFER {
+            ReparseTag: IO_REPARSE_TAG_IFSTEST_CONGRUENT as u32,
+            ReparseDataLength: 1,
+            Reserved: 0,
+            ReparseGuid: GUID::from_u128(0x5f7147ca_25e5_45a5_9d6e_d266077ac517),
+            GenericReparseBuffer: Default::default(),
+        };
+        reparse.GenericReparseBuffer.DataBuffer[0] = b'K';
+        let input_len = std::mem::offset_of!(REPARSE_GUID_DATA_BUFFER, GenericReparseBuffer) + 1;
+        let mut bytes_returned = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                FSCTL_SET_REPARSE_POINT,
+                (&raw const reparse).cast(),
+                input_len as u32,
+                std::ptr::null_mut(),
+                0,
+                &raw mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            result,
+            0,
+            "failed to create non-name-surrogate file reparse point: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     #[test]
     fn atomic_write_and_mmap_read() {
         let tmp = NamedTempFile::new().unwrap();
@@ -2063,6 +2138,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("changed before durable metadata flush"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_open_rejects_non_name_surrogate_file_reparse_point() {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opaque-reparse");
+        make_non_name_surrogate_file_reparse_point(&path);
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert_ne!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "fixture must expose the reparse-point attribute"
+        );
+        assert!(
+            metadata.file_type().is_file(),
+            "fixture must reproduce the non-name-surrogate is_file ambiguity"
+        );
+        let error = ensure_regular_path_entry(&path, "opaque test artifact")
+            .expect_err("path-entry validation must reject every file reparse point");
+        assert!(error.to_string().contains("refusing reparse-point"));
+        let error = open_regular_nofollow(&path, "opaque test artifact")
+            .expect_err("every file reparse point must fail closed");
+        assert!(error.to_string().contains("refusing reparse-point"));
     }
 
     #[test]
