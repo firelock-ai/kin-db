@@ -7160,6 +7160,11 @@ mod tests {
             .open(&path)
             .unwrap();
         file.set_len(MAX_SOURCE_BLOB_BYTES + 1).unwrap();
+        // Windows immutable-source reads deliberately refuse an incompatible
+        // live writer instead of reading a potentially torn body. Close this
+        // fixture's setup handle so the assertion reaches the intended
+        // pre-allocation size gate on every platform.
+        drop(file);
 
         let error = backend
             .load_source_blob("repo-a", digest)
@@ -8891,13 +8896,13 @@ mod tests {
             directory.path().join("detached"),
         )
         .expect_err("Windows capability omits DELETE sharing");
-        assert!(
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
-            ),
-            "unexpected Windows replacement error: {error}"
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "expected Windows ERROR_SHARING_VIOLATION, got: {error}"
         );
+        assert!(directory.path().join("repo-a").is_dir());
+        assert!(!directory.path().join("detached").exists());
         assert!(backend.load_snapshot("repo-a").unwrap().is_some());
     }
 
