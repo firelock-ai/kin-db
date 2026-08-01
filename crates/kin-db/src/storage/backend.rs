@@ -3088,6 +3088,13 @@ impl LocalFileBackend {
                 },
             )?;
         mmap::sync_directory_handle(&staging_clone, &staging_display)?;
+        // The flush-only clone is no longer part of the retained capability.
+        // Drop it before publication: on Windows, a capability-relative clone
+        // may omit FILE_SHARE_DELETE and would otherwise block the rename of
+        // the very staging directory it just made durable. `directory` was
+        // opened through the staging path above with delete sharing enabled,
+        // so it remains the identity-pinned handle across publication.
+        drop(staging_clone);
         if !Self::rename_local_directory_no_replace(parent, staging_name.as_ref(), component)? {
             tracing::warn!(
                 path = %staging_display.display(),
