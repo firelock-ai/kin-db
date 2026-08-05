@@ -184,6 +184,66 @@ jobs:
           --exact
           --test-threads=1
 
+  # kin-db is the vector and embedding substrate that kin's native Windows
+  # release now compiles and ships. Until that shipped, nothing in this repo's
+  # CI targeted Windows at all — the `check` matrix is ubuntu and macos — so a
+  # portability break in this crate could only surface downstream, in kin's
+  # release-gating Windows leg, on a commit that had nothing to do with it.
+  # This job is the regression guard that keeps the break where it was
+  # introduced.
+  #
+  # `cargo check --all-targets` rather than a test run, deliberately. The
+  # default feature set is `vector` + `embeddings`, so this exercises the whole
+  # dependency graph that matters here, including the C build scripts the
+  # embedding chain pulls in (`onig_sys`, via `tokenizers`), which run under
+  # `check`. Executing the suite on Windows is worth doing and is not what this
+  # job claims: it would need its own triage pass, and a compile guard that
+  # lands now is better than a test guard that waits for one.
+  windows-check:
+    name: Windows check (vector + embeddings)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-
+
+      # Default features are vector + embeddings, so this is the shipped
+      # configuration rather than a reduced one. Assert that rather than trust
+      # it: a default that quietly loses a feature would make this job pass
+      # while checking nothing it was added to check.
+      - name: Assert the checked feature set is the shipped one
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --target x86_64-pc-windows-msvc -e features -p kin-db \
+            > kin-db-feature-tree.txt
+          for required in vector embeddings; do
+            if [ "$(grep -Ec "kin-db feature \"${required}\"" kin-db-feature-tree.txt)" -eq 0 ]; then
+              echo "::error::kin-db default features no longer include ${required}"
+              exit 1
+            fi
+          done
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:
