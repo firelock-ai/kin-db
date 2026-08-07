@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusive because loading authority finalizes retired quarantines and clears
   superseded snapshots, which are mutations.
 
+- A source-blob write session flushes the drive's write cache once rather than
+  once per body. On Apple platforms `File::sync_all` is `fcntl(F_FULLFSYNC)`,
+  a full device cache flush; a session now issues `fcntl(F_BARRIERFSYNC)` per
+  body, which orders that body ahead of the `linkat` that names it, and one
+  `F_FULLFSYNC` at the flush before any directory barrier. The load-bearing
+  invariant strengthens: at the moment a name becomes durable, every body it
+  could name is on stable media. A crash before the flush still loses names
+  rather than tearing bodies. On a four-thousand-body import that is roughly
+  4,800 device flushes down to about 260. `save_source_blob`, non-Apple
+  platforms, where `fsync` is already the strongest barrier available, and
+  Windows, which does not defer at all, are unchanged. A volume without
+  barrier support falls back to the full flush.
+
 ## [0.7.13] - 2026-08-06
 
 ### Added

@@ -290,6 +290,93 @@ fn reset_source_envelope_counters() {
     SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(0));
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Device cache flushes and ordering barriers this thread issued through
+    /// the immutable-source write path. Directory barriers are not counted
+    /// here; these are the per-body costs, which are the ones that scale.
+    static SOURCE_DEVICE_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SOURCE_ORDERING_BARRIERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_source_device_flush() {
+    SOURCE_DEVICE_FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_source_device_flush() {}
+
+#[cfg(all(test, unix))]
+fn record_source_ordering_barrier() {
+    SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(barriers.get() + 1));
+}
+
+#[cfg(all(not(test), unix))]
+fn record_source_ordering_barrier() {}
+
+/// Device flushes and ordering barriers recorded on this thread since the
+/// last reset.
+#[cfg(test)]
+fn source_barrier_counters() -> (u64, u64) {
+    (
+        SOURCE_DEVICE_FLUSHES.with(std::cell::Cell::get),
+        SOURCE_ORDERING_BARRIERS.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn reset_source_barrier_counters() {
+    SOURCE_DEVICE_FLUSHES.with(|flushes| flushes.set(0));
+    SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(0));
+}
+
+/// How a body's own bytes reach the device before the `linkat` that names it.
+///
+/// `FullDevice` is an `fsync` plus a flush of the drive's write cache. On
+/// Apple platforms that is what `File::sync_all` issues: the standard library
+/// maps `fsync` to `fcntl(F_FULLFSYNC)` there.
+///
+/// `Ordering` is Apple's `F_BARRIERFSYNC`, which `fcntl(2)` documents as
+/// doing the same thing as `fsync` and then issuing a barrier to the drive,
+/// so that everything fsynced on that device beforehand is persisted before
+/// any I/O issued after the barrier. That is precisely the data-before-name
+/// guarantee this path needs, and the man page names this two-phase use as
+/// what the barrier is for. It exists only on HFS and APFS, so every other
+/// platform and every unsupported volume resolves back to `FullDevice`, which
+/// is the stronger barrier rather than a weaker one.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SourceBodyBarrier {
+    FullDevice,
+    Ordering,
+}
+
+#[cfg(unix)]
+fn issue_source_body_barrier(
+    file: &std::fs::File,
+    barrier: SourceBodyBarrier,
+) -> Result<(), std::io::Error> {
+    #[cfg(target_vendor = "apple")]
+    if matches!(barrier, SourceBodyBarrier::Ordering) {
+        // SAFETY: the descriptor is live for the duration of the call and
+        // F_BARRIERFSYNC ignores its argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
+            record_source_ordering_barrier();
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOTTY) | Some(libc::ENOTSUP) | Some(libc::EINVAL) => {}
+            _ => return Err(error),
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = barrier;
+    record_source_device_flush();
+    file.sync_all()
+}
+
 #[cfg(all(test, unix))]
 fn fail_source_file_sync_once() {
     SOURCE_FILE_SYNC_FAILURE.with(|failure| failure.set(true));
@@ -307,6 +394,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
             display_path.display()
         )));
     }
+    record_source_device_flush();
     file.sync_all().map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to fsync immutable source blob {}: {error}",
@@ -317,6 +405,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
 
 #[cfg(windows)]
 fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result<(), KinDbError> {
+    record_source_device_flush();
     file.sync_all().map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to flush immutable source blob {}: {error}",
@@ -834,14 +923,20 @@ fn read_source_file_at(
 ///
 /// `confirm_directory` decides whether the directory entry is made durable
 /// before this call returns. A batch clears it and issues one directory
-/// barrier per touched directory at its flush instead. The body's own fsync
+/// barrier per touched directory at its flush instead. The body's own barrier
 /// always happens before the `linkat` that names it, in both modes, so a
 /// deferred barrier can only lose the name.
+///
+/// `barrier` decides how strong that body barrier is. A batch orders rather
+/// than flushes, and flushes the device once for the whole session before it
+/// makes any name durable, so the body still reaches the device before the
+/// name that points at it.
 fn publish_source_file_at(
     directory: &std::fs::File,
     digest_hex: &str,
     data: &[u8],
     confirm_directory: bool,
+    barrier: SourceBodyBarrier,
 ) -> Result<bool, KinDbError> {
     let staging = format!(".{digest_hex}.no-clobber-{}", uuid::Uuid::new_v4());
     let staging_name = source_component(&staging)?;
@@ -865,7 +960,7 @@ fn publish_source_file_at(
     let mut staged = unsafe { std::fs::File::from_raw_fd(fd) };
     let write_result = staged
         .write_all(data)
-        .and_then(|()| staged.sync_all())
+        .and_then(|()| issue_source_body_barrier(&staged, barrier))
         .map_err(|error| KinDbError::StorageError(error.to_string()));
     drop(staged);
     if let Err(error) = write_result {
@@ -2597,14 +2692,18 @@ impl DeferredSourceDurability {
         Ok(capability)
     }
 
-    /// Re-confirm every pinned prefix, then issue every outstanding barrier
-    /// child before parent: each digest directory that names bodies, then the
-    /// prefix chain naming those directories, then the repository directory
-    /// naming the chain.
+    /// Re-confirm every pinned prefix, flush the device once, then issue every
+    /// outstanding barrier child before parent: each digest directory that
+    /// names bodies, then the prefix chain naming those directories, then the
+    /// repository directory naming the chain.
     ///
     /// The confirmations run first and as a group, so a namespace substituted
     /// at any point in the session fails the session before a single name is
     /// made durable.
+    ///
+    /// The device flush runs next, before the first directory barrier, so at
+    /// the moment any name becomes durable every body it could name is
+    /// already on stable media.
     ///
     /// The record is cleared only once every barrier succeeded, so a failed
     /// flush stays outstanding and a retry reissues it rather than reporting
@@ -2622,6 +2721,7 @@ impl DeferredSourceDurability {
                 capability,
             )?;
         }
+        sync_source_blob_device(namespace)?;
         for capability in prefixes.values() {
             mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
         }
@@ -2629,6 +2729,39 @@ impl DeferredSourceDurability {
         prefixes.clear();
         Ok(())
     }
+}
+
+/// Flush the drive's write cache once for the whole write session.
+///
+/// Each body reached the device behind an ordering barrier, which guarantees
+/// it is persisted before anything issued afterwards but promises nothing
+/// about when. This is what converts ordered into persisted, and it is issued
+/// before the first directory barrier so no name can become durable ahead of
+/// its bytes.
+///
+/// It is issued through the repository directory handle because `F_FULLFSYNC`
+/// asks the drive to flush, which is a property of the device rather than of
+/// the descriptor it is requested on.
+#[cfg(unix)]
+fn sync_source_blob_device(namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
+    let repo_dir = mmap::open_directory_handle_at(
+        &namespace.directory,
+        Path::new("."),
+        &namespace.display_path,
+    )
+    .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            namespace.display_path.display()
+        ))
+    })?;
+    record_source_device_flush();
+    repo_dir.sync_all().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to flush the device before publishing names below {}: {error}",
+            namespace.display_path.display()
+        ))
+    })
 }
 
 /// Make the `source-blobs/sha256` chain durable, child before parent.
@@ -2764,6 +2897,18 @@ impl LocalSourceDurability<'_> {
                 mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)
             }
             Self::Deferred(_) => Ok(()),
+        }
+    }
+
+    /// How this body's bytes reach the device before the `linkat` names them.
+    ///
+    /// A per-object write flushes the drive's cache, because nothing later
+    /// will. A batch only orders, and pays one device flush for the whole
+    /// session at its flush, before any name becomes durable.
+    fn body_barrier(&self) -> SourceBodyBarrier {
+        match self {
+            Self::Immediate => SourceBodyBarrier::FullDevice,
+            Self::Deferred(_) => SourceBodyBarrier::Ordering,
         }
     }
 }
@@ -6395,6 +6540,7 @@ impl LocalFileBackend {
             &digest_hex,
             data,
             durability.confirms_leaf_inline(),
+            durability.body_barrier(),
         )?;
         let installed =
             read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
@@ -7841,6 +7987,95 @@ mod tests {
             collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs")),
             collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs")),
         );
+    }
+
+    /// A write session flushes the drive's cache once, not once per body.
+    ///
+    /// On Apple platforms `File::sync_all` is `fcntl(F_FULLFSYNC)`, a full
+    /// device cache flush, and it was the single largest cost left inside the
+    /// per-body write. A session issues `F_BARRIERFSYNC` per body instead,
+    /// which orders that body ahead of the `linkat` naming it, and one
+    /// `F_FULLFSYNC` before it makes any name durable.
+    ///
+    /// Elsewhere `fsync` is already the strongest barrier available, so the
+    /// per-body flush stays and this test pins that it stayed.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_flushes_the_device_once_per_session() {
+        const PREFIXES: usize = 2;
+        const PER_PREFIX: usize = 12;
+        let bodies = bodies_sharing_digest_prefixes(PREFIXES, PER_PREFIX);
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = LocalFileBackend::new(batched_dir.path());
+        reset_source_barrier_counters();
+        batched
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+        let (batched_flushes, batched_barriers) = source_barrier_counters();
+
+        #[cfg(target_vendor = "apple")]
+        {
+            assert_eq!(
+                batched_barriers,
+                bodies.len() as u64,
+                "every body must still be ordered ahead of the name that points at it"
+            );
+            assert_eq!(
+                batched_flushes, 1,
+                "a session must flush the device once, before it makes any name durable"
+            );
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            assert_eq!(
+                batched_barriers, 0,
+                "only Apple platforms offer an ordering barrier below a full flush"
+            );
+            assert_eq!(
+                batched_flushes,
+                bodies.len() as u64 + 1,
+                "elsewhere each body keeps its own flush, plus the session's"
+            );
+        }
+
+        let per_object_dir = TempDir::new().unwrap();
+        let per_object = LocalFileBackend::new(per_object_dir.path());
+        reset_source_barrier_counters();
+        for (digest, body) in digests.iter().zip(&bodies) {
+            per_object
+                .save_source_blob("repo-a", *digest, body)
+                .unwrap();
+        }
+        let (per_object_flushes, per_object_barriers) = source_barrier_counters();
+        assert_eq!(
+            per_object_barriers, 0,
+            "the per-object contract must never weaken a body barrier to an ordering one"
+        );
+        assert_eq!(
+            per_object_flushes,
+            (bodies.len() * 2) as u64,
+            "the per-object contract still flushes the device for the staged body and its acknowledgement"
+        );
+
+        // A weaker per-body barrier may not change what the session stores.
+        assert_eq!(
+            collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs")),
+            collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs")),
+        );
+        let reopened = LocalFileBackend::new(batched_dir.path());
+        for (digest, body) in digests.iter().zip(&bodies) {
+            assert_eq!(
+                reopened.load_source_blob("repo-a", *digest).unwrap(),
+                Some(body.clone())
+            );
+        }
     }
 
     /// The session envelope is fixed, so carrying more bodies through the same
