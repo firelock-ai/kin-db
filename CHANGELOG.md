@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.17] - 2026-08-07
+
+### Changed
+
+- A source-blob write session pays its repository envelope once instead of
+  once per body. `publish_source_blob_in_namespace` re-resolved the repository
+  from the filesystem root at entry and exit of every body, and re-walked and
+  re-confirmed the `source-blobs/sha256/HH` chain per body. Under a held write
+  batch both checks move to the session boundary: acquiring the repository
+  lock already confirms the namespace under the lock, the flush confirms it
+  again, each digest prefix is walked and confirmed once when it is pinned,
+  and the flush re-confirms every pinned prefix before it issues a barrier.
+  `save_source_blob` is unchanged, and so is what either path stores.
+
 ## [0.7.13] - 2026-08-06
 
 ### Added

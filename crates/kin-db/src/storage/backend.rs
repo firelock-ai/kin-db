@@ -230,6 +230,54 @@ fn run_local_directory_after_preopen_hook(kind: LocalDirectoryBindKind) {
 #[cfg(not(test))]
 fn run_local_directory_after_preopen_hook(_kind: LocalDirectoryBindKind) {}
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times this thread re-resolved the repository namespace from
+    /// the filesystem root, and how many digest-prefix capability chains it
+    /// walked. Both are load-independent proxies for the per-object syscall
+    /// envelope: a confirmation is roughly twenty syscalls including two
+    /// `realpath` calls and a directory-stream read, and a walk is an `openat`
+    /// per chain component. A test asserts they are amortized per write
+    /// session rather than paid per body.
+    static SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static SOURCE_ENVELOPE_CAPABILITY_WALKS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_source_blob_capability_walk() {
+    SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(walks.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_source_blob_capability_walk() {}
+
+#[cfg(test)]
+fn record_repository_visibility_confirmation() {
+    SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS
+        .with(|confirmations| confirmations.set(confirmations.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_repository_visibility_confirmation() {}
+
+/// Repository-visibility confirmations and prefix capability walks recorded on
+/// this thread since the last reset.
+#[cfg(test)]
+fn source_envelope_counters() -> (u64, u64) {
+    (
+        SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(std::cell::Cell::get),
+        SOURCE_ENVELOPE_CAPABILITY_WALKS.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn reset_source_envelope_counters() {
+    SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(|confirmations| confirmations.set(0));
+    SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(0));
+}
+
 #[cfg(all(test, unix))]
 fn fail_source_file_sync_once() {
     SOURCE_FILE_SYNC_FAILURE.with(|failure| failure.set(true));
@@ -497,14 +545,21 @@ fn prepare_source_trust_root(
     Ok(())
 }
 
+/// The `source-blobs/sha256/HH` directory component a digest publishes into.
 #[cfg(unix)]
-fn open_source_blob_capability_from_repository(
+fn source_blob_prefix(digest: [u8; 32]) -> String {
+    hex::encode(&digest[..1])
+}
+
+#[cfg(unix)]
+fn open_source_blob_prefix_capability_from_repository(
     repository: &cap_std::fs::Dir,
     repository_display: &Path,
-    digest: [u8; 32],
+    prefix: &str,
     create: bool,
     confirm_durability: bool,
 ) -> Result<SourceBlobCapability, KinDbError> {
+    record_source_blob_capability_walk();
     let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
         .map_err(|error| {
         KinDbError::StorageError(format!(
@@ -518,9 +573,8 @@ fn open_source_blob_capability_from_repository(
             repository_display.display()
         ))
     })?;
-    let digest_hex = hex::encode(digest);
     let mut display = repository_display.to_path_buf();
-    for component in ["source-blobs", "sha256", &digest_hex[..2]] {
+    for component in ["source-blobs", "sha256", prefix] {
         display.push(component);
         parent =
             open_source_directory_at(&parent, component, &display, create, confirm_durability)?;
@@ -530,6 +584,23 @@ fn open_source_blob_capability_from_repository(
         leaf_dir: parent,
         leaf_path: display,
     })
+}
+
+#[cfg(unix)]
+fn open_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+    create: bool,
+    confirm_durability: bool,
+) -> Result<SourceBlobCapability, KinDbError> {
+    open_source_blob_prefix_capability_from_repository(
+        repository,
+        repository_display,
+        &source_blob_prefix(digest),
+        create,
+        confirm_durability,
+    )
 }
 
 #[cfg(unix)]
@@ -544,16 +615,16 @@ fn same_directory(left: &std::fs::File, right: &std::fs::File) -> Result<bool, K
 }
 
 #[cfg(unix)]
-fn confirm_source_blob_namespace_from_repository(
+fn confirm_source_blob_prefix_namespace_from_repository(
     repository: &cap_std::fs::Dir,
     repository_display: &Path,
-    digest: [u8; 32],
+    prefix: &str,
     capability: &SourceBlobCapability,
 ) -> Result<(), KinDbError> {
-    let current = open_source_blob_capability_from_repository(
+    let current = open_source_blob_prefix_capability_from_repository(
         repository,
         repository_display,
-        digest,
+        prefix,
         false,
         false,
     )?;
@@ -566,6 +637,21 @@ fn confirm_source_blob_namespace_from_repository(
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn confirm_source_blob_namespace_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+    capability: &SourceBlobCapability,
+) -> Result<(), KinDbError> {
+    confirm_source_blob_prefix_namespace_from_repository(
+        repository,
+        repository_display,
+        &source_blob_prefix(digest),
+        capability,
+    )
 }
 
 #[cfg(unix)]
@@ -931,6 +1017,7 @@ fn open_windows_source_blob_capability_from_repository(
     digest: [u8; 32],
     create: bool,
 ) -> Result<WindowsSourceBlobCapability, KinDbError> {
+    record_source_blob_capability_walk();
     let mut directories = vec![repository.open_dir(".").map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to clone retained Windows repository capability {}: {error}",
@@ -2302,55 +2389,88 @@ struct LocalRepositoryCapability {
     lock_publication_sync_pending: std::sync::atomic::AtomicBool,
 }
 
-/// Directory entries a write batch has published but not yet made durable.
+/// The digest-prefix directories a write batch pinned, and whose entries it
+/// has published but not yet made durable.
 ///
-/// One handle is retained per digest prefix the batch wrote into, which bounds
-/// the set at the 256 possible prefixes however many bodies the batch carries.
+/// One capability is retained per digest prefix the batch wrote into, which
+/// bounds the set at the 256 possible prefixes however many bodies the batch
+/// carries. A prefix is walked and namespace-confirmed once, when it is
+/// pinned; every later body in that prefix publishes through the pinned
+/// descriptor, and the flush re-confirms every pinned prefix before it issues
+/// a barrier.
 #[cfg(unix)]
 #[derive(Default)]
 struct DeferredSourceDurability {
-    leaves: parking_lot::Mutex<std::collections::BTreeMap<String, (std::fs::File, PathBuf)>>,
+    prefixes: parking_lot::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<SourceBlobCapability>>,
+    >,
 }
 
 #[cfg(unix)]
 impl DeferredSourceDurability {
-    fn record(
+    /// Pin a digest prefix for the rest of the session, or return the
+    /// descriptor already pinned for it.
+    ///
+    /// The walk that opens a prefix is followed immediately by the same
+    /// namespace confirmation a per-object write performs, so a capability
+    /// enters the cache only after it has been checked against a fresh
+    /// resolution of its own path.
+    fn capability(
         &self,
-        capability: &SourceBlobCapability,
-        digest_hex: &str,
-    ) -> Result<(), KinDbError> {
-        let prefix = &digest_hex[..2];
-        let mut leaves = self.leaves.lock();
-        if leaves.contains_key(prefix) {
-            return Ok(());
+        namespace: &LocalRepositoryCapability,
+        prefix: &str,
+    ) -> Result<std::sync::Arc<SourceBlobCapability>, KinDbError> {
+        let mut prefixes = self.prefixes.lock();
+        if let Some(capability) = prefixes.get(prefix) {
+            return Ok(std::sync::Arc::clone(capability));
         }
-        let retained = capability.leaf_dir.try_clone().map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to retain immutable source directory {} for a deferred durability barrier: {error}",
-                capability.leaf_path.display()
-            ))
-        })?;
-        leaves.insert(prefix.to_string(), (retained, capability.leaf_path.clone()));
-        Ok(())
+        let capability = std::sync::Arc::new(open_source_blob_prefix_capability_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            prefix,
+            true,
+            false,
+        )?);
+        confirm_source_blob_prefix_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            prefix,
+            &capability,
+        )?;
+        prefixes.insert(prefix.to_string(), std::sync::Arc::clone(&capability));
+        Ok(capability)
     }
 
-    /// Issue every outstanding barrier child before parent: each digest
-    /// directory that names bodies, then the prefix chain naming those
-    /// directories, then the repository directory naming the chain.
+    /// Re-confirm every pinned prefix, then issue every outstanding barrier
+    /// child before parent: each digest directory that names bodies, then the
+    /// prefix chain naming those directories, then the repository directory
+    /// naming the chain.
+    ///
+    /// The confirmations run first and as a group, so a namespace substituted
+    /// at any point in the session fails the session before a single name is
+    /// made durable.
     ///
     /// The record is cleared only once every barrier succeeded, so a failed
     /// flush stays outstanding and a retry reissues it rather than reporting
     /// durability this batch never reached.
     fn flush(&self, namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
-        let mut leaves = self.leaves.lock();
-        if leaves.is_empty() {
+        let mut prefixes = self.prefixes.lock();
+        if prefixes.is_empty() {
             return Ok(());
         }
-        for (directory, display) in leaves.values() {
-            mmap::sync_directory_handle(directory, display)?;
+        for (prefix, capability) in prefixes.iter() {
+            confirm_source_blob_prefix_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                prefix,
+                capability,
+            )?;
+        }
+        for capability in prefixes.values() {
+            mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
         }
         sync_source_blob_chain(namespace)?;
-        leaves.clear();
+        prefixes.clear();
         Ok(())
     }
 }
@@ -2422,6 +2542,47 @@ impl LocalSourceDurability<'_> {
         matches!(self, Self::Immediate)
     }
 
+    /// Whether the repository namespace is re-resolved from the filesystem
+    /// root around this body.
+    ///
+    /// A batch is already bracketed by that check: acquiring the repository
+    /// lock resolves and identity-matches the namespace before the first body,
+    /// and the flush confirms it again after the last. Repeating it per body
+    /// re-derives an identity the session already pinned.
+    fn confirms_repository_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    /// Whether the digest-prefix chain is re-walked and compared against the
+    /// pinned descriptor around this body.
+    ///
+    /// A batch confirms a prefix when it pins it and again for every pinned
+    /// prefix at its flush, so the check moves to the session boundary rather
+    /// than disappearing.
+    fn confirms_namespace_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    /// Pin the digest-prefix directory this body publishes into.
+    fn capability(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        prefix: &str,
+    ) -> Result<std::sync::Arc<SourceBlobCapability>, KinDbError> {
+        match self {
+            Self::Immediate => Ok(std::sync::Arc::new(
+                open_source_blob_prefix_capability_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
+                    prefix,
+                    true,
+                    self.confirms_ancestors_inline(),
+                )?,
+            )),
+            Self::Deferred(deferred) => deferred.capability(namespace, prefix),
+        }
+    }
+
     /// Acknowledge the inode a body actually landed on.
     ///
     /// A batch owes nothing here. A body this call published was fsynced
@@ -2436,16 +2597,17 @@ impl LocalSourceDurability<'_> {
         }
     }
 
-    fn sync_leaf(
-        &self,
-        capability: &SourceBlobCapability,
-        digest_hex: &str,
-    ) -> Result<(), KinDbError> {
+    /// Make the directory entry naming this body durable.
+    ///
+    /// A batch owes nothing here either: the prefix directory was retained
+    /// when it was pinned, so its barrier is already outstanding and the flush
+    /// issues one per prefix rather than one per body.
+    fn sync_leaf(&self, capability: &SourceBlobCapability) -> Result<(), KinDbError> {
         match self {
             Self::Immediate => {
                 mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)
             }
-            Self::Deferred(deferred) => deferred.record(capability, digest_hex),
+            Self::Deferred(_) => Ok(()),
         }
     }
 }
@@ -4209,6 +4371,7 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<(), KinDbError> {
+        record_repository_visibility_confirmation();
         let root = self.storage_root_capability()?.ok_or_else(|| {
             KinDbError::StorageError(format!(
                 "local storage root {} disappeared while repository capability was held",
@@ -5947,19 +6110,15 @@ impl LocalFileBackend {
         data: &[u8],
         durability: &LocalSourceDurability<'_>,
     ) -> Result<(), KinDbError> {
-        self.confirm_repository_visible(namespace)?;
-        let capability = open_source_blob_capability_from_repository(
-            &namespace.directory,
-            &namespace.display_path,
-            digest,
-            true,
-            durability.confirms_ancestors_inline(),
-        )?;
+        if durability.confirms_repository_inline() {
+            self.confirm_repository_visible(namespace)?;
+        }
+        let digest_hex = hex::encode(digest);
+        let capability = durability.capability(namespace, &digest_hex[..2])?;
         #[cfg(test)]
         if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
             hook();
         }
-        let digest_hex = hex::encode(digest);
 
         if let Some(existing) =
             read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
@@ -5975,15 +6134,19 @@ impl LocalFileBackend {
                     capability.leaf_path.display()
                 )));
             }
-            confirm_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
+            if durability.confirms_namespace_inline() {
+                confirm_source_blob_namespace_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
+                    digest,
+                    &capability,
+                )?;
+            }
             durability.sync_body(&existing.file, &capability.leaf_path.join(&digest_hex))?;
-            durability.sync_leaf(&capability, &digest_hex)?;
-            self.confirm_repository_visible(namespace)?;
+            durability.sync_leaf(&capability)?;
+            if durability.confirms_repository_inline() {
+                self.confirm_repository_visible(namespace)?;
+            }
             return Ok(());
         }
 
@@ -5995,12 +6158,14 @@ impl LocalFileBackend {
         // Re-walk without creating anything and compare the directory
         // identity to the pinned handle. A substituted ancestor is rejected
         // before publication; all writes remain relative to the old handle.
-        confirm_source_blob_namespace_from_repository(
-            &namespace.directory,
-            &namespace.display_path,
-            digest,
-            &capability,
-        )?;
+        if durability.confirms_namespace_inline() {
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+        }
 
         let _published = publish_source_file_at(
             &capability.leaf_dir,
@@ -6031,8 +6196,10 @@ impl LocalFileBackend {
         // Confirm the inode actually selected at the target name, then
         // reconfirm its directory entry in file-before-directory order.
         durability.sync_body(&installed.file, &capability.leaf_path.join(&digest_hex))?;
-        durability.sync_leaf(&capability, &digest_hex)?;
-        self.confirm_repository_visible(namespace)?;
+        durability.sync_leaf(&capability)?;
+        if durability.confirms_repository_inline() {
+            self.confirm_repository_visible(namespace)?;
+        }
         Ok(())
     }
 
@@ -7310,6 +7477,160 @@ mod tests {
                 Some(body.clone())
             );
         }
+    }
+
+    /// The prefix a capability is keyed by is the same two hex characters the
+    /// digest directory has always been named after.
+    #[cfg(unix)]
+    #[test]
+    fn source_blob_prefix_is_the_first_two_digest_hex_characters() {
+        for seed in 0u32..512 {
+            let digest = source_digest(format!("prefix equivalence {seed}").as_bytes());
+            assert_eq!(source_blob_prefix(digest), hex::encode(digest)[..2]);
+        }
+    }
+
+    /// Bodies whose digests land in exactly `prefixes` digest-prefix
+    /// directories, `per_prefix` bodies in each.
+    #[cfg(unix)]
+    fn bodies_sharing_digest_prefixes(prefixes: usize, per_prefix: usize) -> Vec<Vec<u8>> {
+        let mut grouped: std::collections::BTreeMap<u8, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        let mut candidate = 0u32;
+        while grouped
+            .values()
+            .filter(|bodies| bodies.len() >= per_prefix)
+            .count()
+            < prefixes
+        {
+            let body = format!("prefix fixture body {candidate}").into_bytes();
+            let entry = grouped.entry(source_digest(&body)[0]).or_default();
+            if entry.len() < per_prefix {
+                entry.push(body);
+            }
+            candidate += 1;
+            assert!(
+                candidate < 1_000_000,
+                "digest prefix search did not converge"
+            );
+        }
+        grouped
+            .into_values()
+            .filter(|bodies| bodies.len() >= per_prefix)
+            .take(prefixes)
+            .flatten()
+            .collect()
+    }
+
+    /// The per-object envelope is two full repository re-resolutions and two
+    /// digest-prefix walks per body; a write session pays a fixed envelope
+    /// instead, whatever it carries.
+    ///
+    /// Both counters are load-independent proxies for syscalls: a repository
+    /// confirmation is roughly twenty of them, including two `realpath` calls
+    /// and a directory-stream read, and a prefix walk is an `openat` per chain
+    /// component. Reverting either hoist puts the batch back on the per-object
+    /// numbers this test also pins.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_amortizes_the_per_object_envelope() {
+        const PREFIXES: usize = 2;
+        const PER_PREFIX: usize = 12;
+        let bodies = bodies_sharing_digest_prefixes(PREFIXES, PER_PREFIX);
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+        assert_eq!(bodies.len(), PREFIXES * PER_PREFIX);
+        assert_eq!(
+            digests
+                .iter()
+                .map(|digest| digest[0])
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            PREFIXES
+        );
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = LocalFileBackend::new(batched_dir.path());
+        reset_source_envelope_counters();
+        batched
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+        let (batched_confirmations, batched_walks) = source_envelope_counters();
+
+        // Two confirmations bracket the whole session: acquiring the
+        // repository lock ends in `confirm_existing_lock_visible`, which
+        // confirms the namespace under the held lock, and the flush confirms
+        // it again after the last body.
+        assert_eq!(
+            batched_confirmations, 2,
+            "a write session must re-resolve the repository twice, not twice per body"
+        );
+        // Two walks to pin and confirm each prefix, one more per prefix to
+        // re-confirm it at the flush.
+        assert_eq!(
+            batched_walks,
+            (PREFIXES * 3) as u64,
+            "a write session must walk each digest prefix a fixed number of times"
+        );
+
+        let per_object_dir = TempDir::new().unwrap();
+        let per_object = LocalFileBackend::new(per_object_dir.path());
+        reset_source_envelope_counters();
+        for (digest, body) in digests.iter().zip(&bodies) {
+            per_object
+                .save_source_blob("repo-a", *digest, body)
+                .unwrap();
+        }
+        let (per_object_confirmations, per_object_walks) = source_envelope_counters();
+        assert_eq!(
+            per_object_confirmations,
+            (bodies.len() * 3) as u64,
+            "the per-object contract still re-resolves the repository around every body"
+        );
+        assert_eq!(
+            per_object_walks,
+            (bodies.len() * 2) as u64,
+            "the per-object contract still walks and re-confirms the prefix per body"
+        );
+
+        // Amortizing the envelope may not change what either path stores.
+        assert_eq!(
+            collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs")),
+            collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs")),
+        );
+    }
+
+    /// The session envelope is fixed, so carrying more bodies through the same
+    /// prefixes costs nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_envelope_does_not_grow_with_body_count() {
+        let mut counters = Vec::new();
+        for per_prefix in [4usize, 16] {
+            let bodies = bodies_sharing_digest_prefixes(2, per_prefix);
+            let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+            let dir = TempDir::new().unwrap();
+            let backend = LocalFileBackend::new(dir.path());
+            reset_source_envelope_counters();
+            backend
+                .with_source_blob_write_batch("repo-a", &mut |batch| {
+                    for (digest, body) in digests.iter().zip(&bodies) {
+                        batch.save(*digest, body)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            counters.push((bodies.len(), source_envelope_counters()));
+        }
+        assert_ne!(counters[0].0, counters[1].0);
+        assert_eq!(
+            counters[0].1, counters[1].1,
+            "a session that carries four times the bodies must pay the same envelope"
+        );
     }
 
     #[test]
