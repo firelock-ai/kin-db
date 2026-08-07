@@ -2046,6 +2046,10 @@ impl InMemoryGraph {
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
+    ///
+    /// A RAM-only index starts empty, so this always rebuilds it over every
+    /// entity. Callers that never search the restored graph want
+    /// [`Self::from_snapshot_without_text_index`] instead.
     pub fn from_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(snapshot, None, false, false)
     }
@@ -2064,8 +2068,19 @@ impl InMemoryGraph {
 
     /// Restore a graph from a snapshot without constructing any text index.
     ///
-    /// This is intended for graph-only workflows such as warm-cache diffing
-    /// where entity/file truth is needed but lexical retrieval is not.
+    /// This is intended for graph-only workflows such as warm-cache diffing or
+    /// workspace materialization, where entity/file truth is needed but lexical
+    /// retrieval is not. Those callers otherwise pay for a full text index
+    /// rebuild over every entity and then drop it with the graph.
+    ///
+    /// Graph truth is unaffected: the text index is a derived retrieval surface,
+    /// it is not part of a `GraphSnapshot`, and no snapshot, tree, or validation
+    /// result depends on whether one was built.
+    pub fn from_snapshot_without_text_index(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
+        Self::from_snapshot_inner(snapshot, None, false, true)
+    }
+
+    /// Restore a graph from a snapshot without constructing any text index.
     ///
     /// The graph root hash argument is accepted and ignored: text index
     /// currency is decided by the retrieval authority hash instead.
@@ -2073,7 +2088,7 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         _expected_root_hash: [u8; 32],
     ) -> Result<Self, KinDbError> {
-        Self::from_snapshot_inner(snapshot, None, false, true)
+        Self::from_snapshot_without_text_index(snapshot)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
@@ -2657,6 +2672,8 @@ impl InMemoryGraph {
         source: &InMemoryGraph,
         root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
+        #[cfg(test)]
+        text_index_rebuilds::record();
         let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
         let docs = {
             let ent = source.entities.read();
@@ -9612,6 +9629,35 @@ impl RetrievalKeyFileResolver for InMemoryGraph {
     }
 }
 
+/// Test-only census of full text index rebuilds.
+///
+/// A rebuild collects indexable text for every entity in the graph, so a
+/// restore that builds an index nobody searches does that work for nothing.
+/// Thread-local for the same reason as [`root_hash_passes`]: the test binary
+/// runs tests in parallel.
+#[cfg(test)]
+pub(crate) mod text_index_rebuilds {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REBUILDS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record() {
+        REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
+    }
+
+    /// Start counting from zero on this thread.
+    pub(crate) fn reset() {
+        REBUILDS.with(|rebuilds| rebuilds.set(0));
+    }
+
+    /// Rebuilds taken on this thread since the last [`reset`].
+    pub(crate) fn count() -> u64 {
+        REBUILDS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9649,6 +9695,61 @@ mod tests {
         let expected = compute_retrieval_authority_hash(&graph.to_snapshot());
         assert_eq!(graph.retrieval_authority_hash(), expected);
         assert_eq!(root_hash_passes::count(), 1);
+    }
+
+    /// Workspace materialization restores a graph, applies one delta, hands the
+    /// snapshot back out and drops the graph. It never searches it, so the text
+    /// index it used to build was indexed over every entity and then discarded.
+    ///
+    /// Both halves are asserted: the rebuild is gone, and the snapshot that
+    /// materialization actually returns is unchanged by its absence.
+    #[test]
+    fn materialization_skips_the_text_index_it_would_discard() {
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry", "flushRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+        // One delta, applied to both graphs, so the two runs differ only in
+        // whether a text index existed. Minting the artifact id per graph would
+        // make them differ for an unrelated reason.
+        let delta = TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("src/registry.rs").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([4; 32]), false),
+                ),
+            }],
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+
+        text_index_rebuilds::reset();
+        let indexed = InMemoryGraph::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(
+            text_index_rebuilds::count(),
+            1,
+            "a RAM-only text index starts empty, so restoring one always rebuilds it"
+        );
+        indexed.apply_transaction_delta(&delta).unwrap();
+
+        text_index_rebuilds::reset();
+        let bare = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+        assert_eq!(
+            text_index_rebuilds::count(),
+            0,
+            "materialization must not build a text index it discards"
+        );
+        bare.apply_transaction_delta(&delta).unwrap();
+
+        assert_eq!(
+            compute_retrieval_authority_hash(&indexed.to_snapshot()),
+            compute_retrieval_authority_hash(&bare.to_snapshot()),
+            "skipping a derived retrieval surface must not change graph truth"
+        );
     }
 
     /// The in-run vector-sidecar flush policy: the first checkpoint of a run is
