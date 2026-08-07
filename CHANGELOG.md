@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the flush re-confirms every pinned prefix before it issues a barrier.
   `save_source_blob` is unchanged, and so is what either path stores.
 
+- Source-blob reads take a shared repository lock instead of an exclusive one,
+  so concurrent readers of one repository no longer serialize on each other.
+  `load_source_blob`, `load_source_blob_bounded`, `source_blob_len` and
+  `with_verified_source_blob_batch` are the converted entry points. Every
+  mutation still takes the exclusive lock, so a writer still excludes every
+  reader and a reader still excludes every writer. Reads also stop creating
+  the `source-blobs/sha256/HH` chain: a lookup against a repository that has
+  never stored a body now returns `None` with nothing written, which is what
+  the GCS backend has always done for the same trait methods.
+  `load_snapshot_authority` and `load_recovery_state` deliberately stay
+  exclusive because loading authority finalizes retired quarantines and clears
+  superseded snapshots, which are mutations.
+
 ## [0.7.13] - 2026-08-06
 
 ### Added

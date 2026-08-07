@@ -180,6 +180,18 @@ enum LocalDirectoryBindKind {
     Staging,
 }
 
+/// Whether a repository authority lock excludes other holders of the same
+/// repository, or only excludes writers.
+///
+/// Every mutation takes `Exclusive`. `Shared` belongs to entry points that
+/// create nothing, rename nothing and delete nothing, so concurrent readers
+/// of one repository stop serializing on each other.
+#[derive(Clone, Copy)]
+enum LocalRepositoryLockAccess {
+    Exclusive,
+    Shared,
+}
+
 #[cfg(test)]
 std::thread_local! {
     static REPOSITORY_AFTER_PREOPEN_HOOK:
@@ -444,14 +456,20 @@ fn source_component(name: &str) -> Result<CString, KinDbError> {
     })
 }
 
+/// Open one immutable-source directory component, reporting a component that
+/// simply is not there as absence rather than as a fault.
+///
+/// Only `ENOENT` is absence. A symlinked component fails `O_NOFOLLOW` with
+/// `ELOOP` and a non-directory fails `O_DIRECTORY` with `ENOTDIR`, so the
+/// refusals this walk exists to make are still errors.
 #[cfg(unix)]
-fn open_source_directory_at(
+fn open_optional_source_directory_at(
     parent: &std::fs::File,
     name: &str,
     display_path: &Path,
     create: bool,
     confirm_durability: bool,
-) -> Result<std::fs::File, KinDbError> {
+) -> Result<Option<std::fs::File>, KinDbError> {
     let component = source_component(name)?;
     if create {
         // SAFETY: both descriptors and the NUL-terminated component are valid
@@ -480,6 +498,9 @@ fn open_source_directory_at(
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
         return Err(KinDbError::StorageError(format!(
             "refusing symlinked or non-directory immutable source blob ancestor {} (or missing path): {error}",
             display_path.display()
@@ -490,7 +511,25 @@ fn open_source_directory_at(
     if confirm_durability {
         mmap::sync_directory_handle(parent, display_path.parent().unwrap_or(display_path))?;
     }
-    Ok(directory)
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+fn open_source_directory_at(
+    parent: &std::fs::File,
+    name: &str,
+    display_path: &Path,
+    create: bool,
+    confirm_durability: bool,
+) -> Result<std::fs::File, KinDbError> {
+    open_optional_source_directory_at(parent, name, display_path, create, confirm_durability)?
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "refusing symlinked or non-directory immutable source blob ancestor {} (or missing path): {}",
+                display_path.display(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+        })
 }
 
 #[cfg(unix)]
@@ -601,6 +640,48 @@ fn open_source_blob_capability_from_repository(
         create,
         confirm_durability,
     )
+}
+
+/// Pin the digest-prefix chain for a read, creating nothing.
+///
+/// A repository that has never stored a body has no `source-blobs/sha256/HH`
+/// chain, which is the same answer as a repository that does not hold this
+/// body: `None`, with nothing written.
+#[cfg(unix)]
+fn open_existing_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+) -> Result<Option<SourceBlobCapability>, KinDbError> {
+    record_source_blob_capability_walk();
+    let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
+        .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            repository_display.display()
+        ))
+    })?;
+    let mut parent = repo_dir.try_clone().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository directory {}: {error}",
+            repository_display.display()
+        ))
+    })?;
+    let mut display = repository_display.to_path_buf();
+    for component in ["source-blobs", "sha256", &source_blob_prefix(digest)] {
+        display.push(component);
+        let Some(next) =
+            open_optional_source_directory_at(&parent, component, &display, false, false)?
+        else {
+            return Ok(None);
+        };
+        parent = next;
+    }
+    Ok(Some(SourceBlobCapability {
+        repo_dir,
+        leaf_dir: parent,
+        leaf_path: display,
+    }))
 }
 
 #[cfg(unix)]
@@ -959,13 +1040,18 @@ fn windows_source_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool 
     cap_fs_ext::OsMetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// Open one immutable-source directory component, reporting a component that
+/// simply is not there as absence rather than as a fault.
+///
+/// Only a not-found open is absence. A reparse point or a non-directory still
+/// fails, so the refusals this walk exists to make are unchanged.
 #[cfg(windows)]
-fn open_windows_source_directory_at(
+fn open_optional_windows_source_directory_at(
     parent: &cap_std::fs::Dir,
     component: &std::ffi::OsStr,
     display_path: &Path,
     create: bool,
-) -> Result<cap_std::fs::Dir, KinDbError> {
+) -> Result<Option<cap_std::fs::Dir>, KinDbError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -992,12 +1078,16 @@ fn open_windows_source_directory_at(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .follow(FollowSymlinks::No)
         .maybe_dir(true);
-    let file = parent.open_with(component, &options).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {error}",
-            display_path.display()
-        ))
-    })?;
+    let file = match parent.open_with(component, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {error}",
+                display_path.display()
+            )));
+        }
+    };
     let metadata = file
         .metadata()
         .map_err(|error| KinDbError::StorageError(error.to_string()))?;
@@ -1007,7 +1097,25 @@ fn open_windows_source_directory_at(
             display_path.display()
         )));
     }
-    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+    Ok(Some(cap_std::fs::Dir::from_std_file(file.into_std())))
+}
+
+#[cfg(windows)]
+fn open_windows_source_directory_at(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+    display_path: &Path,
+    create: bool,
+) -> Result<cap_std::fs::Dir, KinDbError> {
+    open_optional_windows_source_directory_at(parent, component, display_path, create)?.ok_or_else(
+        || {
+            KinDbError::StorageError(format!(
+                "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {}",
+                display_path.display(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+        },
+    )
 }
 
 #[cfg(windows)]
@@ -1053,6 +1161,54 @@ fn open_windows_source_blob_capability_from_repository(
         capability.sync_ancestor_publication()?;
     }
     Ok(capability)
+}
+
+/// Pin the digest-prefix chain for a read, creating nothing.
+///
+/// A repository that has never stored a body has no `source-blobs/sha256/HH`
+/// chain, which is the same answer as a repository that does not hold this
+/// body: `None`, with nothing written.
+#[cfg(windows)]
+fn open_existing_windows_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+) -> Result<Option<WindowsSourceBlobCapability>, KinDbError> {
+    record_source_blob_capability_walk();
+    let mut directories = vec![repository.open_dir(".").map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained Windows repository capability {}: {error}",
+            repository_display.display()
+        ))
+    })?];
+    let mut display_paths = vec![repository_display.to_path_buf()];
+    let mut display = repository_display.to_path_buf();
+    let digest_hex = hex::encode(digest);
+    for component in [
+        std::ffi::OsStr::new("source-blobs"),
+        std::ffi::OsStr::new("sha256"),
+        std::ffi::OsStr::new(&digest_hex[..2]),
+    ] {
+        display.push(component);
+        let Some(next) = open_optional_windows_source_directory_at(
+            directories
+                .last()
+                .expect("repository capability was inserted"),
+            component,
+            &display,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        directories.push(next);
+        display_paths.push(display.clone());
+    }
+    Ok(Some(WindowsSourceBlobCapability {
+        directories,
+        display_paths,
+        leaf_path: display,
+    }))
 }
 
 #[cfg(windows)]
@@ -4696,6 +4852,28 @@ impl LocalFileBackend {
     }
 
     fn acquire_existing_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Exclusive)
+    }
+
+    /// Take the repository authority lock without excluding other readers.
+    ///
+    /// Only an entry point that creates nothing, renames nothing and deletes
+    /// nothing may use this. A shared holder still excludes every writer,
+    /// because every mutation takes the exclusive lock, so what a shared
+    /// reader can observe is bounded by the publication protocol rather than
+    /// by mutual exclusion.
+    fn acquire_existing_shared_lock(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Shared)
+    }
+
+    fn acquire_existing_lock_with_access(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
         let namespace = self
             .repository_capability(repo_id, false)?
             .ok_or_else(|| {
@@ -4724,8 +4902,16 @@ impl LocalFileBackend {
         Self::pin_repository_lock_identity(&namespace, &lock_file)?;
         Self::confirm_repository_lock_publication(&namespace)?;
         let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
-        use fs2::FileExt;
-        lock_target.lock_exclusive().map_err(|error| {
+        // Named through `fs2::FileExt` rather than by method call: `std`'s
+        // `File` grew inherent `lock_shared`, `try_lock_shared` and `unlock`
+        // methods that shadow this trait's, so an unqualified call would take
+        // one lock through `std` and its exclusive counterpart, which `std`
+        // does not provide under that name, through `fs2`.
+        let acquired = match access {
+            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::lock_exclusive(&lock_target),
+            LocalRepositoryLockAccess::Shared => fs2::FileExt::lock_shared(&lock_target),
+        };
+        acquired.map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to acquire existing local repository authority lock {}: {error}",
                 lock_path.display()
@@ -4738,6 +4924,43 @@ impl LocalFileBackend {
             #[cfg(unix)]
             _marker_file: lock_file,
         })
+    }
+
+    /// Whether taking the repository authority lock at `access` would block
+    /// right now, against the same lock target a real acquisition uses.
+    ///
+    /// This is how the exclusion property is asserted without a stopwatch:
+    /// a blocking acquisition can only be observed by waiting for it, and a
+    /// wait that is long enough to mean something is long enough to be flaky.
+    #[cfg(test)]
+    fn repository_lock_would_block(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+    ) -> Result<bool, KinDbError> {
+        let namespace = self.repository_capability(repo_id, false)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository authority directory {} is unavailable for a lock probe",
+                self.base_path.join(repo_id).display()
+            ))
+        })?;
+        let lock_file = Self::open_repository_lock(&namespace, false)?;
+        let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
+        let attempt = match access {
+            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_target),
+            LocalRepositoryLockAccess::Shared => fs2::FileExt::try_lock_shared(&lock_target),
+        };
+        match attempt {
+            Ok(()) => {
+                fs2::FileExt::unlock(&lock_target)
+                    .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+                Ok(false)
+            }
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to probe the local repository authority lock: {error}"
+            ))),
+        }
     }
 
     fn acquire_lock_for_initialization(
@@ -6426,7 +6649,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, max_bytes);
@@ -6439,12 +6662,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_windows_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -6482,13 +6708,15 @@ impl StorageBackend for LocalFileBackend {
             // None) while still opening every component capability-relatively.
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-                false,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
@@ -6523,7 +6751,7 @@ impl StorageBackend for LocalFileBackend {
             )));
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = operation;
@@ -6545,7 +6773,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest);
@@ -6558,12 +6786,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_windows_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -6590,13 +6821,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-                false,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             let digest_hex = hex::encode(digest);
             let byte_len = open_source_file_at(&capability.leaf_dir, &digest_hex)?
                 .map(|(_, byte_len)| byte_len);
@@ -6618,6 +6851,10 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(None);
         }
+        // Exclusive despite the name: `load_authority_unlocked` finalizes
+        // retired quarantines, which deletes quarantined delta artifacts, and
+        // clears superseded snapshots. An authority load is a recovery step,
+        // not a read.
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self.load_authority_unlocked(&lock.namespace)?;
         self.confirm_repository_visible(&lock.namespace)?;
@@ -6628,6 +6865,8 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok((None, Vec::new()));
         }
+        // Exclusive: this finalizes retired quarantines directly as well as
+        // through the authority load.
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self.load_authority_unlocked(&lock.namespace)?;
         let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
@@ -7786,6 +8025,150 @@ mod tests {
             .expect("the reader observes a complete store");
         assert_eq!(observed, Some(bodies[0].clone()));
         reader.unwrap().join().unwrap();
+    }
+
+    /// Readers of one repository stop excluding each other; writers still
+    /// exclude everyone.
+    ///
+    /// Every acquisition here goes through the real lock target, and the
+    /// unheld case is the control: the probe is able to report "free", so a
+    /// report of "would block" carries information.
+    #[test]
+    fn source_blob_readers_share_the_repository_lock_and_writers_still_exclude_them() {
+        use LocalRepositoryLockAccess::{Exclusive, Shared};
+
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let body = b"a body two readers want at once";
+        let digest = source_digest(body);
+        backend.save_source_blob("repo-a", digest, body).unwrap();
+
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "nothing is held, so a shared acquisition is free"
+        );
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "nothing is held, so an exclusive acquisition is free"
+        );
+
+        let reader = backend.acquire_existing_shared_lock("repo-a").unwrap();
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "a second reader must not wait on the first"
+        );
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "a writer must still wait on a reader"
+        );
+        // A second reader really can complete a read while the first holds.
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(body.to_vec())
+        );
+        drop(reader);
+
+        let writer = backend.acquire_existing_lock("repo-a").unwrap();
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "a reader must still wait on a writer"
+        );
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "a writer must still wait on a writer"
+        );
+        drop(writer);
+    }
+
+    /// A read creates nothing, so it may be taken under a shared lock.
+    ///
+    /// A repository that has never stored a body has no
+    /// `source-blobs/sha256/HH` chain. Reading used to mint that chain, which
+    /// is a mutation, and was the only reason a lookup needed the exclusive
+    /// lock. The GCS backend answers the same trait methods without creating
+    /// anything, so directory creation was never part of the read contract.
+    #[test]
+    fn source_blob_read_of_a_repository_without_bodies_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        let source_blobs = dir.path().join("repo-a").join("source-blobs");
+        assert!(!source_blobs.exists());
+
+        let digest = source_digest(b"a body this repository never stored");
+        assert_eq!(backend.load_source_blob("repo-a", digest).unwrap(), None);
+        assert!(
+            !source_blobs.exists(),
+            "a lookup must not mint the digest-prefix chain"
+        );
+        assert_eq!(backend.source_blob_len("repo-a", digest).unwrap(), None);
+        assert!(
+            !source_blobs.exists(),
+            "a length probe must not mint the digest-prefix chain"
+        );
+        assert_eq!(
+            backend
+                .load_source_blob_bounded("repo-a", digest, 16)
+                .unwrap(),
+            None
+        );
+        assert!(!source_blobs.exists());
+
+        // A repository that does hold bodies still answers a missing one with
+        // None rather than an error.
+        let stored = b"a body this repository does store";
+        let stored_digest = source_digest(stored);
+        backend
+            .save_source_blob("repo-a", stored_digest, stored)
+            .unwrap();
+        assert_eq!(
+            backend.load_source_blob("repo-a", stored_digest).unwrap(),
+            Some(stored.to_vec())
+        );
+        assert_eq!(backend.load_source_blob("repo-a", digest).unwrap(), None);
+    }
+
+    /// A symlinked or non-directory ancestor is still a refusal, not absence.
+    #[cfg(unix)]
+    #[test]
+    fn source_blob_read_still_refuses_a_symlinked_prefix_rather_than_reporting_absence() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let body = b"a body below a substituted prefix";
+        let digest = source_digest(body);
+        backend.save_source_blob("repo-a", digest, body).unwrap();
+
+        let prefix = dir
+            .path()
+            .join("repo-a")
+            .join("source-blobs")
+            .join("sha256")
+            .join(&hex::encode(digest)[..2]);
+        std::fs::remove_dir_all(&prefix).unwrap();
+        symlink(outside.path(), &prefix).unwrap();
+
+        let error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("a symlinked digest prefix must fail closed, not read as absent");
+        assert!(
+            error.to_string().contains("refusing symlinked"),
+            "unexpected substituted-prefix error: {error}"
+        );
     }
 
     #[test]
