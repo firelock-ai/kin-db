@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.13] - 2026-08-06
+
+### Added
+
+- `StorageBackend::with_source_blob_write_batch` writes many immutable bodies
+  under one repository authority envelope. A local backend takes the
+  repository lock once for the whole session instead of once per content
+  address, and issues one set of durability barriers at the flush rather than
+  seven per body: three confirming the `source-blobs/sha256/HH` chain, the
+  directory barrier inside the no-clobber publication, the acknowledgement
+  fsync, and a trailing directory barrier. The per-body fsync that precedes
+  the `linkat` naming it does not move, so a directory entry still never
+  becomes durable ahead of the bytes it names and a batch that loses power
+  before its flush loses names rather than producing torn bodies. Bodies are
+  durable when the session returns `Ok`, and readers cannot observe an
+  unflushed session because the repository lock excludes them for its whole
+  duration. `save_source_blob` keeps its per-body contract unchanged, and the
+  default trait implementation writes through it.
+
 ## [0.7.11] - 2026-08-01
 
 ### Fixed
