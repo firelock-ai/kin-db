@@ -276,7 +276,7 @@ fn record_repository_visibility_confirmation() {}
 
 /// Repository-visibility confirmations and prefix capability walks recorded on
 /// this thread since the last reset.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn source_envelope_counters() -> (u64, u64) {
     (
         SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(std::cell::Cell::get),
@@ -284,7 +284,7 @@ fn source_envelope_counters() -> (u64, u64) {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn reset_source_envelope_counters() {
     SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(|confirmations| confirmations.set(0));
     SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(0));
@@ -320,7 +320,7 @@ fn record_source_ordering_barrier() {}
 
 /// Device flushes and ordering barriers recorded on this thread since the
 /// last reset.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn source_barrier_counters() -> (u64, u64) {
     (
         SOURCE_DEVICE_FLUSHES.with(std::cell::Cell::get),
@@ -328,7 +328,7 @@ fn source_barrier_counters() -> (u64, u64) {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn reset_source_barrier_counters() {
     SOURCE_DEVICE_FLUSHES.with(|flushes| flushes.set(0));
     SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(0));
