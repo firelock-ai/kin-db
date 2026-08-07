@@ -307,12 +307,15 @@ fn record_source_device_flush() {
 #[cfg(not(test))]
 fn record_source_device_flush() {}
 
-#[cfg(all(test, unix))]
+// Gated to Apple, not merely to unix: `F_BARRIERFSYNC` is the only ordering
+// barrier this path issues and it exists nowhere else, so a unix-wide
+// definition is dead code on Linux and fails the `-D warnings` gate there.
+#[cfg(all(test, target_vendor = "apple"))]
 fn record_source_ordering_barrier() {
     SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(barriers.get() + 1));
 }
 
-#[cfg(all(not(test), unix))]
+#[cfg(all(not(test), target_vendor = "apple"))]
 fn record_source_ordering_barrier() {}
 
 /// Device flushes and ordering barriers recorded on this thread since the
