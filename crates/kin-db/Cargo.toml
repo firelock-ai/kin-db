@@ -51,7 +51,7 @@ libc = { workspace = true }
 bincode = "1"
 rmp-serde = "1"
 sha2 = "0.11"
-gix-ignore = "0.21"
+gix-ignore = "0.22"
 bstr = "1"
 memmap2 = "0.9"
 fs2 = "0.4"
