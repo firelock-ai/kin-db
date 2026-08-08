@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.17] - 2026-08-07
+
+### Changed
+
+- A source-blob write session pays its repository envelope once instead of
+  once per body. `publish_source_blob_in_namespace` re-resolved the repository
+  from the filesystem root at entry and exit of every body, and re-walked and
+  re-confirmed the `source-blobs/sha256/HH` chain per body. Under a held write
+  batch both checks move to the session boundary: acquiring the repository
+  lock already confirms the namespace under the lock, the flush confirms it
+  again, each digest prefix is walked and confirmed once when it is pinned,
+  and the flush re-confirms every pinned prefix before it issues a barrier.
+  `save_source_blob` is unchanged, and so is what either path stores.
+
+- Source-blob reads take a shared repository lock instead of an exclusive one,
+  so concurrent readers of one repository no longer serialize on each other.
+  `load_source_blob`, `load_source_blob_bounded`, `source_blob_len` and
+  `with_verified_source_blob_batch` are the converted entry points. Every
+  mutation still takes the exclusive lock, so a writer still excludes every
+  reader and a reader still excludes every writer. Reads also stop creating
+  the `source-blobs/sha256/HH` chain: a lookup against a repository that has
+  never stored a body now returns `None` with nothing written, which is what
+  the GCS backend has always done for the same trait methods.
+  `load_snapshot_authority` and `load_recovery_state` deliberately stay
+  exclusive because loading authority finalizes retired quarantines and clears
+  superseded snapshots, which are mutations.
+
+- A source-blob write session flushes the drive's write cache once rather than
+  once per body. On Apple platforms `File::sync_all` is `fcntl(F_FULLFSYNC)`,
+  a full device cache flush; a session now issues `fcntl(F_BARRIERFSYNC)` per
+  body, which orders that body ahead of the `linkat` that names it, and one
+  `F_FULLFSYNC` at the flush before any directory barrier. The load-bearing
+  invariant strengthens: at the moment a name becomes durable, every body it
+  could name is on stable media. A crash before the flush still loses names
+  rather than tearing bodies. On a four-thousand-body import that is roughly
+  4,800 device flushes down to about 260. `save_source_blob`, non-Apple
+  platforms, where `fsync` is already the strongest barrier available, and
+  Windows, which does not defer at all, are unchanged. A volume without
+  barrier support falls back to the full flush.
+
 ## [0.7.13] - 2026-08-06
 
 ### Added
