@@ -1,4 +1,4 @@
-KinDB — Embeddable Code Graph Database
+kin-db: graph storage and retrieval substrate for the Kin ecosystem
 Copyright 2026 Firelock, LLC
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,22 +15,22 @@ limitations under the License.
 
 This project includes the following third-party components:
 
-- usearch (Apache-2.0 License)
-  Copyright (c) 2023 Ash Vardanian and contributors
-  Used for: HNSW vector similarity search
-
-- tantivy (MIT License)
-  Copyright (c) 2016 Paul Masurel and contributors
-  Used for: full-text search indexing
-
-- candle (MIT License / Apache-2.0 License)
-  Copyright (c) 2023 Hugging Face, Inc.
-  Used for: neural network inference (code embeddings)
-
-- parking_lot (MIT License / Apache-2.0 License)
+- parking_lot (MIT OR Apache-2.0)
   Copyright (c) 2016 Amanieu d'Antras
   Used for: concurrent lock primitives
 
-- hashbrown (MIT License / Apache-2.0 License)
+- hashbrown (MIT OR Apache-2.0)
   Copyright (c) 2018 Amanieu d'Antras
   Used for: high-performance hash maps
+
+- tokenizers (Apache-2.0)
+  Developed by Hugging Face and contributors
+  Used for: tokenization in the code embedding pipeline
+
+- hf-hub (Apache-2.0)
+  Developed by Hugging Face and contributors
+  Used for: fetching embedding model files from the Hugging Face Hub
+
+HNSW vector search, BM25 full-text search, and embedding inference are
+first-party Kin components (kin-vector, kin-search, and kin-infer), not
+third-party software.
