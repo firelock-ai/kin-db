@@ -756,6 +756,15 @@ fn relation_is_entity_only(relation: &Relation) -> bool {
 /// The comparison deliberately excludes graph-derived context lines. Those come
 /// from the neighborhood at embed time, and every transition that changes them
 /// arrives as a relation delta, which invalidates both endpoints on its own.
+///
+/// That relation-delta guarantee is a producer contract, not an engine one:
+/// today's delta builders retire an entity's id on rename, so a neighbor whose
+/// context line quotes the old name always sees relation rewrites in the same
+/// transaction. A producer that instead emitted `Modified` with a changed name
+/// under the SAME id, and no relation deltas, would leave skipped neighbors
+/// holding context lines that quote the old name until something else
+/// invalidates them. Any such producer must expand invalidation to the renamed
+/// entity's graph neighbors itself.
 #[cfg(feature = "vector")]
 fn entity_embedding_text_unchanged(old: &Entity, new: &Entity) -> bool {
     crate::embed::format_graph_entity_text(old) == crate::embed::format_graph_entity_text(new)
@@ -7426,6 +7435,10 @@ impl EntityStore for InMemoryGraph {
                         delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
+                        // Upstream validation permits one delta per entity, but
+                        // the skip set must stay correct even for a caller that
+                        // bypasses it: an addition is never skippable.
+                        embedding_text_unchanged.remove(&entity.id);
                     }
                     EntityDelta::Modified { old, new: entity } => {
                         if ent.entities.remove(&entity.id).is_some() {
@@ -7455,6 +7468,11 @@ impl EntityStore for InMemoryGraph {
                         merkle_seeds.insert(entity.id);
                         if entity_embedding_text_unchanged(old, entity) {
                             embedding_text_unchanged.insert(entity.id);
+                        } else {
+                            // Keep the set correct under duplicate deltas for
+                            // one id from a caller that skipped validation: a
+                            // text-changing delta always wins over a skip.
+                            embedding_text_unchanged.remove(&entity.id);
                         }
                     }
                     EntityDelta::Removed { old } => {
@@ -15192,6 +15210,24 @@ mod tests {
             (
                 "file_origin",
                 Box::new(|e: &mut Entity| e.file_origin = Some(FilePathId::new("src/moved.rs"))),
+            ),
+            (
+                "file_import_context",
+                Box::new(|e: &mut Entity| {
+                    e.metadata.extra.insert(
+                        crate::embed::FILE_IMPORT_CONTEXT_KEY.into(),
+                        serde_json::json!("use crate::engine::graph::GraphTruth;"),
+                    );
+                }),
+            ),
+            (
+                "file_surface_context",
+                Box::new(|e: &mut Entity| {
+                    e.metadata.extra.insert(
+                        crate::embed::FILE_SURFACE_CONTEXT_KEY.into(),
+                        serde_json::json!("pub fn surface_shape() -> Shape"),
+                    );
+                }),
             ),
         ];
 
