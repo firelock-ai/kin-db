@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.20] - 2026-08-11
+
+### Changed
+
+* Update the README trust line to the current approved wording by @troyjr4103 in https://github.com/firelock-ai/kin-db/pull/173
+* Invalidate embeddings per entity instead of per file by @troyjr4103 in https://github.com/firelock-ai/kin-db/pull/175
+
+**Full Changelog**: https://github.com/firelock-ai/kin-db/compare/v0.7.19...v0.7.20
+
+## [0.7.19] - 2026-08-08
+
+### Changed
+
+* Read the vector sidecar through its loader instead of decoding it here by @troyjr4103 in https://github.com/firelock-ai/kin-db/pull/172
+
+**Full Changelog**: https://github.com/firelock-ai/kin-db/compare/v0.7.18...v0.7.19
+
+## [0.7.18] - 2026-08-08
+
+### Changed
+
+* chore(deps): refresh Kin registry pins after kin-model@0.7.8 by @troyjr4103 in https://github.com/firelock-ai/kin-db/pull/174
+
+**Full Changelog**: https://github.com/firelock-ai/kin-db/compare/v0.7.17...v0.7.18
+
 ## [0.7.17] - 2026-08-07
 
 ### Changed
@@ -610,7 +635,31 @@ in git history.
 - Embed config tolerance for duplicate `layer_norm_eps`, and an in-memory vector
   cache bound (0.2.2, 0.2.22).
 
-[unreleased]: https://github.com/firelock-ai/kin-db/compare/9dfbe2da3c94...HEAD
+[unreleased]: https://github.com/firelock-ai/kin-db/compare/v0.7.20...HEAD
+[0.7.20]: https://github.com/firelock-ai/kin-db/compare/v0.7.19...v0.7.20
+[0.7.19]: https://github.com/firelock-ai/kin-db/compare/v0.7.18...v0.7.19
+[0.7.18]: https://github.com/firelock-ai/kin-db/compare/v0.7.17...v0.7.18
+[0.7.17]: https://github.com/firelock-ai/kin-db/compare/v0.7.13...v0.7.17
+[0.7.13]: https://github.com/firelock-ai/kin-db/compare/v0.7.11...v0.7.13
+[0.7.11]: https://github.com/firelock-ai/kin-db/compare/v0.7.8...v0.7.11
+[0.7.8]: https://github.com/firelock-ai/kin-db/compare/6bc2bdb2c80d...v0.7.8
+[0.7.5]: https://github.com/firelock-ai/kin-db/compare/v0.7.4...6bc2bdb2c80d
+[0.7.4]: https://github.com/firelock-ai/kin-db/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/firelock-ai/kin-db/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/firelock-ai/kin-db/compare/v0.7.0...v0.7.2
+[0.7.0]: https://github.com/firelock-ai/kin-db/compare/v0.6.7...v0.7.0
+[0.6.7]: https://github.com/firelock-ai/kin-db/compare/v0.6.6...v0.6.7
+[0.6.6]: https://github.com/firelock-ai/kin-db/compare/v0.6.4...v0.6.6
+[0.6.4]: https://github.com/firelock-ai/kin-db/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/firelock-ai/kin-db/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/firelock-ai/kin-db/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/firelock-ai/kin-db/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/firelock-ai/kin-db/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/firelock-ai/kin-db/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/firelock-ai/kin-db/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/firelock-ai/kin-db/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/firelock-ai/kin-db/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/firelock-ai/kin-db/compare/9dfbe2da3c94...v0.3.1
 [0.3.0]: https://github.com/firelock-ai/kin-db/compare/d46123fe1221...9dfbe2da3c94
 [0.2.40]: https://github.com/firelock-ai/kin-db/compare/b8c6ce362afe...d46123fe1221
 [0.2.39]: https://github.com/firelock-ai/kin-db/compare/daffd3c56a73...b8c6ce362afe
