@@ -78,25 +78,24 @@ jobs:
         run: cargo build --workspace --all-targets
 
       # HF_HUB_OFFLINE keeps the run deterministic and offline. The three tests
-      # that construct a real embedder and need HF weights are skipped (CI-config,
-      # no test code touched) until an offline stub-weights fixture exists
-      # (post-freeze item) — same skip as ci.yml so both workflows match. Metal-
-      # only tests are already #[ignore]. Everything else (graph/storage/search/
+      # that construct a real embedder and need HF weights are skipped
+      # (CI-config, no test code touched) until an offline stub-weights fixture
+      # exists, the same skip as ci.yml so both workflows match. Metal-only
+      # tests are already #[ignore]. Everything else (graph/storage/search/
       # vector/text) is pure-Rust and runs.
       - name: Test
         working-directory: kin-db
         env:
           HF_HUB_OFFLINE: "1"
-        # many_vectors_search_quality: duplicate-vector fixture whose exact-top-1
-        # identity assertion flipped at kin-vector efe77db (bisected) — key-hash
-        # tie-break returns a different zero-distance duplicate, not a recall
-        # regression. Skipped here too (same as ci.yml); POST-M1 fixture fix.
+        # many_vectors_search_quality runs again here, matching ci.yml. Its
+        # duplicate-vector fixture was fixed on 2026-06-12 to assert an
+        # exact-match neighbour rather than which tied duplicate wins, so the
+        # tie-break change it was skipped for can no longer fail it.
         run: >-
           cargo test --workspace --
           --skip process_embedding_queue_without_embeddings_is_noop
           --skip default_dimensions_match_default_model
           --skip test_vector_index_dimension_mismatch_auto_recovery
-          --skip many_vectors_search_quality
 
       # Optional-feature runtime coverage. The deterministic versioned-object
       # fixture exercises GCS generation/CAS/reopen behavior without credentials;
@@ -128,8 +127,8 @@ jobs:
           cargo check --workspace --all-targets --target x86_64-unknown-linux-musl
           # Consumers resolve libc through their own lockfiles, not through this
           # workspace, and the kin release that builds these artifacts resolves
-          # 0.2.186 — the newest libc whose musl module declares no `renameat2`
-          # wrapper. A freshly resolved libc hides that difference, so pin the
+          # 0.2.186. That is the newest libc whose musl module declares no
+          # `renameat2` wrapper. A freshly resolved libc hides it, so pin the
           # consumer's version and check again; without this the guard passes
           # whether or not the musl path is sound. Move the pin only when the
           # dependency graph stops resolving it.

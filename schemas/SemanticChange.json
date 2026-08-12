@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SemanticChange",
-  "description": "Kin's native commit — the unit of semantic history.",
+  "description": "Kin's native commit, the unit of semantic history.\n\nPersisted positionally in every snapshot that carries history, so the crate-level positional-wire rule applies: a new field goes last, and only a trailing field may skip serialization.",
   "type": "object",
   "required": [
     "author",
@@ -9,6 +9,7 @@
     "evidence",
     "id",
     "message",
+    "origin",
     "parents",
     "projected_files",
     "relation_deltas",
@@ -16,22 +17,22 @@
     "tree_deltas"
   ],
   "properties": {
+    "admission_policy_delta": {
+      "description": "History-versioned admission policy transition, when the policy changes.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AdmissionPolicyDelta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "author": {
       "description": "Human or assistant.",
       "allOf": [
         {
           "$ref": "#/definitions/AuthorId"
-        }
-      ]
-    },
-    "authored_on": {
-      "description": "Informational: branch name at creation time.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/BranchName"
-        },
-        {
-          "type": "null"
         }
       ]
     },
@@ -47,6 +48,13 @@
         "$ref": "#/definitions/EvidenceId"
       }
     },
+    "external_reference_deltas": {
+      "description": "Exact transitions of first-class external-symbol endpoints.\n\nDeliberately last: persisted positional encodings treat an appended, omitted-empty field as additive, while inserting one earlier would reassign every field after it.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ExternalReferenceDelta"
+      }
+    },
     "id": {
       "description": "Content-addressed hash.",
       "allOf": [
@@ -58,8 +66,16 @@
     "message": {
       "type": "string"
     },
+    "origin": {
+      "description": "Native provenance or the exact external commit identity imported.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ChangeOrigin"
+        }
+      ]
+    },
     "parents": {
-      "description": "0 = genesis, 1 = normal, 2 = merge.",
+      "description": "Ordered parent list: empty for genesis, one for an ordinary change, and any number for a merge. Order and repeated parent entries are preserved exactly for lossless Git commit import.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/SemanticChangeId"
@@ -110,6 +126,93 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "AdmissionPolicyDelta": {
+      "description": "Exact, self-inverting shared-policy transition.",
+      "type": "object",
+      "properties": {
+        "new": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SharedAdmissionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "old": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SharedAdmissionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionPolicyHash": {
+      "description": "Content identity of a resolved shared admission policy.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "AdmissionRuleSource": {
+      "description": "One branch-versioned gitwildmatch source.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "kind",
+        "path",
+        "precedence"
+      ],
+      "properties": {
+        "base_directory": {
+          "description": "Directory against which patterns in this source are rooted. `None` denotes the repository root.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RepoPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/AdmissionRuleSourceKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "precedence": {
+          "description": "Low-to-high precedence. Values must be contiguous from zero.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionRuleSourceKind": {
+      "type": "string",
+      "enum": [
+        "git_ignore",
+        "kin_ignore"
+      ]
+    },
     "ArtifactId": {
       "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
       "type": "string",
@@ -117,10 +220,6 @@
     },
     "AuthorId": {
       "description": "Author identifier (human or assistant).",
-      "type": "string"
-    },
-    "BranchName": {
-      "description": "Branch name.",
       "type": "string"
     },
     "CallArgShape": {
@@ -155,6 +254,45 @@
           "minimum": 0.0
         }
       }
+    },
+    "ChangeOrigin": {
+      "description": "Immutable provenance that participates in semantic-change identity.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "native"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "oid",
+            "type"
+          ],
+          "properties": {
+            "oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "git_commit"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "ContractId": {
       "description": "Unique identifier for a Contract.",
@@ -270,11 +408,18 @@
         {
           "type": "object",
           "required": [
-            "Added"
+            "new",
+            "operation"
           ],
           "properties": {
-            "Added": {
+            "new": {
               "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
             }
           },
           "additionalProperties": false
@@ -282,23 +427,22 @@
         {
           "type": "object",
           "required": [
-            "Modified"
+            "new",
+            "old",
+            "operation"
           ],
           "properties": {
-            "Modified": {
-              "type": "object",
-              "required": [
-                "new",
-                "old"
-              ],
-              "properties": {
-                "new": {
-                  "$ref": "#/definitions/Entity"
-                },
-                "old": {
-                  "$ref": "#/definitions/Entity"
-                }
-              }
+            "new": {
+              "$ref": "#/definitions/Entity"
+            },
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
             }
           },
           "additionalProperties": false
@@ -306,11 +450,18 @@
         {
           "type": "object",
           "required": [
-            "Removed"
+            "old",
+            "operation"
           ],
           "properties": {
-            "Removed": {
-              "$ref": "#/definitions/EntityId"
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
             }
           },
           "additionalProperties": false
@@ -366,6 +517,89 @@
     },
     "EvidenceId": {
       "description": "Unique identifier for an Evidence record.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "ExternalReference": {
+      "description": "Immutable, resolved endpoint for a symbol owned outside the local graph.\n\n`resolution_namespace` identifies both the resolver and its normalization contract. It is versioned so a change to that contract cannot silently reinterpret existing coordinates. `canonical_source` and `symbol` are resolver-issued opaque selectors, preserved byte-for-byte after validation.",
+      "type": "object",
+      "required": [
+        "canonical_source",
+        "hash",
+        "id",
+        "resolution_namespace",
+        "schema_version",
+        "symbol"
+      ],
+      "properties": {
+        "canonical_source": {
+          "type": "string"
+        },
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "id": {
+          "$ref": "#/definitions/ExternalReferenceId"
+        },
+        "resolution_namespace": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalReferenceDelta": {
+      "description": "Exact, self-inverting transitions of persisted external endpoints.\n\nExternal references are immutable. A resolver coordinate change is an explicit removal plus addition (with any affected relation modified in the same transaction), never an in-place modification.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExternalReferenceId": {
+      "description": "Stable identity of one resolver-issued external symbol coordinate.",
       "type": "string",
       "format": "uuid"
     },
@@ -510,6 +744,19 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Symbol owned outside the local repository. Deliberately last so the public variant order remains append-only even though the current MessagePack encoder tags variants by name.",
+          "type": "object",
+          "required": [
+            "ExternalReference"
+          ],
+          "properties": {
+            "ExternalReference": {
+              "$ref": "#/definitions/ExternalReferenceId"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -627,11 +874,18 @@
         {
           "type": "object",
           "required": [
-            "Added"
+            "new",
+            "operation"
           ],
           "properties": {
-            "Added": {
+            "new": {
               "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
             }
           },
           "additionalProperties": false
@@ -639,11 +893,41 @@
         {
           "type": "object",
           "required": [
-            "Removed"
+            "new",
+            "old",
+            "operation"
           ],
           "properties": {
-            "Removed": {
-              "$ref": "#/definitions/RelationId"
+            "new": {
+              "$ref": "#/definitions/Relation"
+            },
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
             }
           },
           "additionalProperties": false
@@ -902,6 +1186,112 @@
           "format": "float"
         }
       }
+    },
+    "SensitiveArtifactAllowance": {
+      "description": "Explicit approval for exactly one sensitive path, digest, and entry kind.",
+      "type": "object",
+      "required": [
+        "approved_by",
+        "content_hash",
+        "kind",
+        "path",
+        "reason"
+      ],
+      "properties": {
+        "approved_by": {
+          "$ref": "#/definitions/AuthorId"
+        },
+        "content_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "kind": {
+          "$ref": "#/definitions/SensitiveArtifactKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SensitiveArtifactKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SharedAdmissionPolicy": {
+      "description": "Replicated admission policy resolved at a semantic change.",
+      "type": "object",
+      "required": [
+        "generation",
+        "hash",
+        "semantics_version",
+        "sensitive_allowances",
+        "sources"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        },
+        "semantics_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sensitive_allowances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SensitiveArtifactAllowance"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AdmissionRuleSource"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "SourceSpan": {
       "description": "Source location of an entity within a file.",

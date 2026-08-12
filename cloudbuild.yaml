@@ -3,8 +3,13 @@
 #
 # Cloud Build config for kin-db repo.
 #
-# On every push: run tests
-# Tagged GitHub releases publish kin-model and kin-db crates to KinLab registry
+# This config runs the test suite and nothing else. It publishes no crate. The
+# kin-db crate is published to the private "kin" registry by the Registry
+# Publish workflow on pushes to main, and kin-model is published from its own
+# repository, so neither belongs to a tag build here.
+#
+# The skip list mirrors .github/workflows/ci.yml: the three tests it names
+# construct a real embedder and need HF weights this environment cannot fetch.
 
 steps:
   # Run tests
@@ -17,8 +22,7 @@ steps:
         HF_HUB_OFFLINE=1 cargo test --workspace -- \
           --skip process_embedding_queue_without_embeddings_is_noop \
           --skip default_dimensions_match_default_model \
-          --skip test_vector_index_dimension_mismatch_auto_recovery \
-          --skip many_vectors_search_quality
+          --skip test_vector_index_dimension_mismatch_auto_recovery
     id: 'test'
 
 options:

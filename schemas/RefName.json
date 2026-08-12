@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RefName",
+  "type": "object",
+  "required": [
+    "bytes_hex"
+  ],
+  "properties": {
+    "bytes_hex": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

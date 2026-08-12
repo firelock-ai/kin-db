@@ -49,17 +49,22 @@ Feature flags of note:
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `vector` | on | HNSW vector index via `kin-vector` |
-| `embeddings` | on | GPU embedding via `kin-infer` |
+| `embeddings` | on | On-device embedding inference via `kin-infer`, on CPU unless a GPU backend is also enabled |
 | `metal` | off | Apple Metal GPU backend (requires `embeddings`) |
+| `accelerate` | off | Apple Accelerate BLAS for the CPU embedding path (requires `embeddings`) |
 | `gcs` | off | Google Cloud Storage snapshot backend |
+| `sql` | off | SQLite snapshot backend |
 
 ## Key types
 
 - `InMemoryGraph`: the live, mutable graph. Implements `GraphStore`,
   `EntityStore`, `ChangeStore`, `SessionStore`, `ProvenanceStore`, and
   `VerificationStore`.
-- `TieredGraph`: tiered storage wrapper, a hot in-memory graph over a
-  configurable cold backend with configurable memory limits.
+- `TieredGraph`: a hot in-memory tier over a cold memory-mapped snapshot tier,
+  with a configurable hot-tier byte budget. Implemented but not yet wired into
+  the load/serve path: `SnapshotManager` always deserializes a snapshot fully
+  into one `InMemoryGraph`, so the cold tier backs no production read today.
+  Treat it as a candidate mechanism rather than a shipping capability.
 - `SnapshotManager`: atomic snapshot persistence and swap.
 - `GraphSnapshot` / `GraphSnapshotDelta`: serializable full and incremental
   graph states for persistence and sync.

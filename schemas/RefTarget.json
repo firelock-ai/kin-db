@@ -1,0 +1,181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RefTarget",
+  "description": "Exact target of a repository ref.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "change_id",
+        "type"
+      ],
+      "properties": {
+        "change_id": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "change"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "object",
+        "type"
+      ],
+      "properties": {
+        "object": {
+          "$ref": "#/definitions/ExternalObjectId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "external_object"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "target",
+        "type"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/definitions/RefName"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "symbolic"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "ExternalObjectId": {
+      "description": "Typed identity of one object in an external Git object database.",
+      "type": "object",
+      "required": [
+        "kind",
+        "oid"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExternalObjectKind"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectKind": {
+      "description": "The object type that participates in Git's object header and object ID.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "tree",
+        "blob",
+        "tag"
+      ]
+    },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "RefName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    }
+  }
+}

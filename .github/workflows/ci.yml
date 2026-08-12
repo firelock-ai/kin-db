@@ -95,6 +95,14 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Key on the manifests, not on Cargo.lock. kin-db is a library workspace
+      # and gitignores its lockfile, so no Cargo.lock exists when this step
+      # runs and `hashFiles` returns an empty string. That left the key frozen
+      # at `<os>-cargo-`, and a cache key is immutable, so every later run hit
+      # the primary key and skipped the save. The 2026-08-12 main run says so
+      # in its own log: "Cache hit occurred on the primary key Linux-cargo-,
+      # not saving cache." The cache had stopped tracking the dependency set
+      # entirely while still reading as a hit.
       - name: Cache cargo registry and build
         uses: actions/cache@v6
         with:
@@ -102,7 +110,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -118,9 +126,10 @@ jobs:
         # still applies to everything else, so no NEW lint can slip in. Burn these
         # down one at a time post-freeze (smallest blast radius first); delete each
         # -A line as its lint reaches zero.
-        # PRIORITY REVIEW: clippy::suspicious_open_options — the truncate-cousin
-        # class (cf. kin-vector .truncate(false) fix); verify open-options intent
-        # before clearing, do NOT blindly accept a clippy autofix here.
+        # PRIORITY REVIEW: clippy::suspicious_open_options belongs to the
+        # truncate-cousin class (cf. kin-vector .truncate(false) fix); verify
+        # open-options intent before clearing, do NOT blindly accept a clippy
+        # autofix here.
         # NOTE: the rustc `deprecated` lint is no longer allow-listed:
         # all kin-db call sites were migrated to the graph-assigned ArtifactId via
         # the `artifact_index` lookup, so -D warnings now denies it here too.
@@ -148,21 +157,19 @@ jobs:
 
       - name: Test
         # HF_HUB_OFFLINE keeps the run deterministic/offline. These three tests
-        # construct a real embedder and need HF network + nomic weights, which CI
-        # cannot fetch — skipped here (CI-config, no test code touched) until an
-        # offline stub-weights fixture exists (post-freeze item). Everything else
+        # construct a real embedder and need HF network plus nomic weights, which
+        # CI cannot fetch, so they are skipped here (CI-config, no test code
+        # touched) until an offline stub-weights fixture exists. Everything else
         # (graph/storage/search/vector/text) is pure-Rust and runs.
         #
-        # many_vectors_search_quality: its fixture inserts 100 vectors with only 8
-        # distinct patterns (13 IDENTICAL to the query) and asserts exact-top-1 ==
-        # the first-inserted duplicate. BISECTED to kin-vector efe77db: it passes
-        # at efe77db~1 (insertion-order tie-break returns key 0) and fails at
-        # efe77db (key-hash tie-break deterministically returns key 8). This is a
-        # CORRECTNESS fix, NOT a recall regression — the returned neighbor is still
-        # a perfect zero-distance match; only which identical-distance duplicate
-        # wins changed. The exact-identity assertion is too strict for a
-        # duplicate-vector fixture. POST-M1: fix the fixture (assert a zero-distance
-        # match / use distinct vectors) as part of the HNSW key-hash recall audit.
+        # many_vectors_search_quality is no longer skipped. It was, because its
+        # fixture inserted 100 vectors with only 8 distinct patterns and then
+        # asserted which of the identical-distance duplicates won the tie, which
+        # flipped when kin-vector moved to a key-hash tie-break. The fixture was
+        # fixed on 2026-06-12 to assert what approximate kNN actually promises,
+        # that the top hit's stored vector equals the query vector, and it has
+        # passed since. A skip outliving its cause hides a real vector-search
+        # regression, so the reason has to expire with the defect.
         env:
           HF_HUB_OFFLINE: "1"
         run: >-
@@ -170,7 +177,6 @@ jobs:
           --skip process_embedding_queue_without_embeddings_is_noop
           --skip default_dimensions_match_default_model
           --skip test_vector_index_dimension_mismatch_auto_recovery
-          --skip many_vectors_search_quality
 
       - name: 100K hydration smoke guard
         # This is a wall-clock guard, so run it outside the parallel suite.
@@ -185,6 +191,20 @@ jobs:
           --test-threads=1
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
+
+  schema-provenance:
+    name: Schema Provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # schemas/ is schemars output for kin-model types, and kin-model owns the
+      # generator, so this repo cannot regenerate them and no runtime path reads
+      # them. Both facts together are why they drifted three minor versions
+      # behind the pin with CI green the whole way. Comparing the recorded
+      # generator version against the pin is the part this repo can prove alone.
+      - name: Check schema provenance
+        run: ./scripts/check-schema-provenance.sh
 
   coverage:
     name: Code Coverage
@@ -202,7 +222,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-tarpaulin-
 

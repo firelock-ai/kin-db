@@ -1,0 +1,3913 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RepositoryTransaction",
+  "description": "One atomic repository-authority transition.\n\nThis type is persisted through a positional MessagePack encoding. Any future optional authority field must be appended after every existing field and carry compatibility tests for every combination of adjacent optional tail fields. A later tail value must keep an explicit `nil` placeholder for any absent earlier value so positions never shift.",
+  "type": "object",
+  "required": [
+    "actor",
+    "aliases",
+    "changes",
+    "expected_generation",
+    "expected_roots",
+    "external_objects",
+    "operation_id",
+    "reason",
+    "ref_mutations",
+    "repository_id",
+    "schema_version"
+  ],
+  "properties": {
+    "actor": {
+      "$ref": "#/definitions/AuthorId"
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ExternalChangeAlias"
+      }
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SemanticChange"
+      }
+    },
+    "default_ref_mutation": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DefaultRefMutation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expected_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "expected_roots": {
+      "$ref": "#/definitions/RootBundle"
+    },
+    "external_objects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ExternalObjectRecord"
+      }
+    },
+    "git_authority_delta": {
+      "description": "Exact compare-and-swap of repository-scoped Git authority. Closure records may already exist in CAS and need not be repeated above.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GitExternalAuthorityDelta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "local_overlay_delta": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FrozenLocalOverlayDelta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "merge_transaction_delta": {
+      "description": "Exact transition of one workspace's durable merge record.\n\nA merge that composes cleanly publishes without one. This carries the merges that did not: opening a conflict set, settling an entry, and terminating by publishing the merge change or aborting back to the recorded restore point. Optional and omitted when absent, so a transaction that touches no merge keeps its existing identity.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MergeTransactionDelta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "operation_id": {
+      "$ref": "#/definitions/OperationId"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "ref_mutations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RefMutation"
+      }
+    },
+    "repository_id": {
+      "$ref": "#/definitions/RepositoryId"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "sealed_observation": {
+      "description": "Fingerprint and coverage of the admitted content closure observed by the enforcement layer.\n\nRepository storage validates only the binding's internal shape and binds it into transaction identity. It cannot re-derive the fingerprint; admission remains responsible for verifying it against graph-owned content before committing this transaction.\n\nDeliberately last. Positional serialization emits an explicit absent merge slot when this field is present without a merge delta.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SealedObservationBinding"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workspace_mutation": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorkspaceMutation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AdmissionCase": {
+      "description": "Filesystem case behavior frozen into one local admission overlay.\n\nThis is authority, not a host hint: the exact same policy bytes produce different answers under case-sensitive and ASCII-folded matching. Persisting the behavior in the overlay identity keeps reopen, replication-local workspace state, and later scans on the same matcher semantics.",
+      "type": "string",
+      "enum": [
+        "sensitive",
+        "fold_ascii"
+      ]
+    },
+    "AdmissionPolicyDelta": {
+      "description": "Exact, self-inverting shared-policy transition.",
+      "type": "object",
+      "properties": {
+        "new": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SharedAdmissionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "old": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SharedAdmissionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionPolicyHash": {
+      "description": "Content identity of a resolved shared admission policy.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "AdmissionPolicyStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionRuleSource": {
+      "description": "One branch-versioned gitwildmatch source.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "kind",
+        "path",
+        "precedence"
+      ],
+      "properties": {
+        "base_directory": {
+          "description": "Directory against which patterns in this source are rooted. `None` denotes the repository root.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RepoPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/AdmissionRuleSourceKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "precedence": {
+          "description": "Low-to-high precedence. Values must be contiguous from zero.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionRuleSourceKind": {
+      "type": "string",
+      "enum": [
+        "git_ignore",
+        "kin_ignore"
+      ]
+    },
+    "ArtifactId": {
+      "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "AuthorId": {
+      "description": "Author identifier (human or assistant).",
+      "type": "string"
+    },
+    "AuthorityRoot": {
+      "description": "One versioned digest in the repository authority root bundle.",
+      "type": "object",
+      "required": [
+        "hash",
+        "version"
+      ],
+      "properties": {
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CallArgShape": {
+      "description": "The argument shape observed at a single call site: how many positional arguments were passed, which keyword-argument names were used, and whether the call forwards a `*args` positional splat or a `**kwargs` keyword splat.\n\nCaptured per `Calls` edge so a consumer that invokes a callable positionally (unaffected by a parameter rename) can be told apart from one that names a parameter (which a rename would strand). A `**kwargs` splat means the keyword set is not statically known; the arity is known exactly only when neither splat flag is set.\n\n`keywords` is kept sorted and deduplicated so the shape is order- and duplicate-independent, keeping graph writes deterministic.",
+      "type": "object",
+      "required": [
+        "has_var_keyword",
+        "has_var_positional",
+        "keywords",
+        "positional"
+      ],
+      "properties": {
+        "has_var_keyword": {
+          "description": "The call forwards a `**mapping` keyword splat, so its keyword set is not statically known.",
+          "type": "boolean"
+        },
+        "has_var_positional": {
+          "description": "The call forwards a `*sequence` positional splat (or an equivalent pack-expansion).",
+          "type": "boolean"
+        },
+        "keywords": {
+          "description": "Sorted, deduplicated names of explicit keyword arguments (`name=value`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "positional": {
+          "description": "Number of positional argument expressions passed. A `*sequence` splat is not counted here; it is recorded by `has_var_positional`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ChangeOrigin": {
+      "description": "Immutable provenance that participates in semantic-change identity.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "native"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "oid",
+            "type"
+          ],
+          "properties": {
+            "oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "git_commit"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ContractId": {
+      "description": "Unique identifier for a Contract.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "DefaultRefExpectation": {
+      "description": "CAS expectation for the repository's optional default ref.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_be_unset"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_equal"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "DefaultRefMutation": {
+      "type": "object",
+      "required": [
+        "expected"
+      ],
+      "properties": {
+        "expected": {
+          "$ref": "#/definitions/DefaultRefExpectation"
+        },
+        "new_default": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EffectiveAdmissionPolicyStamp": {
+      "description": "Complete policy identity consumed by one local workspace.",
+      "type": "object",
+      "required": [
+        "local",
+        "shared"
+      ],
+      "properties": {
+        "local": {
+          "$ref": "#/definitions/LocalOverlayStamp"
+        },
+        "shared": {
+          "$ref": "#/definitions/AdmissionPolicyStamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Entity": {
+      "description": "The atomic semantic unit in Kin's graph.",
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "id",
+        "kind",
+        "language",
+        "metadata",
+        "name",
+        "role",
+        "signature",
+        "visibility"
+      ],
+      "properties": {
+        "created_in": {
+          "description": "None while in overlay; set on kin commit.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "doc_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_origin": {
+          "description": "None for graph-created entities before placement.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FilePathId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "$ref": "#/definitions/SemanticFingerprint"
+        },
+        "id": {
+          "$ref": "#/definitions/EntityId"
+        },
+        "kind": {
+          "$ref": "#/definitions/EntityKind"
+        },
+        "language": {
+          "$ref": "#/definitions/LanguageId"
+        },
+        "lineage_parent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "$ref": "#/definitions/EntityMetadata"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/definitions/EntityRole"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "span": {
+          "description": "None until projection assigns a file location.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "superseded_by": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "visibility": {
+          "$ref": "#/definitions/Visibility"
+        }
+      }
+    },
+    "EntityDelta": {
+      "description": "Delta for a single entity within a SemanticChange.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Entity"
+            },
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "EntityId": {
+      "description": "Unique identifier for an Entity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "EntityKind": {
+      "description": "Classification of a semantic entity.",
+      "type": "string",
+      "enum": [
+        "function",
+        "class",
+        "interface",
+        "trait_def",
+        "type_alias",
+        "module",
+        "package",
+        "test",
+        "schema",
+        "api_endpoint",
+        "event_contract",
+        "file",
+        "document_node",
+        "method",
+        "enum_def",
+        "enum_variant",
+        "constant",
+        "static_var",
+        "macro"
+      ]
+    },
+    "EntityMetadata": {
+      "description": "Extensible metadata bag for entities.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "EntityRole": {
+      "description": "Role of a semantic entity within the project.",
+      "type": "string",
+      "enum": [
+        "source",
+        "test",
+        "external",
+        "docs",
+        "generated",
+        "vendored"
+      ]
+    },
+    "EvidenceId": {
+      "description": "Unique identifier for an Evidence record.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "ExternalChangeAlias": {
+      "description": "Repository-scoped mapping from an external commit OID to final Kin truth.",
+      "type": "object",
+      "required": [
+        "change_id",
+        "oid",
+        "repository_id"
+      ],
+      "properties": {
+        "change_id": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        },
+        "repository_id": {
+          "$ref": "#/definitions/RepositoryId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectId": {
+      "description": "Typed identity of one object in an external Git object database.",
+      "type": "object",
+      "required": [
+        "kind",
+        "oid"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExternalObjectKind"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectKind": {
+      "description": "The object type that participates in Git's object header and object ID.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "tree",
+        "blob",
+        "tag"
+      ]
+    },
+    "ExternalObjectRecord": {
+      "description": "Exact raw-body descriptor for an external object.\n\n`body_hash` addresses the body in Kin's blob CAS. `oid` is independently verified over Git's `\"<kind> <len>\\0<body>\"` envelope.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "object"
+      ],
+      "properties": {
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "object": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalReference": {
+      "description": "Immutable, resolved endpoint for a symbol owned outside the local graph.\n\n`resolution_namespace` identifies both the resolver and its normalization contract. It is versioned so a change to that contract cannot silently reinterpret existing coordinates. `canonical_source` and `symbol` are resolver-issued opaque selectors, preserved byte-for-byte after validation.",
+      "type": "object",
+      "required": [
+        "canonical_source",
+        "hash",
+        "id",
+        "resolution_namespace",
+        "schema_version",
+        "symbol"
+      ],
+      "properties": {
+        "canonical_source": {
+          "type": "string"
+        },
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "id": {
+          "$ref": "#/definitions/ExternalReferenceId"
+        },
+        "resolution_namespace": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalReferenceDelta": {
+      "description": "Exact, self-inverting transitions of persisted external endpoints.\n\nExternal references are immutable. A resolver coordinate change is an explicit removal plus addition (with any affected relation modified in the same transaction), never an in-place modification.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExternalReferenceId": {
+      "description": "Stable identity of one resolver-issued external symbol coordinate.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "FilePathId": {
+      "description": "File path identifier.",
+      "type": "string"
+    },
+    "FingerprintAlgorithm": {
+      "type": "string",
+      "enum": [
+        "V1TreeSitter"
+      ]
+    },
+    "FrozenLocalOverlay": {
+      "description": "Frozen local overlay. It changes only through an explicit refresh.",
+      "type": "object",
+      "required": [
+        "case",
+        "generation",
+        "hash",
+        "sources",
+        "workspace_id"
+      ],
+      "properties": {
+        "case": {
+          "$ref": "#/definitions/AdmissionCase"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/LocalOverlayHash"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LocalAdmissionRuleSource"
+          }
+        },
+        "workspace_id": {
+          "$ref": "#/definitions/WorkspaceId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FrozenLocalOverlayDelta": {
+      "description": "Exact, self-inverting refresh of a workspace's frozen local overlay.",
+      "type": "object",
+      "properties": {
+        "new": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FrozenLocalOverlay"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "old": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FrozenLocalOverlay"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitCommitCanonicalIdentity": {
+      "description": "Kin-canonical identity of one parsed raw Git commit projection.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "GitCommitProjection": {
+      "description": "Parsed fields that define Git commit ancestry and tree identity.",
+      "type": "object",
+      "required": [
+        "canonical_identity",
+        "commit_oid",
+        "parent_oids",
+        "raw_tree_oid"
+      ],
+      "properties": {
+        "canonical_identity": {
+          "$ref": "#/definitions/GitCommitCanonicalIdentity"
+        },
+        "commit_oid": {
+          "$ref": "#/definitions/GitObjectId"
+        },
+        "parent_oids": {
+          "description": "Exact order from the raw commit body, including repeated parents.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectId"
+          }
+        },
+        "raw_tree_oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitExternalAuthority": {
+      "description": "Complete external Git authority admitted at the migration boundary.",
+      "type": "object",
+      "required": [
+        "closure",
+        "commit_projections",
+        "material_head",
+        "object_format",
+        "raw_head",
+        "raw_refs",
+        "repository_id",
+        "schema_version"
+      ],
+      "properties": {
+        "closure": {
+          "$ref": "#/definitions/GitObjectClosureManifest"
+        },
+        "commit_projections": {
+          "description": "Canonically ordered by raw commit OID.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitCommitProjection"
+          }
+        },
+        "material_head": {
+          "description": "Separately derived decision about workspace materializability.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GitMaterialHead"
+            }
+          ]
+        },
+        "object_format": {
+          "$ref": "#/definitions/GitObjectFormat"
+        },
+        "raw_head": {
+          "description": "Exact raw `HEAD`, before symbolic resolution or tag peeling.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GitRawTarget"
+            }
+          ]
+        },
+        "raw_refs": {
+          "description": "Canonically ordered by exact raw ref name.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitRawRef"
+          }
+        },
+        "repository_id": {
+          "$ref": "#/definitions/RepositoryId"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitExternalAuthorityDelta": {
+      "description": "Exact, self-inverting mutation of one repository's external Git authority.\n\nThe complete old and new values make this a compare-and-swap contract for storage. Object bodies remain in the caller-owned CAS and closure records may refer to bodies admitted by earlier transactions.",
+      "type": "object",
+      "properties": {
+        "new": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GitExternalAuthority"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "old": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GitExternalAuthority"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitMaterialHead": {
+      "description": "Result of resolving and peeling raw `HEAD`.",
+      "oneOf": [
+        {
+          "description": "A symbolic `HEAD` whose final named ref does not yet exist.",
+          "type": "object",
+          "required": [
+            "missing_ref",
+            "type"
+          ],
+          "properties": {
+            "missing_ref": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "unborn"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A commit can seed later workspace admission, but is not itself a `WorkspaceState` and carries no admission-policy proof.",
+          "type": "object",
+          "required": [
+            "commit_oid",
+            "direct_target",
+            "raw_tree_oid",
+            "tag_chain",
+            "type"
+          ],
+          "properties": {
+            "commit_oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "direct_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "raw_tree_oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "tag_chain": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ExternalObjectId"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The raw target is valid Git authority but cannot seed a workspace.",
+          "type": "object",
+          "required": [
+            "direct_target",
+            "peeled_target",
+            "tag_chain",
+            "type"
+          ],
+          "properties": {
+            "direct_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "peeled_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "tag_chain": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ExternalObjectId"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "non_materializable"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectClosureEntry": {
+      "description": "One exact object record and the ordered dependencies decoded from its body.",
+      "type": "object",
+      "required": [
+        "dependencies",
+        "record"
+      ],
+      "properties": {
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectDependency"
+          }
+        },
+        "record": {
+          "$ref": "#/definitions/ExternalObjectRecord"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectClosureManifest": {
+      "description": "Exact reachable Git object closure rooted at refs and `HEAD`.",
+      "type": "object",
+      "required": [
+        "objects",
+        "roots"
+      ],
+      "properties": {
+        "objects": {
+          "description": "Canonically ordered by typed external object identity.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectClosureEntry"
+          }
+        },
+        "roots": {
+          "description": "Canonically ordered by root source. `HEAD` sorts before named refs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectRoot"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectDependency": {
+      "description": "One typed dependency decoded from an exact raw Git object body.",
+      "type": "object",
+      "required": [
+        "kind",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/GitObjectDependencyKind"
+        },
+        "target": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectDependencyKind": {
+      "description": "Semantic role of one exact object-to-object dependency.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit_tree"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "position",
+            "type"
+          ],
+          "properties": {
+            "position": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit_parent"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "name",
+            "position",
+            "type"
+          ],
+          "properties": {
+            "mode": {
+              "$ref": "#/definitions/GitTreeEntryMode"
+            },
+            "name": {
+              "$ref": "#/definitions/GitTreeEntryName"
+            },
+            "position": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tree_entry"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "tag_target"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectFormat": {
+      "description": "Hash algorithm used by one Git object database.",
+      "type": "string",
+      "enum": [
+        "sha1",
+        "sha256"
+      ]
+    },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectRoot": {
+      "description": "A direct object reached by resolving one raw ref or raw `HEAD`.",
+      "type": "object",
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/GitObjectRootSource"
+        },
+        "target": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectRootSource": {
+      "description": "Origin of a closure root.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "head"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "ref"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitRawRef": {
+      "description": "One exact `refs/*` entry before peeling or semantic conversion.",
+      "type": "object",
+      "required": [
+        "name",
+        "target"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/definitions/RefName"
+        },
+        "target": {
+          "$ref": "#/definitions/GitRawTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitRawTarget": {
+      "description": "Exact raw target stored by a Git ref or by `HEAD`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "object",
+            "type"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "direct"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitTreeEntryMode": {
+      "description": "Valid Git tree-entry modes accepted by the authority boundary.",
+      "type": "string",
+      "enum": [
+        "tree",
+        "blob",
+        "blob_executable",
+        "symlink",
+        "gitlink"
+      ]
+    },
+    "GitTreeEntryName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GraphNodeId": {
+      "description": "Typed graph node reference for first-class mixed-domain relations.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/ArtifactId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Test"
+          ],
+          "properties": {
+            "Test": {
+              "$ref": "#/definitions/TestId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Work"
+          ],
+          "properties": {
+            "Work": {
+              "$ref": "#/definitions/WorkId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "VerificationRun"
+          ],
+          "properties": {
+            "VerificationRun": {
+              "$ref": "#/definitions/VerificationRunId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Symbol owned outside the local repository. Deliberately last so the public variant order remains append-only even though the current MessagePack encoder tags variants by name.",
+          "type": "object",
+          "required": [
+            "ExternalReference"
+          ],
+          "properties": {
+            "ExternalReference": {
+              "$ref": "#/definitions/ExternalReferenceId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "LanguageId": {
+      "description": "Supported programming languages (Tier 1).",
+      "type": "string",
+      "enum": [
+        "TypeScript",
+        "JavaScript",
+        "Python",
+        "Go",
+        "Java",
+        "Rust",
+        "C",
+        "Cpp",
+        "CSharp",
+        "Ruby",
+        "Php",
+        "Swift",
+        "Kotlin",
+        "Hcl"
+      ]
+    },
+    "LocalAdmissionRuleSource": {
+      "description": "One captured local-only gitwildmatch source.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "kind",
+        "precedence"
+      ],
+      "properties": {
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/LocalAdmissionRuleSourceKind"
+        },
+        "precedence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LocalAdmissionRuleSourceKind": {
+      "type": "string",
+      "enum": [
+        "git_info_exclude",
+        "git_global_exclude",
+        "kin_local"
+      ]
+    },
+    "LocalOverlayHash": {
+      "$ref": "#/definitions/Hash256"
+    },
+    "LocalOverlayStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/LocalOverlayHash"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LocatedEntry": {
+      "description": "One artifact's exact location and materialization at a repository ref.",
+      "type": "object",
+      "required": [
+        "entry",
+        "path"
+      ],
+      "properties": {
+        "entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeConflictEntry": {
+      "description": "One conflicting identity, its three inputs, and its resolution.\n\nPersisted positionally inside [`MergeTransactionRecord`], so the crate-level positional-wire rule applies: a new field goes last, and only a trailing field may skip serialization.",
+      "type": "object",
+      "required": [
+        "base",
+        "divergence",
+        "ours",
+        "resolution",
+        "subject",
+        "theirs"
+      ],
+      "properties": {
+        "base": {
+          "$ref": "#/definitions/MergeSideValue"
+        },
+        "divergence": {
+          "$ref": "#/definitions/MergeDivergence"
+        },
+        "label": {
+          "description": "Qualified name, file, or path at whichever side still carries the identity, so a listing is actionable. Identity stays the subject.\n\nAlways serialized, including as null. `resolution` follows this field, so omitting an absent label would shorten the array and decode the resolution into this slot.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ours": {
+          "$ref": "#/definitions/MergeSideValue"
+        },
+        "resolution": {
+          "$ref": "#/definitions/MergeEntryResolution"
+        },
+        "subject": {
+          "$ref": "#/definitions/MergeConflictSubject"
+        },
+        "theirs": {
+          "$ref": "#/definitions/MergeSideValue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeConflictSubject": {
+      "description": "The exact identity one conflict is reported and resolved against.\n\nIdentity is never a path for artifacts: they carry a stable `ArtifactId`, so a move on one side against an edit on the other is still one artifact. The `Path` variant is a different thing entirely, a contested location rather than a contested value.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "entity",
+            "subject"
+          ],
+          "properties": {
+            "entity": {
+              "$ref": "#/definitions/EntityId"
+            },
+            "subject": {
+              "type": "string",
+              "enum": [
+                "entity"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "relation",
+            "subject"
+          ],
+          "properties": {
+            "relation": {
+              "$ref": "#/definitions/RelationId"
+            },
+            "subject": {
+              "type": "string",
+              "enum": [
+                "relation"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "artifact",
+            "subject"
+          ],
+          "properties": {
+            "artifact": {
+              "$ref": "#/definitions/ArtifactId"
+            },
+            "subject": {
+              "type": "string",
+              "enum": [
+                "artifact"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Both sides placed distinct artifacts at one repository path. Every per-artifact three-way was clean; the composed tree is not.",
+          "type": "object",
+          "required": [
+            "path",
+            "subject"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/definitions/RepoPath"
+            },
+            "subject": {
+              "type": "string",
+              "enum": [
+                "path"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeDivergence": {
+      "description": "Why one identity failed to compose, typed rather than described.\n\nThe daemon renders these into refusal and listing prose. A durable record a command reads back must not carry that prose as its only classification.",
+      "oneOf": [
+        {
+          "description": "Present in the base and moved to different values on both sides.",
+          "type": "object",
+          "required": [
+            "divergence"
+          ],
+          "properties": {
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "changed_both_sides"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Absent from the base and added independently with different values.",
+          "type": "object",
+          "required": [
+            "divergence"
+          ],
+          "properties": {
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "added_both_sides"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Changed on the branch being merged into, removed on the source branch.",
+          "type": "object",
+          "required": [
+            "divergence"
+          ],
+          "properties": {
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "changed_ours_removed_theirs"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Removed on the branch being merged into, changed on the source branch.",
+          "type": "object",
+          "required": [
+            "divergence"
+          ],
+          "properties": {
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "removed_ours_changed_theirs"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Distinct surviving artifacts claim one repository path.",
+          "type": "object",
+          "required": [
+            "artifacts",
+            "divergence"
+          ],
+          "properties": {
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ArtifactId"
+              }
+            },
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "path_collision"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A surviving relation points at a node neither composed side kept.",
+          "type": "object",
+          "required": [
+            "divergence",
+            "endpoint"
+          ],
+          "properties": {
+            "divergence": {
+              "type": "string",
+              "enum": [
+                "dangling_endpoint"
+              ]
+            },
+            "endpoint": {
+              "$ref": "#/definitions/GraphNodeId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeEntryResolution": {
+      "description": "How one conflicting identity has been settled, if it has.",
+      "oneOf": [
+        {
+          "description": "Nothing has settled this entry. `kin conflicts` lists exactly these.",
+          "type": "object",
+          "required": [
+            "resolution"
+          ],
+          "properties": {
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "unresolved"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Settled by binding one side's exact value, which may be absent.",
+          "type": "object",
+          "required": [
+            "provenance",
+            "resolution",
+            "side"
+          ],
+          "properties": {
+            "provenance": {
+              "$ref": "#/definitions/MergeResolutionProvenance"
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "side"
+              ]
+            },
+            "side": {
+              "$ref": "#/definitions/MergeSide"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Settled by an explicitly authored value.",
+          "type": "object",
+          "required": [
+            "payload",
+            "provenance",
+            "resolution"
+          ],
+          "properties": {
+            "payload": {
+              "$ref": "#/definitions/MergeResolutionPayload"
+            },
+            "provenance": {
+              "$ref": "#/definitions/MergeResolutionProvenance"
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "payload"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeOpening": {
+      "description": "The transaction that opened this merge.",
+      "type": "object",
+      "required": [
+        "actor",
+        "opened_at",
+        "operation_id"
+      ],
+      "properties": {
+        "actor": {
+          "$ref": "#/definitions/AuthorId"
+        },
+        "opened_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "operation_id": {
+          "$ref": "#/definitions/OperationId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeParentBinding": {
+      "description": "Both parents, their single base, and the refs they were resolved from.\n\nThe merge change this record terminates in carries ordered parents with `ours_change` first, which is what history replay validates, so the binding records that order rather than leaving it to the publisher.",
+      "type": "object",
+      "required": [
+        "base_change",
+        "ours_change",
+        "ours_target",
+        "source_ref",
+        "target_ref",
+        "theirs_change",
+        "theirs_target"
+      ],
+      "properties": {
+        "base_change": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "ours_change": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "ours_target": {
+          "description": "Exact resolved target of `target_ref` when the merge opened, which the terminating transaction compare-and-swaps against.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RefTarget"
+            }
+          ]
+        },
+        "source_ref": {
+          "description": "Branch being merged in.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RefName"
+            }
+          ]
+        },
+        "target_ref": {
+          "description": "Active branch, which the merge publishes into.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RefName"
+            }
+          ]
+        },
+        "theirs_change": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "theirs_target": {
+          "$ref": "#/definitions/RefTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeResolutionPayload": {
+      "description": "An explicitly authored resolution value.\n\nTaking a side covers every case where one of the three inputs is the answer, including removal when that side is absent. A payload is for the rest: a value neither side holds, a contested path's owner, and removal when no side is absent, which is what a dangling endpoint leaves behind.",
+      "oneOf": [
+        {
+          "description": "The identity does not survive the merge.",
+          "type": "object",
+          "required": [
+            "payload"
+          ],
+          "properties": {
+            "payload": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The atomic semantic unit in Kin's graph.",
+          "type": "object",
+          "required": [
+            "fingerprint",
+            "id",
+            "kind",
+            "language",
+            "metadata",
+            "name",
+            "payload",
+            "role",
+            "signature",
+            "visibility"
+          ],
+          "properties": {
+            "created_in": {
+              "description": "None while in overlay; set on kin commit.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SemanticChangeId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "doc_summary": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file_origin": {
+              "description": "None for graph-created entities before placement.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/FilePathId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fingerprint": {
+              "$ref": "#/definitions/SemanticFingerprint"
+            },
+            "id": {
+              "$ref": "#/definitions/EntityId"
+            },
+            "kind": {
+              "$ref": "#/definitions/EntityKind"
+            },
+            "language": {
+              "$ref": "#/definitions/LanguageId"
+            },
+            "lineage_parent": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EntityId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "metadata": {
+              "$ref": "#/definitions/EntityMetadata"
+            },
+            "name": {
+              "type": "string"
+            },
+            "payload": {
+              "type": "string",
+              "enum": [
+                "entity"
+              ]
+            },
+            "role": {
+              "$ref": "#/definitions/EntityRole"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "span": {
+              "description": "None until projection assigns a file location.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SourceSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "superseded_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EntityId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "visibility": {
+              "$ref": "#/definitions/Visibility"
+            }
+          }
+        },
+        {
+          "description": "A typed edge in the semantic graph.",
+          "type": "object",
+          "required": [
+            "confidence",
+            "dst",
+            "evidence",
+            "id",
+            "kind",
+            "origin",
+            "payload",
+            "src"
+          ],
+          "properties": {
+            "confidence": {
+              "description": "Confidence score (0.0 - 1.0).",
+              "type": "number",
+              "format": "float"
+            },
+            "created_in": {
+              "description": "None while in overlay; set on kin commit.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SemanticChangeId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dst": {
+              "$ref": "#/definitions/GraphNodeId"
+            },
+            "evidence": {
+              "description": "Parser/linker evidence for this edge.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RelationEvidence"
+              }
+            },
+            "id": {
+              "$ref": "#/definitions/RelationId"
+            },
+            "import_source": {
+              "description": "For Calls/References edges, the module/package the target was imported from. Enables qualified cross-repo resolution in the spine. e.g., \"requests\" for `from requests import get`, \"kin_db\" for `use kin_db::InMemoryGraph`",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/definitions/RelationKind"
+            },
+            "origin": {
+              "$ref": "#/definitions/RelationOrigin"
+            },
+            "payload": {
+              "type": "string",
+              "enum": [
+                "relation"
+              ]
+            },
+            "src": {
+              "$ref": "#/definitions/GraphNodeId"
+            }
+          }
+        },
+        {
+          "description": "One artifact's exact location and materialization at a repository ref.",
+          "type": "object",
+          "required": [
+            "entry",
+            "path",
+            "payload"
+          ],
+          "properties": {
+            "entry": {
+              "$ref": "#/definitions/TreeEntry"
+            },
+            "path": {
+              "$ref": "#/definitions/RepoPath"
+            },
+            "payload": {
+              "type": "string",
+              "enum": [
+                "artifact"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "This artifact keeps the contested path. Every other claimant is settled through its own entry.",
+          "type": "object",
+          "required": [
+            "artifact",
+            "payload"
+          ],
+          "properties": {
+            "artifact": {
+              "$ref": "#/definitions/ArtifactId"
+            },
+            "payload": {
+              "type": "string",
+              "enum": [
+                "path_owner"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeResolutionProvenance": {
+      "description": "Who settled an entry, when, and through which repository transaction.\n\n`operation_id` is the load-bearing field: it ties the resolution to one committed transaction in the operation log, so the chain from an open merge to each of its resolutions is auditable without trusting the record's own account of itself.",
+      "type": "object",
+      "required": [
+        "actor",
+        "operation_id",
+        "resolved_at"
+      ],
+      "properties": {
+        "actor": {
+          "$ref": "#/definitions/AuthorId"
+        },
+        "operation_id": {
+          "$ref": "#/definitions/OperationId"
+        },
+        "resolved_at": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeSide": {
+      "description": "Which of the three-way inputs a value or resolution refers to.",
+      "oneOf": [
+        {
+          "description": "The single merge base both branches descend from.",
+          "type": "string",
+          "enum": [
+            "base"
+          ]
+        },
+        {
+          "description": "The branch being merged into, which is the merge change's first parent.",
+          "type": "string",
+          "enum": [
+            "ours"
+          ]
+        },
+        {
+          "description": "The branch being merged in.",
+          "type": "string",
+          "enum": [
+            "theirs"
+          ]
+        }
+      ]
+    },
+    "MergeSideValue": {
+      "description": "One side's value, bound by content rather than embedded.\n\n`Present` carries a domain-separated digest of the exact value that side holds. The value itself stays in history, recoverable by resolving the graph at the change this record binds for that side, so the record never becomes a second, drifting copy of graph truth. A consumer settling an entry by taking a side re-materializes the value and checks it against this digest.",
+      "oneOf": [
+        {
+          "description": "The identity does not exist on this side.",
+          "type": "object",
+          "required": [
+            "value"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "absent"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "content",
+            "value"
+          ],
+          "properties": {
+            "content": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "value": {
+              "type": "string",
+              "enum": [
+                "present"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeTransactionDelta": {
+      "description": "Exact, self-inverting transition of one workspace's merge record.\n\n`new: None` drops the record outright, which the local-overlay delta this follows deliberately refuses for itself. A workspace may legitimately end up with no merge history; it may never end up with no admission overlay.",
+      "type": "object",
+      "properties": {
+        "new": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MergeTransactionRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "old": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MergeTransactionRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeTransactionRecord": {
+      "description": "A merge that could not compose, held as graph truth until it terminates.\n\nAt most one record exists per workspace. A terminal record is retained as the durable account of the last merge on that workspace and is replaced when the next merge opens, so \"is a merge in progress\" is a state check rather than an existence check.\n\nReached from a repository operation record and persisted positionally, so the crate-level positional-wire rule applies: a new field goes last, and only a trailing field may skip serialization.",
+      "type": "object",
+      "required": [
+        "binding",
+        "entries",
+        "hash",
+        "opened",
+        "repository_id",
+        "restore",
+        "schema_version",
+        "state",
+        "workspace_id"
+      ],
+      "properties": {
+        "binding": {
+          "$ref": "#/definitions/MergeParentBinding"
+        },
+        "entries": {
+          "description": "One entry per conflicting identity, in canonical subject order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MergeConflictEntry"
+          }
+        },
+        "hash": {
+          "description": "Identity over every field above. A persistence layer recomputes it, so a record assembled outside this type cannot be accepted.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "opened": {
+          "$ref": "#/definitions/MergeOpening"
+        },
+        "repository_id": {
+          "$ref": "#/definitions/RepositoryId"
+        },
+        "restore": {
+          "$ref": "#/definitions/MergeWorkspaceRestorePoint"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "state": {
+          "$ref": "#/definitions/MergeTransactionState"
+        },
+        "workspace_id": {
+          "$ref": "#/definitions/WorkspaceId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MergeTransactionState": {
+      "description": "How a merge ended, or that it has not.",
+      "oneOf": [
+        {
+          "description": "Conflicts remain, or every entry is settled but the merge change has not been published yet. This is the only state whose entries may change.",
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "in_progress"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Published as this merge change, whose ordered parents are the binding's `ours_change` then `theirs_change`.",
+          "type": "object",
+          "required": [
+            "committed_at",
+            "merge_change",
+            "operation_id",
+            "state"
+          ],
+          "properties": {
+            "committed_at": {
+              "$ref": "#/definitions/Timestamp"
+            },
+            "merge_change": {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            "operation_id": {
+              "$ref": "#/definitions/OperationId"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "committed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Abandoned, with the workspace proven equal to the recorded restore point.",
+          "type": "object",
+          "required": [
+            "aborted_at",
+            "actor",
+            "operation_id",
+            "state"
+          ],
+          "properties": {
+            "aborted_at": {
+              "$ref": "#/definitions/Timestamp"
+            },
+            "actor": {
+              "$ref": "#/definitions/AuthorId"
+            },
+            "operation_id": {
+              "$ref": "#/definitions/OperationId"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "aborted"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MergeWorkspaceRestorePoint": {
+      "description": "The exact workspace an abort must restore.\n\nThese are the fields a `WorkspaceExpectation::MustEqual` compares, captured before the merge moved anything. Abort is not \"undo whatever happened\"; it is \"prove the workspace equals this again\".",
+      "type": "object",
+      "required": [
+        "admission_policy",
+        "generation",
+        "head",
+        "semantic_overlay_hash",
+        "tree_hash"
+      ],
+      "properties": {
+        "admission_policy": {
+          "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+        },
+        "base_target": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_tree_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "head": {
+          "$ref": "#/definitions/WorkspaceHead"
+        },
+        "semantic_overlay_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "tree_hash": {
+          "$ref": "#/definitions/Hash256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperationId": {
+      "description": "Caller-stable identity for one repository authority transaction.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "RefExpectation": {
+      "description": "Exact compare-and-swap expectation for a ref mutation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_not_exist"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefTarget"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_equal"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RefMutation": {
+      "description": "One exact create, update, or delete inside a multi-ref transaction.",
+      "type": "object",
+      "required": [
+        "expected",
+        "name",
+        "policy"
+      ],
+      "properties": {
+        "expected": {
+          "$ref": "#/definitions/RefExpectation"
+        },
+        "name": {
+          "$ref": "#/definitions/RefName"
+        },
+        "new_target": {
+          "description": "`None` deletes the ref.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/definitions/RefUpdatePolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefTarget": {
+      "description": "Exact target of a repository ref.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "change_id",
+            "type"
+          ],
+          "properties": {
+            "change_id": {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "change"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "object",
+            "type"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "external_object"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RefUpdatePolicy": {
+      "description": "Ancestry policy for a ref mutation.",
+      "type": "string",
+      "enum": [
+        "fast_forward_only",
+        "force_with_lease"
+      ]
+    },
+    "Relation": {
+      "description": "A typed edge in the semantic graph.",
+      "type": "object",
+      "required": [
+        "confidence",
+        "dst",
+        "evidence",
+        "id",
+        "kind",
+        "origin",
+        "src"
+      ],
+      "properties": {
+        "confidence": {
+          "description": "Confidence score (0.0 - 1.0).",
+          "type": "number",
+          "format": "float"
+        },
+        "created_in": {
+          "description": "None while in overlay; set on kin commit.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dst": {
+          "$ref": "#/definitions/GraphNodeId"
+        },
+        "evidence": {
+          "description": "Parser/linker evidence for this edge.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RelationEvidence"
+          }
+        },
+        "id": {
+          "$ref": "#/definitions/RelationId"
+        },
+        "import_source": {
+          "description": "For Calls/References edges, the module/package the target was imported from. Enables qualified cross-repo resolution in the spine. e.g., \"requests\" for `from requests import get`, \"kin_db\" for `use kin_db::InMemoryGraph`",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/RelationKind"
+        },
+        "origin": {
+          "$ref": "#/definitions/RelationOrigin"
+        },
+        "src": {
+          "$ref": "#/definitions/GraphNodeId"
+        }
+      }
+    },
+    "RelationDelta": {
+      "description": "Delta for a single relation within a SemanticChange.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Relation"
+            },
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RelationEvidence": {
+      "description": "Concrete evidence supporting a graph relation.",
+      "type": "object",
+      "required": [
+        "occurrence_count"
+      ],
+      "properties": {
+        "call_shape": {
+          "description": "Argument shape of the call site that produced this edge, when captured. Present only for `Calls` edges from languages that emit shapes; non-call edges and unresolved calls leave it `None`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CallArgShape"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurrence_count": {
+          "description": "Number of equivalent occurrences collapsed into this evidence record.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parser_rule": {
+          "description": "Parser or linker rule that produced this evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_path": {
+          "description": "Resolved graph-owned target path, when the linker could resolve it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_path": {
+          "description": "Module/include path as written in source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_span": {
+          "description": "Source span of the syntax that produced the edge, when available.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token": {
+          "description": "Lexical token at the evidence site, e.g. a macro name or imported symbol.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RelationId": {
+      "description": "Unique identifier for a Relation.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "RelationKind": {
+      "description": "Classification of a relation edge.",
+      "type": "string",
+      "enum": [
+        "Contains",
+        "Extends",
+        "Implements",
+        "Overrides",
+        "Calls",
+        "Instantiates",
+        "References",
+        "UsesMacro",
+        "UsesType",
+        "Imports",
+        "Includes",
+        "DependsOn",
+        "EmitsEvent",
+        "SubscribesTo",
+        "DefinesContract",
+        "ConsumesContract",
+        "SendsMessage",
+        "Spawns",
+        "Tests",
+        "Covers",
+        "CoChanges",
+        "DerivedFrom",
+        "DocumentedBy",
+        "OwnedBy",
+        "OwnedByFile"
+      ]
+    },
+    "RelationOrigin": {
+      "description": "How a relation was established.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Parsed",
+            "Inferred",
+            "Manual"
+          ]
+        },
+        {
+          "description": "Discovered via Language Server Protocol (type-resolved).",
+          "type": "string",
+          "enum": [
+            "Lsp"
+          ]
+        }
+      ]
+    },
+    "RepoPath": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryId": {
+      "type": "string"
+    },
+    "RiskLevel": {
+      "description": "Risk classification.",
+      "type": "string",
+      "enum": [
+        "Low",
+        "Medium",
+        "High",
+        "Critical"
+      ]
+    },
+    "RiskSummary": {
+      "description": "Summary of risk associated with a semantic change.",
+      "type": "object",
+      "required": [
+        "breaking_changes",
+        "contract_violations",
+        "notes",
+        "overall_risk",
+        "test_coverage_gaps",
+        "work_risks"
+      ],
+      "properties": {
+        "breaking_changes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contract_violations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "overall_risk": {
+          "$ref": "#/definitions/RiskLevel"
+        },
+        "test_coverage_gaps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "work_risks": {
+          "description": "Risks related to in-progress work items affected by changes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "RootBundle": {
+      "description": "Exhaustive root partition for replicated and local repository authority.",
+      "type": "object",
+      "required": [
+        "collaboration",
+        "generation",
+        "history",
+        "local_state",
+        "ref_log",
+        "ref_state",
+        "replication",
+        "version"
+      ],
+      "properties": {
+        "collaboration": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "history": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "local_state": {
+          "description": "Local workspace/session/overlay authority. Never compare this field when deciding whether two replicas have identical replicated truth.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuthorityRoot"
+            }
+          ]
+        },
+        "ref_log": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "ref_state": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "replication": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SealedObservationBinding": {
+      "description": "Authority binding supplied by the component that sealed an admitted content closure.\n\nThis type proves only that the transaction names one exact observation and binds its coverage summary into transaction identity. Repository storage validates this shape but does not re-derive or verify the fingerprint: enforcement remains the responsibility of the admission component that can read the admitted closure and its graph-owned bodies.",
+      "type": "object",
+      "required": [
+        "declared_exclusions",
+        "fingerprint",
+        "observed_entries",
+        "observed_trees",
+        "opaque_bodies",
+        "schema_version",
+        "sealed_bodies",
+        "sealed_body_bytes"
+      ],
+      "properties": {
+        "declared_exclusions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "fingerprint": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "observed_entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "observed_trees": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "opaque_bodies": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sealed_bodies": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sealed_body_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemanticChange": {
+      "description": "Kin's native commit, the unit of semantic history.\n\nPersisted positionally in every snapshot that carries history, so the crate-level positional-wire rule applies: a new field goes last, and only a trailing field may skip serialization.",
+      "type": "object",
+      "required": [
+        "author",
+        "entity_deltas",
+        "evidence",
+        "id",
+        "message",
+        "origin",
+        "parents",
+        "projected_files",
+        "relation_deltas",
+        "timestamp",
+        "tree_deltas"
+      ],
+      "properties": {
+        "admission_policy_delta": {
+          "description": "History-versioned admission policy transition, when the policy changes.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AdmissionPolicyDelta"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "author": {
+          "description": "Human or assistant.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuthorId"
+            }
+          ]
+        },
+        "entity_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EntityDelta"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvidenceId"
+          }
+        },
+        "external_reference_deltas": {
+          "description": "Exact transitions of first-class external-symbol endpoints.\n\nDeliberately last: persisted positional encodings treat an appended, omitted-empty field as additive, while inserting one earlier would reassign every field after it.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalReferenceDelta"
+          }
+        },
+        "id": {
+          "description": "Content-addressed hash.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticChangeId"
+            }
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "origin": {
+          "description": "Native provenance or the exact external commit identity imported.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChangeOrigin"
+            }
+          ]
+        },
+        "parents": {
+          "description": "Ordered parent list: empty for genesis, one for an ordinary change, and any number for a merge. Order and repeated parent entries are preserved exactly for lossless Git commit import.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SemanticChangeId"
+          }
+        },
+        "projected_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FilePathId"
+          }
+        },
+        "relation_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RelationDelta"
+          }
+        },
+        "risk_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RiskSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spec_link": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpecId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "tree_deltas": {
+          "description": "Exact changes to the repository tree, including code, configuration, documentation, assets, and files in unsupported languages.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TreeDelta"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "SemanticFingerprint": {
+      "description": "Content-based fingerprint of an entity, used to detect what changed between revisions (structure, signature, and exact contents).",
+      "type": "object",
+      "required": [
+        "algorithm",
+        "ast_hash",
+        "behavior_hash",
+        "equivalence_hash",
+        "signature_hash",
+        "stability_score"
+      ],
+      "properties": {
+        "algorithm": {
+          "$ref": "#/definitions/FingerprintAlgorithm"
+        },
+        "ast_hash": {
+          "description": "Hash of the normalized AST/source structure (insensitive to comments and whitespace).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "behavior_hash": {
+          "description": "Hash of the entity's full source text (changes on any body edit).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "equivalence_hash": {
+          "description": "Hash of the entity's behavior-equivalence class: the token stream with pure-no-op statements (e.g. docstrings) normalized away, so a behavior-preserving body edit leaves it unchanged while any real change alters it. The zero hash means \"not computed\" and is never treated as a match. Always serialized and required.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "signature_hash": {
+          "description": "Hash of the entity's signature line / declaration shape.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            }
+          ]
+        },
+        "stability_score": {
+          "description": "Confidence in fingerprint stability (0.0 - 1.0).",
+          "type": "number",
+          "format": "float"
+        }
+      }
+    },
+    "SensitiveArtifactAllowance": {
+      "description": "Explicit approval for exactly one sensitive path, digest, and entry kind.",
+      "type": "object",
+      "required": [
+        "approved_by",
+        "content_hash",
+        "kind",
+        "path",
+        "reason"
+      ],
+      "properties": {
+        "approved_by": {
+          "$ref": "#/definitions/AuthorId"
+        },
+        "content_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "kind": {
+          "$ref": "#/definitions/SensitiveArtifactKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SensitiveArtifactKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SharedAdmissionPolicy": {
+      "description": "Replicated admission policy resolved at a semantic change.",
+      "type": "object",
+      "required": [
+        "generation",
+        "hash",
+        "semantics_version",
+        "sensitive_allowances",
+        "sources"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        },
+        "semantics_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sensitive_allowances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SensitiveArtifactAllowance"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AdmissionRuleSource"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceSpan": {
+      "description": "Source location of an entity within a file.",
+      "type": "object",
+      "required": [
+        "end_byte",
+        "end_col",
+        "end_line",
+        "file",
+        "start_byte",
+        "start_col",
+        "start_line"
+      ],
+      "properties": {
+        "end_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "end_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "end_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "file": {
+          "$ref": "#/definitions/FilePathId"
+        },
+        "start_byte": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "start_col": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SpecId": {
+      "description": "Unique identifier for a Spec.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "TestId": {
+      "description": "Unique identifier for a test case.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "UTC timestamp wrapper.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "TreeDelta": {
+      "description": "Exact transition for one stable artifact identity in the repository tree.\n\n`Updated` covers content edits, mode changes, moves, and move-plus-edit. Paths are locations only; identity is always carried by `artifact_id`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "artifact_id",
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
+            },
+            "new": {
+              "$ref": "#/definitions/LocatedEntry"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "artifact_id",
+            "new",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
+            },
+            "new": {
+              "$ref": "#/definitions/LocatedEntry"
+            },
+            "old": {
+              "$ref": "#/definitions/LocatedEntry"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "updated"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "artifact_id",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "artifact_id": {
+              "$ref": "#/definitions/ArtifactId"
+            },
+            "old": {
+              "$ref": "#/definitions/LocatedEntry"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TreeEntry": {
+      "description": "Exact materialization of one leaf in the repository tree.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "hash",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The referenced blob contains the byte-exact link target.",
+          "type": "object",
+          "required": [
+            "target_blob",
+            "type"
+          ],
+          "properties": {
+            "target_blob": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A Git submodule pointer. The target need not exist in this repository's object database.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "gitlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VerificationRunId": {
+      "description": "Unique identifier for a verification run.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "Visibility": {
+      "description": "Visibility of a semantic entity.",
+      "type": "string",
+      "enum": [
+        "Public",
+        "Private",
+        "Internal",
+        "Crate"
+      ]
+    },
+    "WorkId": {
+      "description": "Unique identifier for a WorkItem.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceExpectation": {
+      "description": "Exact compare-and-swap expectation for persisted workspace authority.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_not_exist"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "admission_policy",
+            "generation",
+            "head",
+            "semantic_overlay_hash",
+            "tree_hash",
+            "type"
+          ],
+          "properties": {
+            "admission_policy": {
+              "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+            },
+            "base_target": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RefTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "base_tree_hash": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Hash256"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "head": {
+              "$ref": "#/definitions/WorkspaceHead"
+            },
+            "semantic_overlay_hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "tree_hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_equal"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceHead": {
+      "description": "Local HEAD for one materialized workspace.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefTarget"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "detached"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceId": {
+      "description": "Local identity for one materialized repository workspace.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceMutation": {
+      "description": "One exact graph-owned workspace transition.\n\nThe authority implementation applies `tree_deltas` and `semantic_delta` to the graph identified by `expected`, derives the successor's cumulative base-relative semantic overlay, verifies the exact result, and commits it in the same repository transaction as history and ref updates.",
+      "type": "object",
+      "required": [
+        "expected",
+        "new_admission_policy",
+        "new_generation",
+        "new_head",
+        "new_shared_admission_policy",
+        "new_tree_hash",
+        "semantic_delta",
+        "tree_deltas",
+        "workspace_id"
+      ],
+      "properties": {
+        "expected": {
+          "$ref": "#/definitions/WorkspaceExpectation"
+        },
+        "new_admission_policy": {
+          "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+        },
+        "new_base_target": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_base_tree_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "new_head": {
+          "$ref": "#/definitions/WorkspaceHead"
+        },
+        "new_shared_admission_policy": {
+          "description": "Complete shared policy active for the resulting workspace tree.\n\nA dirty or unborn workspace may contain a new `.gitignore` before any semantic change records that policy. Persisting only its stamp would leave storage unable to reproduce or validate the matcher inputs.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SharedAdmissionPolicy"
+            }
+          ]
+        },
+        "new_tree_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "semantic_delta": {
+          "description": "Incremental entity/relation transition from the expected workspace graph to the successor workspace graph. Durable storage derives and persists the cumulative base-relative overlay from this exact delta.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkspaceSemanticDelta"
+            }
+          ]
+        },
+        "tree_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TreeDelta"
+          }
+        },
+        "workspace_id": {
+          "$ref": "#/definitions/WorkspaceId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WorkspaceSemanticDelta": {
+      "description": "One canonical entity/relation transition for mutable workspace authority.\n\n[`WorkspaceMutation::semantic_delta`] carries the incremental transition from the expected workspace graph to its successor. The same representation is stored cumulatively in [`WorkspaceState::semantic_overlay`] relative to `base_target`. Exact repository membership remains independently authoritative in [`WorkspaceState::tree`].",
+      "type": "object",
+      "required": [
+        "entity_deltas",
+        "relation_deltas",
+        "version"
+      ],
+      "properties": {
+        "entity_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EntityDelta"
+          }
+        },
+        "external_reference_deltas": {
+          "description": "Deliberately last for additive positional-wire compatibility.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalReferenceDelta"
+          }
+        },
+        "relation_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RelationDelta"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
