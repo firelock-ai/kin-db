@@ -2,7 +2,7 @@
 
 # KinDB
 
-Purpose-built, embeddable code graph database in Rust. Designed for kin — a semantic VCS that replaces file-based version control with a graph of entities and relationships.
+Purpose-built, embeddable code graph database in Rust. Designed for kin, a semantic VCS that replaces file-based version control with a graph of entities and relationships.
 
 ## Build
 
@@ -17,19 +17,19 @@ cargo test --workspace
 
 ### Crates
 
-- `kin-model` — External dependency consumed from the `kin` cargo registry (canonical repo: `firelock-ai/kin-model`): entities, relations, layout, and the canonical types KinDB builds on. Not part of this workspace.
-- `crates/kin-db` — Graph engine crate (the only workspace member).
+- `kin-model` is an external dependency consumed from the `kin` cargo registry (canonical repo: `firelock-ai/kin-model`). It holds entities, relations, layout, and the canonical types KinDB builds on, and it is not part of this workspace.
+- `crates/kin-db` is the graph engine crate and the only workspace member.
   `types.rs` re-exports the canonical `kin-model` types for local compatibility.
   `store.rs` re-exports `kin-model`'s `GraphStore` trait surface, which KinDB implements.
   `engine/`, `storage/`, `vector/`, and `search/` implement the runtime behavior.
 
 ### Key Design Decisions
 
-- **Static schema** — Entity/Relation types known at compile time. No runtime schema parsing.
-- **Batch write / continuous read** — Optimized for `kin commit` (bulk write) then many reads.
-- **parking_lot::RwLock** — Concurrent readers, exclusive writer. RCU snapshots for zero-blocking reads.
-- **hashbrown::HashMap** — Faster than std HashMap for the access patterns here.
-- **No query language** — All queries are compiled Rust functions. Zero parsing overhead.
+- **Static schema.** Entity/Relation types known at compile time. No runtime schema parsing.
+- **Batch write / continuous read.** Optimized for `kin commit` (bulk write) then many reads.
+- **parking_lot::RwLock.** Concurrent readers, exclusive writer. RCU snapshots for zero-blocking reads.
+- **hashbrown::HashMap.** Faster than std HashMap for the access patterns here.
+- **No query language.** All queries are compiled Rust functions. Zero parsing overhead.
 
 ### File Paths Are Secondary Metadata
 
