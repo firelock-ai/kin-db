@@ -20,7 +20,6 @@ jobs:
         --skip process_embedding_queue_without_embeddings_is_noop
         --skip default_dimensions_match_default_model
         --skip test_vector_index_dimension_mismatch_auto_recovery
-        --skip many_vectors_search_quality
       mint-release-tag: true
     secrets:
       KIN_RELEASE_BOT_APP_ID: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}

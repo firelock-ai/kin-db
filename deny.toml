@@ -14,12 +14,12 @@ feature-depth = 1
 
 # --- Advisory database (replaces standalone cargo-audit) ---
 [advisories]
-# Unmaintained (NOT vulnerabilities) — transitive, no safe upgrade, no runtime
-# risk. Each has a reason per policy.
+# Unmaintained (NOT vulnerabilities). All transitive, with no safe upgrade and
+# no runtime risk. Each has a reason per policy.
 ignore = [
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 — author ceased development; 1.3.3 is a complete, stable release. Transitive; no vuln, no fix needed." },
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained — transitive proc-macro, build-time only; no vuln, no drop-in std replacement adopted yet." },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.x unmaintained — functionality folded into rustls-pki-types; transitive, no vuln, no action needed until the dep tree drops it." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3, author ceased development. 1.3.3 is a complete, stable release. Transitive; no vuln, no fix needed." },
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Transitive proc-macro, build-time only; no vuln, no drop-in std replacement adopted yet." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.x unmaintained, its functionality folded into rustls-pki-types. Transitive, no vuln, no action needed until the dep tree drops it." },
     # Real DoS advisories, patched upstream in quick-xml >= 0.41.0 but transitively
     # capped below the fix: object_store 0.14 (latest) requires quick-xml ^0.40.1
     # (< 0.41) and no object_store release yet moves to 0.41. quick-xml is reachable
@@ -41,9 +41,9 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
-    # CDLA-Permissive-2.0: Community Data License Agreement, Permissive v2.0 — a
-    # permissive (non-copyleft) license on a transitive data/asset crate. Safe to
-    # allow; flagged for review as a non-code license entering the graph.
+    # CDLA-Permissive-2.0 is the Community Data License Agreement, Permissive
+    # v2.0, a permissive (non-copyleft) license on a transitive data/asset crate.
+    # Safe to allow; flagged for review as a non-code license entering the graph.
     "CDLA-Permissive-2.0",
     "ISC",
     "MPL-2.0",

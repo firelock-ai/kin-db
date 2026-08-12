@@ -108,6 +108,11 @@
       "type": "string",
       "format": "uuid"
     },
+    "ExternalReferenceId": {
+      "description": "Stable identity of one resolver-issued external symbol coordinate.",
+      "type": "string",
+      "format": "uuid"
+    },
     "FilePathId": {
       "description": "File path identifier.",
       "type": "string"
@@ -183,6 +188,19 @@
           "properties": {
             "VerificationRun": {
               "$ref": "#/definitions/VerificationRunId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Symbol owned outside the local repository. Deliberately last so the public variant order remains append-only even though the current MessagePack encoder tags variants by name.",
+          "type": "object",
+          "required": [
+            "ExternalReference"
+          ],
+          "properties": {
+            "ExternalReference": {
+              "$ref": "#/definitions/ExternalReferenceId"
             }
           },
           "additionalProperties": false

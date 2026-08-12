@@ -1,73 +1,171 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "GraphOverlay",
-  "description": "In-memory diff applied on top of the current branch head.",
+  "title": "WorkspaceMutation",
+  "description": "One exact graph-owned workspace transition.\n\nThe authority implementation applies `tree_deltas` and `semantic_delta` to the graph identified by `expected`, derives the successor's cumulative base-relative semantic overlay, verifies the exact result, and commits it in the same repository transaction as history and ref updates.",
   "type": "object",
   "required": [
-    "entity_adds",
-    "entity_bodies",
-    "entity_mods",
-    "entity_removes",
-    "relation_adds",
-    "relation_removes",
-    "tree_deltas"
+    "expected",
+    "new_admission_policy",
+    "new_generation",
+    "new_head",
+    "new_shared_admission_policy",
+    "new_tree_hash",
+    "semantic_delta",
+    "tree_deltas",
+    "workspace_id"
   ],
   "properties": {
-    "entity_adds": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/Entity"
-      }
+    "expected": {
+      "$ref": "#/definitions/WorkspaceExpectation"
     },
-    "entity_bodies": {
-      "description": "Entity bodies for modified/added entities. Used by VFS to project overlay changes without re-reading files.",
-      "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {
-          "type": "integer",
-          "format": "uint8",
-          "minimum": 0.0
+    "new_admission_policy": {
+      "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+    },
+    "new_base_target": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RefTarget"
+        },
+        {
+          "type": "null"
         }
-      }
+      ]
     },
-    "entity_mods": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/Entity"
-      }
+    "new_base_tree_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
-    "entity_removes": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/EntityId"
-      }
+    "new_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
     },
-    "relation_adds": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/Relation"
-      }
+    "new_head": {
+      "$ref": "#/definitions/WorkspaceHead"
     },
-    "relation_removes": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/RelationId"
-      }
+    "new_shared_admission_policy": {
+      "description": "Complete shared policy active for the resulting workspace tree.\n\nA dirty or unborn workspace may contain a new `.gitignore` before any semantic change records that policy. Persisting only its stamp would leave storage unable to reproduce or validate the matcher inputs.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SharedAdmissionPolicy"
+        }
+      ]
+    },
+    "new_tree_hash": {
+      "$ref": "#/definitions/Hash256"
+    },
+    "semantic_delta": {
+      "description": "Incremental entity/relation transition from the expected workspace graph to the successor workspace graph. Durable storage derives and persists the cumulative base-relative overlay from this exact delta.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorkspaceSemanticDelta"
+        }
+      ]
     },
     "tree_deltas": {
-      "description": "Exact repository-tree transitions staged in this working copy.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/TreeDelta"
       }
+    },
+    "workspace_id": {
+      "$ref": "#/definitions/WorkspaceId"
     }
   },
+  "additionalProperties": false,
   "definitions": {
+    "AdmissionPolicyHash": {
+      "description": "Content identity of a resolved shared admission policy.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "AdmissionPolicyStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionRuleSource": {
+      "description": "One branch-versioned gitwildmatch source.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "kind",
+        "path",
+        "precedence"
+      ],
+      "properties": {
+        "base_directory": {
+          "description": "Directory against which patterns in this source are rooted. `None` denotes the repository root.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RepoPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/AdmissionRuleSourceKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "precedence": {
+          "description": "Low-to-high precedence. Values must be contiguous from zero.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdmissionRuleSourceKind": {
+      "type": "string",
+      "enum": [
+        "git_ignore",
+        "kin_ignore"
+      ]
+    },
     "ArtifactId": {
       "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
       "type": "string",
       "format": "uuid"
+    },
+    "AuthorId": {
+      "description": "Author identifier (human or assistant).",
+      "type": "string"
     },
     "CallArgShape": {
       "description": "The argument shape observed at a single call site: how many positional arguments were passed, which keyword-argument names were used, and whether the call forwards a `*args` positional splat or a `**kwargs` keyword splat.\n\nCaptured per `Calls` edge so a consumer that invokes a callable positionally (unaffected by a parameter rename) can be told apart from one that names a parameter (which a rename would strand). A `**kwargs` splat means the keyword set is not statically known; the arity is known exactly only when neither splat flag is set.\n\n`keywords` is kept sorted and deduplicated so the shape is order- and duplicate-independent, keeping graph writes deterministic.",
@@ -106,6 +204,23 @@
       "description": "Unique identifier for a Contract.",
       "type": "string",
       "format": "uuid"
+    },
+    "EffectiveAdmissionPolicyStamp": {
+      "description": "Complete policy identity consumed by one local workspace.",
+      "type": "object",
+      "required": [
+        "local",
+        "shared"
+      ],
+      "properties": {
+        "local": {
+          "$ref": "#/definitions/LocalOverlayStamp"
+        },
+        "shared": {
+          "$ref": "#/definitions/AdmissionPolicyStamp"
+        }
+      },
+      "additionalProperties": false
     },
     "Entity": {
       "description": "The atomic semantic unit in Kin's graph.",
@@ -210,6 +325,72 @@
         }
       }
     },
+    "EntityDelta": {
+      "description": "Delta for a single entity within a SemanticChange.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Entity"
+            },
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/Entity"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "EntityId": {
       "description": "Unique identifier for an Entity.",
       "type": "string",
@@ -256,6 +437,116 @@
         "generated",
         "vendored"
       ]
+    },
+    "ExternalObjectId": {
+      "description": "Typed identity of one object in an external Git object database.",
+      "type": "object",
+      "required": [
+        "kind",
+        "oid"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExternalObjectKind"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectKind": {
+      "description": "The object type that participates in Git's object header and object ID.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "tree",
+        "blob",
+        "tag"
+      ]
+    },
+    "ExternalReference": {
+      "description": "Immutable, resolved endpoint for a symbol owned outside the local graph.\n\n`resolution_namespace` identifies both the resolver and its normalization contract. It is versioned so a change to that contract cannot silently reinterpret existing coordinates. `canonical_source` and `symbol` are resolver-issued opaque selectors, preserved byte-for-byte after validation.",
+      "type": "object",
+      "required": [
+        "canonical_source",
+        "hash",
+        "id",
+        "resolution_namespace",
+        "schema_version",
+        "symbol"
+      ],
+      "properties": {
+        "canonical_source": {
+          "type": "string"
+        },
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "id": {
+          "$ref": "#/definitions/ExternalReferenceId"
+        },
+        "resolution_namespace": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalReferenceDelta": {
+      "description": "Exact, self-inverting transitions of persisted external endpoints.\n\nExternal references are immutable. A resolver coordinate change is an explicit removal plus addition (with any affected relation modified in the same transaction), never an in-place modification.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/ExternalReference"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExternalReferenceId": {
+      "description": "Stable identity of one resolver-issued external symbol coordinate.",
+      "type": "string",
+      "format": "uuid"
     },
     "FilePathId": {
       "description": "File path identifier.",
@@ -398,6 +689,19 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Symbol owned outside the local repository. Deliberately last so the public variant order remains append-only even though the current MessagePack encoder tags variants by name.",
+          "type": "object",
+          "required": [
+            "ExternalReference"
+          ],
+          "properties": {
+            "ExternalReference": {
+              "$ref": "#/definitions/ExternalReferenceId"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -432,6 +736,27 @@
         "Hcl"
       ]
     },
+    "LocalOverlayHash": {
+      "$ref": "#/definitions/Hash256"
+    },
+    "LocalOverlayStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/LocalOverlayHash"
+        }
+      },
+      "additionalProperties": false
+    },
     "LocatedEntry": {
       "description": "One artifact's exact location and materialization at a repository ref.",
       "type": "object",
@@ -448,6 +773,80 @@
         }
       },
       "additionalProperties": false
+    },
+    "RefName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefTarget": {
+      "description": "Exact target of a repository ref.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "change_id",
+            "type"
+          ],
+          "properties": {
+            "change_id": {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "change"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "object",
+            "type"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "external_object"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "Relation": {
       "description": "A typed edge in the semantic graph.",
@@ -508,6 +907,72 @@
           "$ref": "#/definitions/GraphNodeId"
         }
       }
+    },
+    "RelationDelta": {
+      "description": "Delta for a single relation within a SemanticChange.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "added"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "new",
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "new": {
+              "$ref": "#/definitions/Relation"
+            },
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "modified"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "old",
+            "operation"
+          ],
+          "properties": {
+            "old": {
+              "$ref": "#/definitions/Relation"
+            },
+            "operation": {
+              "type": "string",
+              "enum": [
+                "removed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "RelationEvidence": {
       "description": "Concrete evidence supporting a graph relation.",
@@ -703,6 +1168,112 @@
           "format": "float"
         }
       }
+    },
+    "SensitiveArtifactAllowance": {
+      "description": "Explicit approval for exactly one sensitive path, digest, and entry kind.",
+      "type": "object",
+      "required": [
+        "approved_by",
+        "content_hash",
+        "kind",
+        "path",
+        "reason"
+      ],
+      "properties": {
+        "approved_by": {
+          "$ref": "#/definitions/AuthorId"
+        },
+        "content_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "kind": {
+          "$ref": "#/definitions/SensitiveArtifactKind"
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SensitiveArtifactKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SharedAdmissionPolicy": {
+      "description": "Replicated admission policy resolved at a semantic change.",
+      "type": "object",
+      "required": [
+        "generation",
+        "hash",
+        "semantics_version",
+        "sensitive_allowances",
+        "sources"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        },
+        "semantics_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sensitive_allowances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SensitiveArtifactAllowance"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AdmissionRuleSource"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "SourceSpan": {
       "description": "Source location of an entity within a file.",
@@ -928,6 +1499,167 @@
       "description": "Unique identifier for a WorkItem.",
       "type": "string",
       "format": "uuid"
+    },
+    "WorkspaceExpectation": {
+      "description": "Exact compare-and-swap expectation for persisted workspace authority.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_not_exist"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "admission_policy",
+            "generation",
+            "head",
+            "semantic_overlay_hash",
+            "tree_hash",
+            "type"
+          ],
+          "properties": {
+            "admission_policy": {
+              "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+            },
+            "base_target": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RefTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "base_tree_hash": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Hash256"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "head": {
+              "$ref": "#/definitions/WorkspaceHead"
+            },
+            "semantic_overlay_hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "tree_hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "must_equal"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceHead": {
+      "description": "Local HEAD for one materialized workspace.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefTarget"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "detached"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceId": {
+      "description": "Local identity for one materialized repository workspace.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceSemanticDelta": {
+      "description": "One canonical entity/relation transition for mutable workspace authority.\n\n[`WorkspaceMutation::semantic_delta`] carries the incremental transition from the expected workspace graph to its successor. The same representation is stored cumulatively in [`WorkspaceState::semantic_overlay`] relative to `base_target`. Exact repository membership remains independently authoritative in [`WorkspaceState::tree`].",
+      "type": "object",
+      "required": [
+        "entity_deltas",
+        "relation_deltas",
+        "version"
+      ],
+      "properties": {
+        "entity_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EntityDelta"
+          }
+        },
+        "external_reference_deltas": {
+          "description": "Deliberately last for additive positional-wire compatibility.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalReferenceDelta"
+          }
+        },
+        "relation_deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RelationDelta"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

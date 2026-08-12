@@ -1,0 +1,575 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkspaceTreeSnapshot",
+  "description": "One complete, authority-bound workspace tree.",
+  "type": "object",
+  "required": [
+    "artifacts",
+    "binding",
+    "schema"
+  ],
+  "properties": {
+    "artifacts": {
+      "description": "Canonically ordered by stable artifact identity.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkspaceTreeArtifact"
+      }
+    },
+    "binding": {
+      "$ref": "#/definitions/WorkspaceSnapshotBinding"
+    },
+    "schema": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AdmissionPolicyHash": {
+      "description": "Content identity of a resolved shared admission policy.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "AdmissionPolicyStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/AdmissionPolicyHash"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ArtifactId": {
+      "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "AuthorityRoot": {
+      "description": "One versioned digest in the repository authority root bundle.",
+      "type": "object",
+      "required": [
+        "hash",
+        "version"
+      ],
+      "properties": {
+        "hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "EffectiveAdmissionPolicyStamp": {
+      "description": "Complete policy identity consumed by one local workspace.",
+      "type": "object",
+      "required": [
+        "local",
+        "shared"
+      ],
+      "properties": {
+        "local": {
+          "$ref": "#/definitions/LocalOverlayStamp"
+        },
+        "shared": {
+          "$ref": "#/definitions/AdmissionPolicyStamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectId": {
+      "description": "Typed identity of one object in an external Git object database.",
+      "type": "object",
+      "required": [
+        "kind",
+        "oid"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExternalObjectKind"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectKind": {
+      "description": "The object type that participates in Git's object header and object ID.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "tree",
+        "blob",
+        "tag"
+      ]
+    },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "LocalOverlayHash": {
+      "$ref": "#/definitions/Hash256"
+    },
+    "LocalOverlayStamp": {
+      "type": "object",
+      "required": [
+        "generation",
+        "hash"
+      ],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash": {
+          "$ref": "#/definitions/LocalOverlayHash"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefTarget": {
+      "description": "Exact target of a repository ref.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "change_id",
+            "type"
+          ],
+          "properties": {
+            "change_id": {
+              "$ref": "#/definitions/SemanticChangeId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "change"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "object",
+            "type"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "external_object"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RepoPath": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryId": {
+      "type": "string"
+    },
+    "RootBundle": {
+      "description": "Exhaustive root partition for replicated and local repository authority.",
+      "type": "object",
+      "required": [
+        "collaboration",
+        "generation",
+        "history",
+        "local_state",
+        "ref_log",
+        "ref_state",
+        "replication",
+        "version"
+      ],
+      "properties": {
+        "collaboration": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "history": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "local_state": {
+          "description": "Local workspace/session/overlay authority. Never compare this field when deciding whether two replicas have identical replicated truth.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuthorityRoot"
+            }
+          ]
+        },
+        "ref_log": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "ref_state": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "replication": {
+          "$ref": "#/definitions/AuthorityRoot"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemanticChangeId": {
+      "description": "Content-addressed identifier for a SemanticChange.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "TreeEntry": {
+      "description": "Exact materialization of one leaf in the repository tree.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "executable",
+            "hash",
+            "type"
+          ],
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "hash": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The referenced blob contains the byte-exact link target.",
+          "type": "object",
+          "required": [
+            "target_blob",
+            "type"
+          ],
+          "properties": {
+            "target_blob": {
+              "$ref": "#/definitions/Hash256"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A Git submodule pointer. The target need not exist in this repository's object database.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "gitlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceHead": {
+      "description": "Local HEAD for one materialized workspace.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefTarget"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "detached"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkspaceId": {
+      "description": "Local identity for one materialized repository workspace.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceSnapshotBinding": {
+      "description": "VFS/projection binding for one exact workspace snapshot.\n\n`workspace_tree_hash` is the projected graph-owned tree. It is deliberately distinct from `base_tree_hash`: a dirty workspace must never pretend that its tree is the commit named by `base_target`. Both base fields are absent for an unborn symbolic ref.",
+      "type": "object",
+      "required": [
+        "admission_policy",
+        "repository_id",
+        "roots",
+        "workspace_generation",
+        "workspace_head",
+        "workspace_id",
+        "workspace_semantic_overlay_hash",
+        "workspace_tree_hash"
+      ],
+      "properties": {
+        "admission_policy": {
+          "$ref": "#/definitions/EffectiveAdmissionPolicyStamp"
+        },
+        "base_target": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_tree_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repository_id": {
+          "$ref": "#/definitions/RepositoryId"
+        },
+        "roots": {
+          "$ref": "#/definitions/RootBundle"
+        },
+        "workspace_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "workspace_head": {
+          "$ref": "#/definitions/WorkspaceHead"
+        },
+        "workspace_id": {
+          "$ref": "#/definitions/WorkspaceId"
+        },
+        "workspace_semantic_overlay_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "workspace_tree_hash": {
+          "$ref": "#/definitions/Hash256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WorkspaceTreeArtifact": {
+      "description": "One leaf in a workspace-tree projection.",
+      "type": "object",
+      "required": [
+        "artifact_id",
+        "entry",
+        "mtime",
+        "path",
+        "size"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/definitions/ArtifactId"
+        },
+        "entry": {
+          "$ref": "#/definitions/TreeEntry"
+        },
+        "mtime": {
+          "description": "Projection timestamp as Unix seconds. Git does not store file mtimes; this value is projection metadata and is integrity-bound by the snapshot identity rather than by the repository tree hash.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "path": {
+          "$ref": "#/definitions/RepoPath"
+        },
+        "size": {
+          "description": "Exact byte length of the blob or symlink target. Gitlinks have no local body and must advertise zero.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

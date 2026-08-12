@@ -1,0 +1,620 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GitExternalAuthority",
+  "description": "Complete external Git authority admitted at the migration boundary.",
+  "type": "object",
+  "required": [
+    "closure",
+    "commit_projections",
+    "material_head",
+    "object_format",
+    "raw_head",
+    "raw_refs",
+    "repository_id",
+    "schema_version"
+  ],
+  "properties": {
+    "closure": {
+      "$ref": "#/definitions/GitObjectClosureManifest"
+    },
+    "commit_projections": {
+      "description": "Canonically ordered by raw commit OID.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GitCommitProjection"
+      }
+    },
+    "material_head": {
+      "description": "Separately derived decision about workspace materializability.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GitMaterialHead"
+        }
+      ]
+    },
+    "object_format": {
+      "$ref": "#/definitions/GitObjectFormat"
+    },
+    "raw_head": {
+      "description": "Exact raw `HEAD`, before symbolic resolution or tag peeling.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GitRawTarget"
+        }
+      ]
+    },
+    "raw_refs": {
+      "description": "Canonically ordered by exact raw ref name.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GitRawRef"
+      }
+    },
+    "repository_id": {
+      "$ref": "#/definitions/RepositoryId"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ExternalObjectId": {
+      "description": "Typed identity of one object in an external Git object database.",
+      "type": "object",
+      "required": [
+        "kind",
+        "oid"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExternalObjectKind"
+        },
+        "oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExternalObjectKind": {
+      "description": "The object type that participates in Git's object header and object ID.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "tree",
+        "blob",
+        "tag"
+      ]
+    },
+    "ExternalObjectRecord": {
+      "description": "Exact raw-body descriptor for an external object.\n\n`body_hash` addresses the body in Kin's blob CAS. `oid` is independently verified over Git's `\"<kind> <len>\\0<body>\"` envelope.",
+      "type": "object",
+      "required": [
+        "body_hash",
+        "body_len",
+        "object"
+      ],
+      "properties": {
+        "body_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "body_len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "object": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitCommitCanonicalIdentity": {
+      "description": "Kin-canonical identity of one parsed raw Git commit projection.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "GitCommitProjection": {
+      "description": "Parsed fields that define Git commit ancestry and tree identity.",
+      "type": "object",
+      "required": [
+        "canonical_identity",
+        "commit_oid",
+        "parent_oids",
+        "raw_tree_oid"
+      ],
+      "properties": {
+        "canonical_identity": {
+          "$ref": "#/definitions/GitCommitCanonicalIdentity"
+        },
+        "commit_oid": {
+          "$ref": "#/definitions/GitObjectId"
+        },
+        "parent_oids": {
+          "description": "Exact order from the raw commit body, including repeated parents.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectId"
+          }
+        },
+        "raw_tree_oid": {
+          "$ref": "#/definitions/GitObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitMaterialHead": {
+      "description": "Result of resolving and peeling raw `HEAD`.",
+      "oneOf": [
+        {
+          "description": "A symbolic `HEAD` whose final named ref does not yet exist.",
+          "type": "object",
+          "required": [
+            "missing_ref",
+            "type"
+          ],
+          "properties": {
+            "missing_ref": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "unborn"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A commit can seed later workspace admission, but is not itself a `WorkspaceState` and carries no admission-policy proof.",
+          "type": "object",
+          "required": [
+            "commit_oid",
+            "direct_target",
+            "raw_tree_oid",
+            "tag_chain",
+            "type"
+          ],
+          "properties": {
+            "commit_oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "direct_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "raw_tree_oid": {
+              "$ref": "#/definitions/GitObjectId"
+            },
+            "tag_chain": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ExternalObjectId"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The raw target is valid Git authority but cannot seed a workspace.",
+          "type": "object",
+          "required": [
+            "direct_target",
+            "peeled_target",
+            "tag_chain",
+            "type"
+          ],
+          "properties": {
+            "direct_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "peeled_target": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "tag_chain": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ExternalObjectId"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "non_materializable"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectClosureEntry": {
+      "description": "One exact object record and the ordered dependencies decoded from its body.",
+      "type": "object",
+      "required": [
+        "dependencies",
+        "record"
+      ],
+      "properties": {
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectDependency"
+          }
+        },
+        "record": {
+          "$ref": "#/definitions/ExternalObjectRecord"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectClosureManifest": {
+      "description": "Exact reachable Git object closure rooted at refs and `HEAD`.",
+      "type": "object",
+      "required": [
+        "objects",
+        "roots"
+      ],
+      "properties": {
+        "objects": {
+          "description": "Canonically ordered by typed external object identity.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectClosureEntry"
+          }
+        },
+        "roots": {
+          "description": "Canonically ordered by root source. `HEAD` sorts before named refs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GitObjectRoot"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectDependency": {
+      "description": "One typed dependency decoded from an exact raw Git object body.",
+      "type": "object",
+      "required": [
+        "kind",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/GitObjectDependencyKind"
+        },
+        "target": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectDependencyKind": {
+      "description": "Semantic role of one exact object-to-object dependency.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit_tree"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "position",
+            "type"
+          ],
+          "properties": {
+            "position": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "commit_parent"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "name",
+            "position",
+            "type"
+          ],
+          "properties": {
+            "mode": {
+              "$ref": "#/definitions/GitTreeEntryMode"
+            },
+            "name": {
+              "$ref": "#/definitions/GitTreeEntryName"
+            },
+            "position": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tree_entry"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "tag_target"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectFormat": {
+      "description": "Hash algorithm used by one Git object database.",
+      "type": "string",
+      "enum": [
+        "sha1",
+        "sha256"
+      ]
+    },
+    "GitObjectId": {
+      "description": "Exact Git object identity stored by a gitlink tree entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha1"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 20,
+              "minItems": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitObjectRoot": {
+      "description": "A direct object reached by resolving one raw ref or raw `HEAD`.",
+      "type": "object",
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/GitObjectRootSource"
+        },
+        "target": {
+          "$ref": "#/definitions/ExternalObjectId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitObjectRootSource": {
+      "description": "Origin of a closure root.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "head"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "ref"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitRawRef": {
+      "description": "One exact `refs/*` entry before peeling or semantic conversion.",
+      "type": "object",
+      "required": [
+        "name",
+        "target"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/definitions/RefName"
+        },
+        "target": {
+          "$ref": "#/definitions/GitRawTarget"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GitRawTarget": {
+      "description": "Exact raw target stored by a Git ref or by `HEAD`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "object",
+            "type"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/definitions/ExternalObjectId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "direct"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/RefName"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symbolic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GitTreeEntryMode": {
+      "description": "Valid Git tree-entry modes accepted by the authority boundary.",
+      "type": "string",
+      "enum": [
+        "tree",
+        "blob",
+        "blob_executable",
+        "symlink",
+        "gitlink"
+      ]
+    },
+    "GitTreeEntryName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Hash256": {
+      "description": "Content-addressed 256-bit hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "RefName": {
+      "type": "object",
+      "required": [
+        "bytes_hex"
+      ],
+      "properties": {
+        "bytes_hex": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryId": {
+      "type": "string"
+    }
+  }
+}

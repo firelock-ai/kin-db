@@ -26,8 +26,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
       # Mirror ci.yml / ci-linux.yml: HF_HUB_OFFLINE keeps the run deterministic
       # and offline. The three tests that construct a real embedder needing HF
-      # weights, plus many_vectors_search_quality, are skipped here too (same skip
-      # as CI) until an offline stub-weights fixture exists (post-freeze item).
+      # weights are skipped here too (same skip as CI) until an offline
+      # stub-weights fixture exists. Keep this list identical to CI's, because a
+      # release gate that skips more than CI proves less than the run that let
+      # the tag be cut.
       - name: Test
         env:
           HF_HUB_OFFLINE: "1"
@@ -36,7 +38,6 @@ jobs:
           --skip process_embedding_queue_without_embeddings_is_noop
           --skip default_dimensions_match_default_model
           --skip test_vector_index_dimension_mismatch_auto_recovery
-          --skip many_vectors_search_quality
 
       - name: 100K hydration smoke guard
         # Keep the release gate identical to CI: the timed assertion runs alone

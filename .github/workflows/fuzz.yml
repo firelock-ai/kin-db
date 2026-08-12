@@ -6,7 +6,7 @@
 # cargo-fuzz / libFuzzer coverage for kin-db's binary ingestion and
 # semantic-entity-graph build paths.
 #
-# - On PRs: DETERMINISTIC regression — replay the committed seed corpus only
+# - On PRs: DETERMINISTIC regression that replays the committed seed corpus only
 #   (-runs=0, no mutation). This gates PRs on known-bad inputs (e.g. the
 #   body_len overflow seed) without the flakiness of mutation-based fuzzing
 #   blocking unrelated PRs.
