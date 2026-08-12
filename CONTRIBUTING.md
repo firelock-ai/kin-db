@@ -5,12 +5,10 @@ conventions this repository actually follows, and how to get changes reviewed.
 
 ## Development Setup
 
-kin-db is a Rust workspace. CI builds on **stable** Rust, so a current stable
-toolchain via [rustup](https://rustup.rs/) is all you need:
-
-```sh
-rustup toolchain install stable
-```
+kin-db is a Rust workspace. The Rust toolchain is pinned by
+[`rust-toolchain.toml`](rust-toolchain.toml), and [rustup](https://rustup.rs/)
+honors that pin automatically: with rustup installed, your first `cargo`
+invocation fetches the pinned toolchain and its components.
 
 Build and test the workspace:
 
