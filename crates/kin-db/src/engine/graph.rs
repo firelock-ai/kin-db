@@ -3642,6 +3642,35 @@ impl InMemoryGraph {
         references
     }
 
+    /// Whether two graphs agree on the semantic workspace: live entities, live
+    /// relations, and the resolved tree.
+    ///
+    /// The obvious way to write this from outside the crate is to `to_snapshot`
+    /// both sides and compare the three fields, and that is what the commit
+    /// reply path did. A snapshot deep-clones every sub-store, including the
+    /// entity revision history and the audit log, both of which grow with every
+    /// commit a repository has ever taken, so comparing three maps cost two
+    /// whole-graph clones per call. The reply path compares twice, which is four
+    /// clones of everything, after the change is already durable.
+    ///
+    /// Reading the three fields under their own lock clones none of them. The
+    /// comparison itself is unchanged: the same three fields, by value, both
+    /// hash maps and therefore order-independent.
+    ///
+    /// Comparing a graph with itself short-circuits rather than taking the same
+    /// lock twice, since a second read acquisition behind a waiting writer is a
+    /// deadlock rather than a re-entrant read.
+    pub fn semantic_workspace_matches(&self, other: &InMemoryGraph) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        let left = self.entities.read();
+        let right = other.entities.read();
+        left.entities == right.entities
+            && left.relations == right.relations
+            && left.resolved_tree == right.resolved_tree
+    }
+
     pub fn to_snapshot(&self) -> GraphSnapshot {
         // Clone each sub-store under its own read lock, then drop the lock
         // immediately. Lock ordering: entities → changes → work → reviews
@@ -15455,6 +15484,52 @@ mod tests {
             graph.pending_embeddings(),
             2,
             "both endpoints of a changed relation re-embed even with identical own text"
+        );
+    }
+
+    /// The commit reply path compares the live graph against reloaded
+    /// repository authority twice per commit, and used to do it by cloning both
+    /// whole graphs each time. The comparison must read exactly the three
+    /// workspace fields and stay blind to everything a snapshot also carries,
+    /// or the cheap form is not the same question as the expensive one.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn workspace_equality_reads_entities_relations_and_tree_only() {
+        let left = InMemoryGraph::new();
+        let right = InMemoryGraph::new();
+        assert!(
+            left.semantic_workspace_matches(&right),
+            "two empty graphs agree"
+        );
+        assert!(
+            left.semantic_workspace_matches(&left),
+            "a graph agrees with itself"
+        );
+
+        let entity = test_entity("foo", "src/a.rs");
+        left.batch_upsert_entities(std::slice::from_ref(&entity))
+            .unwrap();
+        assert!(
+            !left.semantic_workspace_matches(&right),
+            "an entity present on one side is a workspace difference"
+        );
+        right
+            .batch_upsert_entities(std::slice::from_ref(&entity))
+            .unwrap();
+        assert!(
+            left.semantic_workspace_matches(&right),
+            "the same entity on both sides agrees"
+        );
+
+        // Revision history and the change DAG are carried by a snapshot and are
+        // not the workspace. Comparing through `to_snapshot` never
+        // distinguished them either, so the cheap form has to stay equally
+        // blind, and they are exactly the sub-stores whose growth made the
+        // expensive form cost minutes.
+        apply_init_change(&left, 0x01, std::slice::from_ref(&entity));
+        assert!(
+            left.semantic_workspace_matches(&right),
+            "revision history and changes must not decide workspace equality"
         );
     }
 
