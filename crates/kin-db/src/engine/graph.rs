@@ -15505,11 +15505,21 @@ mod tests {
     /// still. If that were wrong, both columns would grow together and the
     /// ratio would stay flat.
     ///
+    /// The `rebuild_us` column is measured beside the comparisons so the two
+    /// candidate terms can be ranked instead of guessed at, and on this
+    /// evidence it dominates: rebuilding the graph costs more than an order of
+    /// magnitude what all of a commit's comparisons cost together. It is a
+    /// lower bound on the real reload, which also opens the repository and
+    /// deserializes off disk. It is printed and not asserted, because the
+    /// ranking is what the reader needs and pinning it would turn a future
+    /// improvement to the reload into a red test.
+    ///
     /// Ignored by default because it is a timing measurement, not a gate. Run
     /// it with `cargo test --features vector -- --ignored --nocapture
-    /// workspace_comparison_cost`. The assertion is deliberately loose: it
-    /// fails only if the clone-free form stops being dramatically cheaper,
-    /// which is a structural change rather than a slow machine.
+    /// workspace_comparison_cost`. The assertions are deliberately loose: they
+    /// fail only if the clone-free form stops being dramatically cheaper or the
+    /// gap stops widening with history, both structural changes rather than a
+    /// slow machine.
     #[cfg(feature = "vector")]
     #[test]
     #[ignore = "timing measurement for FIR-2258, not a gate"]
@@ -15558,7 +15568,13 @@ mod tests {
 
         const ENTITIES: usize = 200;
         println!("entities={ENTITIES}  (one comparison, both sides)");
-        println!("generations  snapshot_us  clone_free_us  ratio");
+        // `rebuild_us` is the in-memory half of what the commit reply's
+        // `load_native_commit_base` pays before either comparison runs. It is a
+        // LOWER BOUND on that step: the real one also opens the repository and
+        // deserializes the snapshot off disk, neither of which is timed here.
+        // It is measured beside the comparisons so the two candidate terms can
+        // be ranked rather than guessed at.
+        println!("generations  snapshot_us  clone_free_us  ratio  rebuild_us");
         let mut ratios = Vec::new();
         for generations in [1u8, 8, 24] {
             let left = build(ENTITIES, generations);
@@ -15572,8 +15588,16 @@ mod tests {
             assert!(left.semantic_workspace_matches(&right));
             let clone_free_us = started.elapsed().as_micros().max(1);
 
+            let carried = left.to_snapshot();
+            let started = std::time::Instant::now();
+            let rebuilt = InMemoryGraph::from_snapshot(carried).unwrap();
+            let rebuild_us = started.elapsed().as_micros().max(1);
+            assert!(left.semantic_workspace_matches(&rebuilt));
+
             let ratio = snapshot_us as f64 / clone_free_us as f64;
-            println!("{generations:>11}  {snapshot_us:>11}  {clone_free_us:>13}  {ratio:>5.1}x");
+            println!(
+                "{generations:>11}  {snapshot_us:>11}  {clone_free_us:>13}  {ratio:>5.1}x  {rebuild_us:>10}"
+            );
             ratios.push(ratio);
         }
 
