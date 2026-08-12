@@ -662,13 +662,27 @@ fn entity_unchanged_since_last_revision(ent: &EntityData, entity: &Entity) -> bo
         .is_some_and(|last| entity_matches_revision(&last.entity, entity))
 }
 
-/// Apply a change's entity deltas to the revision chains, returning the prior
-/// HEAD revision id of every entity that gained a new generation. Those
-/// superseded revisions are no longer current truth, so any vector still indexed
-/// under their key is an orphan — the returned ids let `prune_orphaned_vectors`
-/// evict exactly that set without rescanning the whole index.
-fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec<EntityRevisionId> {
-    let mut superseded = Vec::new();
+/// One entity's revision-chain advance: the entity that gained a new HEAD
+/// generation, and the HEAD id that advance superseded (`None` when the chain
+/// had no prior generation).
+///
+/// Both halves are retrieval facts. The superseded id names a vector that is no
+/// longer truth and must be evicted; the entity id names a revision key that
+/// just entered truth and therefore needs a vector. Returning them together is
+/// what keeps the two sides from drifting apart, which is exactly how a commit
+/// used to retire coverage it never replaced.
+type RevisionAdvance = (EntityId, Option<EntityRevisionId>);
+
+/// Apply a change's entity deltas to the revision chains, returning one
+/// [`RevisionAdvance`] per entity that gained a new generation.
+///
+/// The superseded HEAD ids let `prune_orphaned_vectors` evict exactly the
+/// orphaned set without rescanning the whole index. The entity ids let
+/// [`InMemoryGraph::admit_minted_revision_vectors`] give the newly-minted HEAD
+/// revision keys a vector, since `graph_truth_retrievable_keys` starts counting
+/// them as coverage the instant this function returns.
+fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec<RevisionAdvance> {
+    let mut advances = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
             EntityDelta::Added { new: entity } => {
@@ -676,9 +690,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
                     continue;
                 }
                 let chain = ent.entity_revisions.entry(entity.id).or_default();
-                if let Some(prev) = chain.last() {
-                    superseded.push(prev.revision_id);
-                }
+                advances.push((entity.id, chain.last().map(|prev| prev.revision_id)));
                 chain.push(EntityRevision::new(entity.clone(), change.id, None));
             }
             EntityDelta::Modified { old, new } => {
@@ -687,9 +699,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
                 }
                 let previous_revision = lookup_entity_revision_id(&ent.entity_revisions, old);
                 let chain = ent.entity_revisions.entry(new.id).or_default();
-                if let Some(prev) = chain.last() {
-                    superseded.push(prev.revision_id);
-                }
+                advances.push((new.id, chain.last().map(|prev| prev.revision_id)));
                 chain.push(EntityRevision::new(
                     new.clone(),
                     change.id,
@@ -699,7 +709,67 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
             EntityDelta::Removed { .. } => {}
         }
     }
-    superseded
+    advances
+}
+
+/// The prior HEAD revision ids in a set of advances: the vectors this change
+/// orphaned.
+fn superseded_revision_ids(advances: &[RevisionAdvance]) -> Vec<EntityRevisionId> {
+    advances
+        .iter()
+        .filter_map(|(_, superseded)| *superseded)
+        .collect()
+}
+
+/// A revision key that entered graph truth in this change, with the key whose
+/// vector can be carried onto it when the two format to byte-identical embed
+/// text.
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy)]
+struct MintedRevision {
+    /// The new HEAD revision key, now counted by
+    /// `graph_truth_retrievable_keys` and therefore owed a vector.
+    key: RetrievalKey,
+    /// The revision key holding the vector this one can reuse verbatim.
+    carry_from: Option<RetrievalKey>,
+}
+
+/// Decide, for every entity that gained a generation, whether its new HEAD
+/// revision key can reuse the superseded generation's vector.
+///
+/// A revision key embeds `format_graph_entity_text(&rev.entity)` with no
+/// neighborhood context (see `prepare_pending_embedding_batch`), so byte
+/// equality of that formatting is the whole criterion — not a heuristic, and
+/// not the fingerprint triple, which can agree while the formatted text does
+/// not. Sorted by key so the resulting index upsert order does not depend on
+/// delta order, matching the determinism the rest of the vector path keeps.
+#[cfg(feature = "vector")]
+fn plan_minted_revision_vectors(
+    ent: &EntityData,
+    advances: &[RevisionAdvance],
+) -> Vec<MintedRevision> {
+    let mut minted: Vec<MintedRevision> = advances
+        .iter()
+        .filter_map(|(entity_id, _)| {
+            let chain = ent.entity_revisions.get(entity_id)?;
+            let head = chain.last()?;
+            let carry_from = chain
+                .len()
+                .checked_sub(2)
+                .and_then(|index| chain.get(index))
+                .filter(|prev| {
+                    crate::embed::format_graph_entity_text(&prev.entity)
+                        == crate::embed::format_graph_entity_text(&head.entity)
+                })
+                .map(|prev| RetrievalKey::EntityRevision(prev.revision_id));
+            Some(MintedRevision {
+                key: RetrievalKey::EntityRevision(head.revision_id),
+                carry_from,
+            })
+        })
+        .collect();
+    minted.sort_unstable_by_key(|entry| entry.key);
+    minted
 }
 
 /// The most recent (HEAD) revision id of every entity's revision chain.
@@ -5560,6 +5630,58 @@ impl InMemoryGraph {
         }
     }
 
+    /// Give every revision key this change minted a vector, or a place in the
+    /// queue that will build one.
+    ///
+    /// A change appends a new HEAD `EntityRevision` for each entity it touches,
+    /// and `graph_truth_retrievable_keys` counts HEAD revision keys as coverage,
+    /// so the instant a change lands the store owes N new vectors while the
+    /// prune retires the N it replaced. Nothing else fills them: the transaction
+    /// path invalidates `RetrievalKey::Entity` only, and the background embed
+    /// worker embeds what is queued rather than what is missing. Left alone,
+    /// every commit permanently costs the store one vector per touched entity
+    /// and the queue drains to empty with the work outstanding.
+    ///
+    /// Most of those keys need no inference. A file-wide edit restamps blob
+    /// hashes and shifts spans, and neither reaches the formatted embed text, so
+    /// the superseded generation's vector is the correct vector for the new key
+    /// and is copied onto it. Only the keys whose text genuinely moved are
+    /// queued, at `ChangedThisSync` — the same tier the live mutation path uses.
+    #[cfg(feature = "vector")]
+    fn admit_minted_revision_vectors(&self, minted: &[MintedRevision]) {
+        if minted.is_empty() {
+            return;
+        }
+        let vector_index = self.vector_index.lock().clone();
+        let mut carried = 0usize;
+        let mut queued = 0usize;
+        let mut queue = self.embedding_queue.lock();
+        for entry in minted {
+            if let Some(vi) = vector_index.as_ref() {
+                if vi.contains_retrievable(&entry.key) {
+                    continue;
+                }
+                if let Some(source) = entry.carry_from {
+                    if let Some(vector) = vi.get_retrievable(&source) {
+                        if vi.upsert_retrievable(entry.key, &vector).is_ok() {
+                            carried += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // No index yet, no vector to carry, or the carry failed. Queueing is
+            // the honest answer in every one of those cases: the key is missing
+            // and the store now says so.
+            queue.insert_graph_priority_changed(entry.key, EmbedRecency::ChangedThisSync);
+            queued += 1;
+        }
+        drop(queue);
+        if carried > 0 || queued > 0 {
+            tracing::debug!(carried, queued, "admitted minted revision vectors");
+        }
+    }
+
     /// Force the next [`InMemoryGraph::prune_orphaned_vectors`] to scan the whole
     /// index against graph truth. Called after an untracked truth change — a
     /// fresh build, a sidecar load, or an entity removal — whose orphan set
@@ -7981,7 +8103,10 @@ impl ChangeStore for InMemoryGraph {
         // transition so a concurrent persistence detach cannot split them
         // across generations.
         let mut pending = self.pending_delta.lock();
-        let superseded_revisions = append_entity_revisions(&mut ent, change);
+        let advances = append_entity_revisions(&mut ent, change);
+        let superseded_revisions = superseded_revision_ids(&advances);
+        #[cfg(feature = "vector")]
+        let minted_revisions = plan_minted_revision_vectors(&ent, &advances);
         run_create_change_after_revision_hook();
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
@@ -8018,7 +8143,17 @@ impl ChangeStore for InMemoryGraph {
         drop(pending);
 
         #[cfg(feature = "vector")]
-        self.note_superseded_vectors(&superseded_revisions);
+        {
+            // Both guards go before the vector index is touched. The rest of the
+            // engine reaches the index only after releasing the entity lock, and
+            // the carry-forward reads a vector under the index lock.
+            drop(chg);
+            drop(ent);
+            // Admit before noting: the carry-forward source is the very key the
+            // prune is about to evict.
+            self.admit_minted_revision_vectors(&minted_revisions);
+            self.note_superseded_vectors(&superseded_revisions);
+        }
         #[cfg(not(feature = "vector"))]
         let _ = superseded_revisions;
         Ok(())
@@ -8199,11 +8334,11 @@ impl InMemoryGraph {
         let mut seen_entities = HashSet::new();
         let mut touched_parents = Vec::new();
         let mut seen_parents = HashSet::new();
-        let mut superseded_revisions = Vec::new();
+        let mut advances: Vec<RevisionAdvance> = Vec::new();
         let mut pending_changes = Vec::with_capacity(unique_changes.len());
 
         for change in unique_changes {
-            superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
+            advances.extend(append_entity_revisions(&mut ent, &change));
             for entity_id in change.entity_deltas.iter().map(|delta| match delta {
                 EntityDelta::Added { new: entity } | EntityDelta::Modified { new: entity, .. } => {
                     entity.id
@@ -8263,8 +8398,16 @@ impl InMemoryGraph {
             .collect();
         delta_map_upsert_batch(&mut pending.delta.change_children, child_updates);
 
+        let superseded_revisions = superseded_revision_ids(&advances);
         #[cfg(feature = "vector")]
-        self.note_superseded_vectors(&superseded_revisions);
+        {
+            let minted_revisions = plan_minted_revision_vectors(&ent, &advances);
+            drop(pending);
+            drop(chg);
+            drop(ent);
+            self.admit_minted_revision_vectors(&minted_revisions);
+            self.note_superseded_vectors(&superseded_revisions);
+        }
         #[cfg(not(feature = "vector"))]
         let _ = superseded_revisions;
 
@@ -15313,6 +15456,192 @@ mod tests {
             2,
             "both endpoints of a changed relation re-embed even with identical own text"
         );
+    }
+
+    /// Drive one commit the way the transactional write path does: seal the
+    /// change, which appends a revision generation per touched entity, then
+    /// apply the same deltas to live entity state.
+    #[cfg(feature = "vector")]
+    fn apply_commit_change(graph: &InMemoryGraph, change_byte: u8, modified: &[(Entity, Entity)]) {
+        let entity_deltas: Vec<EntityDelta> = modified
+            .iter()
+            .map(|(old, new)| EntityDelta::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            })
+            .collect();
+        let change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([change_byte; 32])),
+            parents: vec![],
+            timestamp: Timestamp(
+                chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(change_byte), 0)
+                    .expect("test timestamp is representable"),
+            ),
+            author: AuthorId::new("test"),
+            message: "commit".to_string(),
+            entity_deltas: entity_deltas.clone(),
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        graph.create_change(&change).unwrap();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas,
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    /// The embedding queue is what the background worker drains and what it
+    /// reports as `remaining`, so a retrieval key missing its vector and absent
+    /// from the queue is work nothing will ever do, announced as finished. The
+    /// queue must always account for at least the coverage gap.
+    #[cfg(feature = "vector")]
+    fn assert_queue_accounts_for_missing_coverage(graph: &InMemoryGraph) {
+        let status = graph.embedding_status();
+        let missing = status.total.saturating_sub(status.indexed);
+        let queued = graph.pending_embeddings();
+        assert!(
+            queued >= missing,
+            "queue reports {queued} remaining while {missing} retrieval keys carry no vector"
+        );
+    }
+
+    /// FIR-2254. Every commit appends a new HEAD `EntityRevision` per touched
+    /// entity, and `graph_truth_retrievable_keys` counts HEAD revision keys as
+    /// coverage, so a commit hands the store one retrieval key per touched
+    /// entity with no vector behind it while the prune retires the generation
+    /// each one replaced. Nothing filled them: the transaction path invalidates
+    /// `RetrievalKey::Entity` only, the background worker embeds what is queued
+    /// rather than what is missing, and the queue drained to empty with the work
+    /// outstanding. A 3166-entity store lost 641 vectors to one comment-only
+    /// edit, then 210 more to the next, and stayed down until an operator
+    /// noticed the counter and ran `kin embed` by hand.
+    ///
+    /// A comment between declarations restamps blob hashes and shifts spans, and
+    /// neither reaches the formatted embed text, so the superseded generation's
+    /// vector is the correct vector for the key that replaced it and is carried
+    /// onto it without inference.
+    ///
+    /// Discriminating: on the shipped behavior `indexed` falls by one per
+    /// touched entity while the queue reads empty, so both assertions fail.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn comment_only_commit_keeps_vector_coverage_complete() {
+        let graph = InMemoryGraph::new();
+        let file = "src/engine/graph.rs";
+        let untouched_a = entity_in_edited_file("prune_orphaned_vectors", file, "blob-1", 10);
+        let untouched_b = entity_in_edited_file("process_embedding_queue", file, "blob-1", 200);
+        let untouched_c = entity_in_edited_file("apply_transaction_delta", file, "blob-1", 400);
+        let originals = [untouched_a, untouched_b, untouched_c];
+        apply_init_change(&graph, 0x01, &originals);
+        graph.admit_artifact_for_test(
+            file,
+            TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+        );
+        embed_all_retrievable(&graph);
+        graph.embedding_queue.lock().clear();
+
+        let before = graph.embedding_status();
+        assert_eq!(
+            before.indexed, before.total,
+            "the fixture must start at full coverage"
+        );
+        assert_eq!(
+            before.pending, 0,
+            "the fixture must start with a drained queue"
+        );
+
+        let moved: Vec<(Entity, Entity)> = originals
+            .iter()
+            .map(|entity| {
+                (
+                    entity.clone(),
+                    restamp_for_unrelated_file_edit(entity, "blob-2", 7),
+                )
+            })
+            .collect();
+        apply_commit_change(&graph, 0x02, &moved);
+
+        let after = graph.embedding_status();
+        assert_eq!(
+            after.total, before.total,
+            "the commit replaces revision keys one for one, so truth must not grow"
+        );
+        assert_eq!(
+            after.indexed, after.total,
+            "a comment-only commit must not cost the store vector coverage"
+        );
+        assert_eq!(
+            after.pending, 0,
+            "carried vectors leave nothing for the background pass to do"
+        );
+        assert_queue_accounts_for_missing_coverage(&graph);
+    }
+
+    /// The other half of FIR-2254's acceptance. When a commit does change embed
+    /// text the vector cannot be carried, so the revision key it mints has to be
+    /// QUEUED. Coverage that is short with an empty queue is the exact state the
+    /// daemon reported as `remaining=0`: it drains what is queued, not what is
+    /// missing, so an unqueued gap is never repaired and never announced.
+    ///
+    /// Discriminating: on the shipped behavior only the HEAD entity key is
+    /// queued while two keys are short, so the accounting assertion fails.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn commit_queues_the_revision_key_whose_embed_text_changed() {
+        let graph = InMemoryGraph::new();
+        let file = "src/engine/graph.rs";
+        let untouched_a = entity_in_edited_file("prune_orphaned_vectors", file, "blob-1", 10);
+        let untouched_b = entity_in_edited_file("process_embedding_queue", file, "blob-1", 200);
+        let edited = entity_in_edited_file("apply_transaction_delta", file, "blob-1", 400);
+        apply_init_change(
+            &graph,
+            0x01,
+            &[untouched_a.clone(), untouched_b.clone(), edited.clone()],
+        );
+        graph.admit_artifact_for_test(
+            file,
+            TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+        );
+        embed_all_retrievable(&graph);
+        graph.embedding_queue.lock().clear();
+
+        let mut rewritten = restamp_for_unrelated_file_edit(&edited, "blob-2", 7);
+        rewritten.signature = "fn apply_transaction_delta(&self, delta: &TransactionDelta)".into();
+        apply_commit_change(
+            &graph,
+            0x02,
+            &[
+                (
+                    untouched_a.clone(),
+                    restamp_for_unrelated_file_edit(&untouched_a, "blob-2", 7),
+                ),
+                (
+                    untouched_b.clone(),
+                    restamp_for_unrelated_file_edit(&untouched_b, "blob-2", 7),
+                ),
+                (edited.clone(), rewritten),
+            ],
+        );
+
+        let status = graph.embedding_status();
+        assert_eq!(
+            status.total.saturating_sub(status.indexed),
+            2,
+            "only the rewritten entity's HEAD entity and HEAD revision keys lose their vectors"
+        );
+        assert_queue_accounts_for_missing_coverage(&graph);
     }
 
     /// Add `entities` to the graph under a fresh change id, recording one
