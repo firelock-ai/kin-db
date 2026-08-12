@@ -15495,6 +15495,101 @@ mod tests {
         );
     }
 
+    /// What the snapshot-based comparison actually costs as history deepens,
+    /// and what it costs to answer the same question without cloning.
+    ///
+    /// This is the measurement behind FIR-2258. The claim under test is narrow
+    /// and falsifiable: the cost of comparing two graphs through `to_snapshot`
+    /// is driven by the sub-stores a workspace comparison never reads, so it
+    /// grows with a repository's history while the workspace itself stands
+    /// still. If that were wrong, both columns would grow together and the
+    /// ratio would stay flat.
+    ///
+    /// Ignored by default because it is a timing measurement, not a gate. Run
+    /// it with `cargo test --features vector -- --ignored --nocapture
+    /// workspace_comparison_cost`. The assertion is deliberately loose: it
+    /// fails only if the clone-free form stops being dramatically cheaper,
+    /// which is a structural change rather than a slow machine.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[ignore = "timing measurement for FIR-2258, not a gate"]
+    fn workspace_comparison_cost_grows_with_history_the_comparison_never_reads() {
+        /// One entity per declaration in a file, restamped once per generation
+        /// exactly as a comment-only edit restamps every entity in its file.
+        fn build(entities: usize, generations: u8) -> InMemoryGraph {
+            let graph = InMemoryGraph::new();
+            let file = "src/engine/graph.rs";
+            let mut live: Vec<Entity> = (0..entities)
+                .map(|index| {
+                    entity_in_edited_file(&format!("entity_{index}"), file, "blob-0", index as u32)
+                })
+                .collect();
+            apply_init_change(&graph, 0x01, &live);
+            graph.admit_artifact_for_test(
+                file,
+                TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+            );
+            for generation in 1..=generations {
+                let blob = format!("blob-{generation}");
+                let moved: Vec<(Entity, Entity)> = live
+                    .iter()
+                    .map(|entity| {
+                        (
+                            entity.clone(),
+                            restamp_for_unrelated_file_edit(entity, &blob, u32::from(generation)),
+                        )
+                    })
+                    .collect();
+                apply_commit_change(&graph, 0x02 + generation, &moved);
+                live = moved.into_iter().map(|(_, new)| new).collect();
+            }
+            graph
+        }
+
+        /// The comparison exactly as the commit reply path wrote it before the
+        /// engine could answer without cloning.
+        fn matches_via_snapshot(left: &InMemoryGraph, right: &InMemoryGraph) -> bool {
+            let left = left.to_snapshot();
+            let right = right.to_snapshot();
+            left.entities == right.entities
+                && left.relations == right.relations
+                && left.resolved_tree == right.resolved_tree
+        }
+
+        const ENTITIES: usize = 200;
+        println!("entities={ENTITIES}  (one comparison, both sides)");
+        println!("generations  snapshot_us  clone_free_us  ratio");
+        let mut ratios = Vec::new();
+        for generations in [1u8, 8, 24] {
+            let left = build(ENTITIES, generations);
+            let right = InMemoryGraph::from_snapshot(left.to_snapshot()).unwrap();
+
+            let started = std::time::Instant::now();
+            assert!(matches_via_snapshot(&left, &right));
+            let snapshot_us = started.elapsed().as_micros().max(1);
+
+            let started = std::time::Instant::now();
+            assert!(left.semantic_workspace_matches(&right));
+            let clone_free_us = started.elapsed().as_micros().max(1);
+
+            let ratio = snapshot_us as f64 / clone_free_us as f64;
+            println!("{generations:>11}  {snapshot_us:>11}  {clone_free_us:>13}  {ratio:>5.1}x");
+            ratios.push(ratio);
+        }
+
+        // The workspace is identical in every row: same entities, same
+        // relations, same tree. Only history deepened. If the snapshot form
+        // were not paying for history, this would not hold.
+        assert!(
+            *ratios.last().unwrap() > 4.0,
+            "the clone-free comparison must stay dramatically cheaper as history deepens; ratios {ratios:?}"
+        );
+        assert!(
+            ratios.last().unwrap() > ratios.first().unwrap(),
+            "the gap must widen with history, since history is what only the snapshot form reads; ratios {ratios:?}"
+        );
+    }
+
     /// The commit reply path compares the live graph against reloaded
     /// repository authority twice per commit, and used to do it by cloning both
     /// whole graphs each time. The comparison must read exactly the three
