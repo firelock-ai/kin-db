@@ -5683,8 +5683,11 @@ impl InMemoryGraph {
         }
         let vector_index = self.vector_index.lock().clone();
         let mut carried = 0usize;
-        let mut queued = 0usize;
-        let mut queue = self.embedding_queue.lock();
+        // Decide against the index first and take the queue lock once at the
+        // end. Holding the queue across index calls would be the only place in
+        // the engine where those two are nested, and a lock order that exists
+        // nowhere else is a deadlock waiting for its second site.
+        let mut to_queue: Vec<RetrievalKey> = Vec::new();
         for entry in minted {
             if let Some(vi) = vector_index.as_ref() {
                 if vi.contains_retrievable(&entry.key) {
@@ -5702,10 +5705,15 @@ impl InMemoryGraph {
             // No index yet, no vector to carry, or the carry failed. Queueing is
             // the honest answer in every one of those cases: the key is missing
             // and the store now says so.
-            queue.insert_graph_priority_changed(entry.key, EmbedRecency::ChangedThisSync);
-            queued += 1;
+            to_queue.push(entry.key);
         }
-        drop(queue);
+        let queued = to_queue.len();
+        if queued > 0 {
+            let mut queue = self.embedding_queue.lock();
+            for key in to_queue {
+                queue.insert_graph_priority_changed(key, EmbedRecency::ChangedThisSync);
+            }
+        }
         if carried > 0 || queued > 0 {
             tracing::debug!(carried, queued, "admitted minted revision vectors");
         }
