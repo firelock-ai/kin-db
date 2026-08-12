@@ -76,7 +76,7 @@ contributions from the community. A few requirements:
 ## Commit Messages
 
 This repository uses [Conventional Commits](https://www.conventionalcommits.org/).
-Recent history shows the expected shape — a `type(scope): summary` subject:
+Recent history shows the expected shape, a `type(scope): summary` subject:
 
 ```
 fix(storage): correct snapshot swap under concurrent reads
@@ -95,7 +95,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 
 - **Keep branch names topical, not tracker-coded.** Prefer short, descriptive
   names like `fix/snapshot-swap-race` or `feat/vector-persistence`. Avoid
-  embedding internal issue or tracker IDs in a branch name — a squash merge
+  embedding internal issue or tracker IDs in a branch name. A squash merge
   copies the branch name into the public commit subject, so anything in the
   branch name lands in history verbatim.
 - **Keep private context private.** Do not publish private session URLs or IDs,
@@ -111,7 +111,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 ## Pull Requests
 
 - **Keep PRs scoped.** Stage only the files your change actually needs.
-  Unrelated cleanups belong in their own PR — this keeps review focused and
+  Unrelated cleanups belong in their own PR. That keeps review focused and
   history bisectable.
 - Make sure `cargo fmt`, `cargo clippy`, and `cargo test` all pass.
 - If your change is user-facing, briefly describe it in the PR body so
@@ -122,8 +122,8 @@ Public Git history is part of the product, so keep it clean and reviewable:
 File issues on [firelock-ai/kin-db](https://github.com/firelock-ai/kin-db/issues)
 using the provided templates:
 
-- **Bug reports** — use the bug report template.
-- **Feature requests** — use the feature request template.
+- **Bug reports.** Use the bug report template.
+- **Feature requests.** Use the feature request template.
 
 For security vulnerabilities, do **not** open a public issue. Follow the
 private reporting process in [SECURITY.md](SECURITY.md).

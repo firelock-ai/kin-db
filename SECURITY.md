@@ -35,8 +35,8 @@ support window.
 
 ## Scope
 
-This policy covers the `kin-db` repository: the semantic engine — graph storage,
-snapshots, indexing, and text and vector search internals. Other Kin ecosystem
-repositories (for example `kin`, `kin-model`, `kin-vfs`, `kinlab`) carry their
+This policy covers the `kin-db` repository, which holds the semantic engine:
+graph storage, snapshots, indexing, and text and vector search internals.
+Other Kin ecosystem repositories (for example `kin`, `kin-model`, `kin-vfs`, `kinlab`) carry their
 own security policies; report issues against the repository where the affected
 code lives.
