@@ -21,12 +21,16 @@ Before opening a pull request, make sure the standard checks pass:
 
 ```sh
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI treats clippy warnings as errors (`-D warnings`), so a clean clippy run
-locally avoids surprises.
+CI treats clippy warnings as errors (`-D warnings`), but it also carries a
+burn-down allow-list of pre-existing lints that predate the current tree. A
+bare `cargo clippy --all-targets -- -D warnings` therefore fails today on lints
+CI accepts, which tells you nothing about your change. Copy the clippy
+invocation from the `Clippy` step in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) so you run what the gate
+runs, and treat any lint it does not allow as yours to fix.
 
 ## DCO Sign-Off
 
