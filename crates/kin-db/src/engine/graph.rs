@@ -772,22 +772,36 @@ fn plan_minted_revision_vectors(
     minted
 }
 
-/// The most recent (HEAD) revision id of every entity's revision chain.
+/// The most recent (HEAD) revision id of every LIVE entity's revision chain.
 ///
 /// `append_entity_revisions` pushes each new generation to the end of the
-/// chain, so `revs.last()` is the live revision. Superseded generations are
-/// intentionally excluded: the vector index tracks at most one revision vector
-/// per live entity. A superseded generation that a live re-embed leaves behind
-/// is an orphan to reclaim — not retrieval truth that semantic search should
-/// return as a second hit for the same entity. This is the single authority for
-/// "which revision keys are current", shared by the prune target and the
-/// embedding-queue backfill so the two never disagree (a disagreement would make
-/// the backfill re-embed a key the prune immediately evicts, churning forever).
+/// chain, so `revs.last()` is the live revision. Two exclusions keep this the
+/// retrieval-truth set rather than the history set:
+///
+/// - Superseded generations. The vector index tracks at most one revision
+///   vector per live entity; a superseded generation that a live re-embed
+///   leaves behind is an orphan to reclaim, not retrieval truth that semantic
+///   search should return as a second hit for the same entity.
+/// - Chains whose owning entity the graph no longer holds. Whole-history
+///   ingest derives a revision chain for every entity that ever existed, and
+///   removing an entity ends its chain without deleting it, so a repository
+///   with real history carries many chains keyed by ids absent from
+///   `ent.entities`. Such a chain's head resolves only to a snapshot of a
+///   dead entity: a vector under its key can never be served, retrieval must
+///   drop it, and every drop is reported as a degradation. Admitting those
+///   heads as truth made a freshly embedded store rank and drop them on every
+///   query while the prune kept their vectors forever.
+///
+/// This is the single authority for "which revision keys are current", shared
+/// by the prune target and the embedding-queue backfill so the two never
+/// disagree (a disagreement would make the backfill re-embed a key the prune
+/// immediately evicts, churning forever).
 #[cfg(feature = "vector")]
 fn latest_revision_ids(ent: &EntityData) -> impl Iterator<Item = EntityRevisionId> + '_ {
     ent.entity_revisions
-        .values()
-        .filter_map(|revs| revs.last().map(|rev| rev.revision_id))
+        .iter()
+        .filter(|(id, _)| ent.entities.contains_key(*id))
+        .filter_map(|(_, revs)| revs.last().map(|rev| rev.revision_id))
 }
 
 fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
