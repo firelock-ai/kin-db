@@ -5277,7 +5277,8 @@ impl InMemoryGraph {
                         }
                     }
                     RetrievalKey::Artifact(artifact_id) => {
-                        if let Some((artifact_key, text)) = artifact_embedding_doc(&ent, artifact_id)
+                        if let Some((artifact_key, text)) =
+                            artifact_embedding_doc(&ent, artifact_id)
                         {
                             keys.push(artifact_key);
                             texts.push(text);
