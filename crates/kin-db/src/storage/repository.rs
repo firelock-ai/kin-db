@@ -11212,4 +11212,408 @@ mod tests {
             "unexpected other-digest error: {other_digest}"
         );
     }
+
+    /// One authority store carrying a deep synthetic history and one clean
+    /// workspace based at its head, committed through the real transaction
+    /// surface so every materialization input (refs, workspace authority,
+    /// overlay derivation) is exactly what a product store carries.
+    ///
+    /// Entities deliberately have no file origin, so the fixture needs no
+    /// repository tree and no source bodies; the costs under measurement
+    /// (history replay, snapshot copying, admission passes) involve neither.
+    struct SyntheticHistoryStore {
+        manager: RepositoryAuthorityManager<MemoryBackend>,
+        workspace_id: WorkspaceId,
+        change_count: usize,
+        entity_count: usize,
+        relation_count: usize,
+        modified_entity: EntityId,
+        final_signature: String,
+        chain_source: EntityId,
+        chain_target: EntityId,
+    }
+
+    fn build_synthetic_history_store(
+        add_changes: usize,
+        adds_per_change: usize,
+        modify_changes: usize,
+        modifies_per_change: usize,
+    ) -> SyntheticHistoryStore {
+        assert!(add_changes >= 1 && adds_per_change >= 2 && modify_changes >= 1);
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let base_time = chrono::DateTime::parse_from_rfc3339("2026-07-28T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let new_change = |parents: Vec<SemanticChangeId>,
+                          sequence: usize,
+                          entity_deltas: Vec<EntityDelta>,
+                          relation_deltas: Vec<RelationDelta>,
+                          admission_policy_delta: Option<AdmissionPolicyDelta>| {
+            let mut change = SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::Native,
+                parents,
+                timestamp: Timestamp(base_time + chrono::Duration::seconds(sequence as i64)),
+                author: AuthorId::new("synthetic-history"),
+                message: format!("synthetic change {sequence}"),
+                entity_deltas,
+                relation_deltas,
+                tree_deltas: Vec::new(),
+                admission_policy_delta,
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).unwrap();
+            change
+        };
+
+        let mut current_entities: BTreeMap<EntityId, Entity> = BTreeMap::new();
+        let mut relations: Vec<Relation> = Vec::new();
+        let mut changes: Vec<SemanticChange> = Vec::new();
+
+        let mut seed = semantic_test_entity("src/seed.rs", "seed", LanguageId::Rust, 0x01);
+        seed.file_origin = None;
+        current_entities.insert(seed.id, seed.clone());
+        changes.push(new_change(
+            Vec::new(),
+            0,
+            vec![EntityDelta::Added { new: seed }],
+            Vec::new(),
+            Some(AdmissionPolicyDelta::initialize(shared.clone())),
+        ));
+
+        let mut chain_endpoints = None;
+        for c in 0..add_changes {
+            let mut entity_deltas = Vec::with_capacity(adds_per_change);
+            let mut relation_deltas = Vec::new();
+            let mut previous: Option<EntityId> = None;
+            for i in 0..adds_per_change {
+                let mut entity = semantic_test_entity(
+                    &format!("src/mod_{c}.rs"),
+                    &format!("fn_{c}_{i}"),
+                    LanguageId::Rust,
+                    (c % 251) as u8,
+                );
+                entity.file_origin = None;
+                if let Some(source) = previous {
+                    let relation = Relation {
+                        id: RelationId::from_content(
+                            &source.to_string(),
+                            &entity.id.to_string(),
+                            "calls",
+                        ),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(source),
+                        dst: GraphNodeId::Entity(entity.id),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Manual,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    };
+                    if chain_endpoints.is_none() {
+                        chain_endpoints = Some((source, entity.id));
+                    }
+                    relations.push(relation.clone());
+                    relation_deltas.push(RelationDelta::Added { new: relation });
+                }
+                previous = Some(entity.id);
+                current_entities.insert(entity.id, entity.clone());
+                entity_deltas.push(EntityDelta::Added { new: entity });
+            }
+            let parent = changes.last().expect("genesis exists").id;
+            changes.push(new_change(
+                vec![parent],
+                1 + c,
+                entity_deltas,
+                relation_deltas,
+                None,
+            ));
+        }
+        let (chain_source, chain_target) = chain_endpoints.expect("adds_per_change >= 2");
+
+        let mut modified_entity = None;
+        for m in 0..modify_changes {
+            let victims: Vec<EntityId> = current_entities
+                .keys()
+                .skip((m * modifies_per_change) % current_entities.len())
+                .take(modifies_per_change.max(1))
+                .copied()
+                .collect();
+            let mut entity_deltas = Vec::with_capacity(victims.len());
+            for id in victims {
+                let old = current_entities.get(&id).expect("victim exists").clone();
+                let mut new = old.clone();
+                new.signature = format!("{} /* rev {m} */", old.signature);
+                modified_entity = Some(id);
+                current_entities.insert(id, new.clone());
+                entity_deltas.push(EntityDelta::Modified { old, new });
+            }
+            let parent = changes.last().expect("chain exists").id;
+            changes.push(new_change(
+                vec![parent],
+                1 + add_changes + m,
+                entity_deltas,
+                Vec::new(),
+                None,
+            ));
+        }
+        let modified_entity = modified_entity.expect("modify_changes >= 1");
+        let final_signature = current_entities
+            .get(&modified_entity)
+            .expect("modified entity exists")
+            .signature
+            .clone();
+
+        let head = changes.last().expect("chain exists").id;
+        let base_target = RefTarget::change(head);
+        let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xf1_2322));
+        let frozen_overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let effective_policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: frozen_overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let mut initial = transaction_shell(&manager, 0xf1_2322);
+        let change_count = changes.len();
+        initial.changes = changes;
+        initial.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(base_target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        initial.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main.clone()),
+        });
+        initial.workspace_mutation = Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic { target: main },
+            new_base_target: Some(base_target),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas: Vec::new(),
+            new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new_with_external_references(
+                current_entities
+                    .values()
+                    .cloned()
+                    .map(|new| EntityDelta::Added { new })
+                    .collect(),
+                relations
+                    .iter()
+                    .cloned()
+                    .map(|new| RelationDelta::Added { new })
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap(),
+            new_shared_admission_policy: shared,
+            new_admission_policy: effective_policy,
+        });
+        initial.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(frozen_overlay));
+        manager.commit_repository_transaction(initial).unwrap();
+
+        SyntheticHistoryStore {
+            manager,
+            workspace_id,
+            change_count,
+            entity_count: current_entities.len(),
+            relation_count: relations.len(),
+            modified_entity,
+            final_signature,
+            chain_source,
+            chain_target,
+        }
+    }
+
+    /// The uncommitted relation the dirty-workspace variant stages.
+    fn synthetic_overlay_relation(store: &SyntheticHistoryStore) -> Relation {
+        Relation {
+            id: RelationId::from_content(
+                &store.chain_target.to_string(),
+                &store.chain_source.to_string(),
+                "overlay-calls",
+            ),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(store.chain_target),
+            dst: GraphNodeId::Entity(store.chain_source),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn stage_synthetic_overlay(store: &SyntheticHistoryStore) -> Relation {
+        let relation = synthetic_overlay_relation(store);
+        store
+            .manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &store.manager,
+                0xf1_2323,
+                WorkspaceSemanticDelta::new_with_external_references(
+                    Vec::new(),
+                    vec![RelationDelta::Added {
+                        new: relation.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        relation
+    }
+
+    /// Assert the materialized workspace snapshot is exactly the replayed
+    /// head state plus carried history, independent of how materialization is
+    /// implemented. These assertions pin the contract FIR-2322's restructure
+    /// must preserve.
+    fn assert_synthetic_materialization(
+        store: &SyntheticHistoryStore,
+        materialized: &GraphSnapshot,
+        staged: Option<&Relation>,
+    ) {
+        assert_eq!(materialized.entities.len(), store.entity_count);
+        assert_eq!(
+            materialized.relations.len(),
+            store.relation_count + usize::from(staged.is_some())
+        );
+        assert_eq!(materialized.changes.len(), store.change_count);
+        assert!(
+            materialized.repository_authority.is_none(),
+            "workspace query snapshots never carry the authority envelope"
+        );
+        assert_eq!(materialized.resolved_tree.len(), 0);
+        let modified = materialized
+            .entities
+            .get(&store.modified_entity)
+            .expect("modified entity present");
+        assert_eq!(modified.signature, store.final_signature);
+        let revisions = materialized
+            .entity_revisions
+            .get(&store.modified_entity)
+            .expect("modified entity carries a revision timeline");
+        assert!(
+            revisions.len() >= 2,
+            "a modified entity must retain more than one revision, found {}",
+            revisions.len()
+        );
+        let outgoing = materialized
+            .outgoing
+            .get(&store.chain_source)
+            .expect("chain source has outgoing adjacency");
+        let expected_relation = RelationId::from_content(
+            &store.chain_source.to_string(),
+            &store.chain_target.to_string(),
+            "calls",
+        );
+        assert!(outgoing.contains(&expected_relation));
+        assert!(
+            outgoing.windows(2).all(|pair| pair[0] <= pair[1]),
+            "persisted adjacency lists stay sorted"
+        );
+        match staged {
+            Some(relation) => {
+                assert_eq!(materialized.relations.get(&relation.id), Some(relation));
+            }
+            None => {
+                let staged_id = synthetic_overlay_relation(store).id;
+                assert!(
+                    !materialized.relations.contains_key(&staged_id),
+                    "a clean workspace must not carry the staged overlay relation"
+                );
+            }
+        }
+    }
+
+    fn materialize_synthetic(store: &SyntheticHistoryStore) -> GraphSnapshot {
+        store
+            .manager
+            .workspace_graph_snapshot(&repository_id(), &store.workspace_id)
+            .unwrap()
+            .expect("synthetic workspace materializes")
+    }
+
+    #[test]
+    fn synthetic_history_store_materializes_replayed_state_clean_and_dirty() {
+        let store = build_synthetic_history_store(3, 12, 2, 4);
+        assert!(
+            store.manager.read_authority().metadata().workspaces[0]
+                .semantic_overlay
+                .is_empty(),
+            "a workspace matching its committed base must not persist a compensating overlay"
+        );
+        let clean = materialize_synthetic(&store);
+        assert_synthetic_materialization(&store, &clean, None);
+
+        let staged = stage_synthetic_overlay(&store);
+        assert!(
+            !store.manager.read_authority().metadata().workspaces[0]
+                .semantic_overlay
+                .is_empty(),
+            "the staged relation must persist as a workspace overlay"
+        );
+        let dirty = materialize_synthetic(&store);
+        assert_synthetic_materialization(&store, &dirty, Some(&staged));
+        assert_eq!(clean.entities, dirty.entities);
+        assert_eq!(clean.entity_revisions, dirty.entity_revisions);
+    }
+
+    /// Local, non-citable cold-open materialization wall-clock probe for
+    /// FIR-2322. Run explicitly in release mode:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     workspace_materialization_cold_open_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn workspace_materialization_cold_open_bench() {
+        let build_started = std::time::Instant::now();
+        let store = build_synthetic_history_store(40, 500, 20, 100);
+        eprintln!(
+            "store: {} entities, {} relations, {} changes, built in {:.1}s",
+            store.entity_count,
+            store.relation_count,
+            store.change_count,
+            build_started.elapsed().as_secs_f64()
+        );
+
+        let mut time_rounds = |label: &str| {
+            let mut samples = Vec::new();
+            let mut latest = None;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                latest = Some(materialize_synthetic(&store));
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+            latest.expect("at least one round ran")
+        };
+
+        let clean = time_rounds("clean-workspace materialize");
+        assert_synthetic_materialization(&store, &clean, None);
+
+        let staged = stage_synthetic_overlay(&store);
+        let dirty = time_rounds("dirty-workspace materialize");
+        assert_synthetic_materialization(&store, &dirty, Some(&staged));
+    }
 }
