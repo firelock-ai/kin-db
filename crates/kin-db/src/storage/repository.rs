@@ -27,8 +27,7 @@ use kin_model::{
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
     RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
     RootBundle, SemanticChange, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy,
-    Timestamp,
-    TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
+    Timestamp, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
     WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
     REPOSITORY_ROOT_SCHEMA_VERSION,
 };
@@ -11378,31 +11377,32 @@ mod tests {
         let base_time = chrono::DateTime::parse_from_rfc3339("2026-07-28T16:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let new_change = |parents: Vec<SemanticChangeId>,
-                          sequence: usize,
-                          entity_deltas: Vec<EntityDelta>,
-                          relation_deltas: Vec<RelationDelta>,
-                          admission_policy_delta: Option<AdmissionPolicyDelta>| {
-            let mut change = SemanticChange {
-                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
-                origin: ChangeOrigin::Native,
-                parents,
-                timestamp: Timestamp(base_time + chrono::Duration::seconds(sequence as i64)),
-                author: AuthorId::new("synthetic-history"),
-                message: format!("synthetic change {sequence}"),
-                entity_deltas,
-                relation_deltas,
-                tree_deltas: Vec::new(),
-                admission_policy_delta,
-                external_reference_deltas: Vec::new(),
-                projected_files: Vec::new(),
-                spec_link: None,
-                evidence: Vec::new(),
-                risk_summary: None,
+        let new_change =
+            |parents: Vec<SemanticChangeId>,
+             sequence: usize,
+             entity_deltas: Vec<EntityDelta>,
+             relation_deltas: Vec<RelationDelta>,
+             admission_policy_delta: Option<AdmissionPolicyDelta>| {
+                let mut change = SemanticChange {
+                    id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                    origin: ChangeOrigin::Native,
+                    parents,
+                    timestamp: Timestamp(base_time + chrono::Duration::seconds(sequence as i64)),
+                    author: AuthorId::new("synthetic-history"),
+                    message: format!("synthetic change {sequence}"),
+                    entity_deltas,
+                    relation_deltas,
+                    tree_deltas: Vec::new(),
+                    admission_policy_delta,
+                    external_reference_deltas: Vec::new(),
+                    projected_files: Vec::new(),
+                    spec_link: None,
+                    evidence: Vec::new(),
+                    risk_summary: None,
+                };
+                change.id = compute_semantic_change_id(&change).unwrap();
+                change
             };
-            change.id = compute_semantic_change_id(&change).unwrap();
-            change
-        };
 
         let mut current_entities: BTreeMap<EntityId, Entity> = BTreeMap::new();
         let mut relations: Vec<Relation> = Vec::new();
