@@ -13298,6 +13298,7 @@ mod tests {
         let dirty_served = time_rounds("dirty prepared serve", true);
         assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
         assert_workspace_snapshots_identical(&dirty_served, &dirty_materialized);
+    }
 
     /// The overlay relation staged by round `round` of the successor bench.
     fn indexed_overlay_relation(store: &SyntheticHistoryStore, round: usize) -> Relation {
@@ -13363,7 +13364,7 @@ mod tests {
     fn one_workspace_mutation_resolves_each_distinct_base_exactly_once() {
         let store = build_synthetic_history_store(2, 8, 1, 3);
 
-        let unchanged_base = overlay_transaction_at_unchanged_base(&store, 0xf2_2347_01, 0);
+        let unchanged_base = overlay_transaction_at_unchanged_base(&store, 0xf2_2347_0001, 0);
         let (receipt, resolutions) = mutation_base_resolutions_during(|| {
             store
                 .manager
@@ -13464,7 +13465,7 @@ mod tests {
             new_admission_policy: current.admission_policy,
         };
 
-        let mut transaction = transaction_shell(&store.manager, 0xf2_2347_02);
+        let mut transaction = transaction_shell(&store.manager, 0xf2_2347_0002);
         transaction.changes.push(change);
         transaction.ref_mutations.push(RefMutation {
             name: RefName::branch(b"main").unwrap(),
