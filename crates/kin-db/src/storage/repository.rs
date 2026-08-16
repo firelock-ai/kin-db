@@ -12937,20 +12937,27 @@ mod tests {
             build_started.elapsed().as_secs_f64()
         );
 
-        let time_rounds = |label: &str, expect_serves: u64| {
+        // `serve` measures a reopen that finds a valid artifact. `materialize`
+        // clears the artifact before every round, because otherwise the first
+        // round rewrites it and every round after it measures a serve.
+        let time_rounds = |label: &str, serve: bool| {
             let mut samples = Vec::new();
             let mut latest = None;
             for _ in 0..5 {
+                if !serve {
+                    store.backend.prepared.lock().clear();
+                }
                 // One fresh open per round, because that is the shape the
                 // artifact exists for: a cold process asking once.
                 let manager = reopen_synthetic(&store);
                 let started = std::time::Instant::now();
                 latest = Some(materialize_through(&manager, &store.workspace_id));
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                let stats = manager.prepared_workspace_graph_stats();
                 assert_eq!(
-                    manager.prepared_workspace_graph_stats().serves,
-                    expect_serves,
-                    "{label} did not take the path it is measuring"
+                    (stats.serves, stats.writes),
+                    if serve { (1, 0) } else { (0, 1) },
+                    "{label} did not take the path it is measuring, got {stats:?}"
                 );
             }
             samples.sort_by(f64::total_cmp);
@@ -12963,25 +12970,52 @@ mod tests {
             latest.expect("at least one round ran")
         };
 
-        // The first open writes the artifact; every later one can serve it.
-        let miss = materialize_through(&reopen_synthetic(&store), &store.workspace_id);
-        assert_synthetic_materialization(&store, &miss, None);
-        let served = time_rounds("clean-workspace prepared serve", 1);
-        assert_synthetic_materialization(&store, &served, None);
-        assert_workspace_snapshots_identical(&served, &miss);
+        // The baseline this change has to be judged against: the same
+        // materialization through a backend that keeps no prepared state, so
+        // it pays neither a lookup nor a write.
+        let blind = Arc::new(PreparedBlindBackend(Arc::clone(&store.backend)));
+        let time_blind_rounds = |label: &str| {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let manager =
+                    RepositoryAuthorityManager::open(repository_id(), Arc::clone(&blind)).unwrap();
+                let started = std::time::Instant::now();
+                let materialized = manager
+                    .workspace_graph_snapshot(&repository_id(), &store.workspace_id)
+                    .unwrap()
+                    .expect("the synthetic workspace exists");
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(
+                    manager.prepared_workspace_graph_stats(),
+                    PreparedWorkspaceGraphStats::default(),
+                    "{label} must touch no prepared state at all"
+                );
+                std::hint::black_box(materialized);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+        };
+        time_blind_rounds("clean-workspace materialize, no prepared state");
 
-        store.backend.prepared.lock().clear();
-        let materialized = time_rounds("clean-workspace materialize", 0);
+        // The materialize rounds include the artifact write they end with,
+        // which is the honest cost of a miss under this change.
+        let materialized = time_rounds("clean-workspace materialize and record", false);
         assert_synthetic_materialization(&store, &materialized, None);
+        let served = time_rounds("clean-workspace prepared serve", true);
+        assert_synthetic_materialization(&store, &served, None);
+        assert_workspace_snapshots_identical(&served, &materialized);
 
         let staged = stage_synthetic_overlay(&store);
-        let dirty_miss = materialize_through(&reopen_synthetic(&store), &store.workspace_id);
-        assert_synthetic_materialization(&store, &dirty_miss, Some(&staged));
-        let dirty_served = time_rounds("dirty-workspace prepared serve", 1);
-        assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
-
-        store.backend.prepared.lock().clear();
-        let dirty_materialized = time_rounds("dirty-workspace materialize", 0);
+        time_blind_rounds("dirty-workspace materialize, no prepared state");
+        let dirty_materialized = time_rounds("dirty-workspace materialize and record", false);
         assert_synthetic_materialization(&store, &dirty_materialized, Some(&staged));
+        let dirty_served = time_rounds("dirty-workspace prepared serve", true);
+        assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
+        assert_workspace_snapshots_identical(&dirty_served, &dirty_materialized);
     }
 }
