@@ -905,18 +905,52 @@ impl RepositoryAuthorityState {
             return Ok(None);
         };
 
-        if let Some(prepared) = &self.prepared {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .filter(|_| prepared_workspace_state_pays_for_itself(workspace));
+        if let Some(prepared) = prepared {
             if let Some(snapshot) = prepared.serve(self.generation(), workspace) {
                 return Ok(Some(snapshot));
             }
         }
         let materialized =
             materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace)?;
-        if let Some(prepared) = &self.prepared {
+        if let Some(prepared) = prepared {
             prepared.record(self.generation(), workspace, &materialized);
         }
         Ok(Some(materialized))
     }
+}
+
+/// Whether a durable prepared artifact can pay for itself for this workspace.
+///
+/// Materialization has two very different costs, and only one of them is worth
+/// buying back at this layer. A workspace with no semantic overlay returns its
+/// resolved base directly: one replay, no graph build, no export. A workspace
+/// carrying an overlay cannot take that path at all, and pays a graph build, a
+/// delta application, a full snapshot export, and a validation pass on top of
+/// the same replay. Serving a prepared payload costs one decode of a
+/// history-bearing frame plus its admission validation, which sits between the
+/// two.
+///
+/// Measured on the synthetic 20k-entity, 61-change store in release (local,
+/// non-citable): clean materialize 212 ms against a 247 ms serve, so serving a
+/// clean workspace would be a 16% regression; dirty materialize 612 ms against
+/// a 279 ms serve, a 2.2x win. So the overlay is the gate. It is decided from
+/// persisted workspace metadata alone, with no resolution and no IO, and it is
+/// deliberately conservative in the safe direction: an empty overlay whose tree
+/// still diverges from its base does take the expensive path and is passed
+/// over here, which costs a win rather than causing a regression.
+///
+/// This is a cost rule, not a correctness rule. Nothing about whether an
+/// artifact may be TRUSTED lives here; that is the binding, and it is checked
+/// in full on every serve. Relax this when the payload can replace the
+/// authority decode as well (FIR-2333) or becomes a page-parkable mmap layout,
+/// because the clean-path arithmetic changes then, and re-measure before doing
+/// it.
+fn prepared_workspace_state_pays_for_itself(workspace: &WorkspaceState) -> bool {
+    !workspace.semantic_overlay.is_empty()
 }
 
 fn extend_authenticated_gitlinks<'a>(
@@ -12209,12 +12243,19 @@ mod tests {
     }
 
     fn stage_synthetic_overlay(store: &SyntheticHistoryStore) -> Relation {
-        let relation = synthetic_overlay_relation(store);
+        stage_overlay_relation(store, 0xf1_2323, synthetic_overlay_relation(store))
+    }
+
+    fn stage_overlay_relation(
+        store: &SyntheticHistoryStore,
+        operation: u128,
+        relation: Relation,
+    ) -> Relation {
         store
             .manager
             .commit_repository_transaction(semantic_workspace_transaction(
                 &store.manager,
-                0xf1_2323,
+                operation,
                 WorkspaceSemanticDelta::new_with_external_references(
                     Vec::new(),
                     vec![RelationDelta::Added {
@@ -12551,6 +12592,26 @@ mod tests {
         RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap()
     }
 
+    /// The synthetic store with a staged overlay, which is the workspace shape
+    /// a prepared artifact is admitted for: materializing it cannot take the
+    /// clean fast path, so it pays a graph build, a delta application, a full
+    /// export, and a validation pass on top of the replay.
+    fn build_overlaid_history_store(
+        add_changes: usize,
+        adds_per_change: usize,
+        modify_changes: usize,
+        modifies_per_change: usize,
+    ) -> (SyntheticHistoryStore, Relation) {
+        let store = build_synthetic_history_store(
+            add_changes,
+            adds_per_change,
+            modify_changes,
+            modifies_per_change,
+        );
+        let staged = stage_synthetic_overlay(&store);
+        (store, staged)
+    }
+
     fn stored_prepared_binding(store: &SyntheticHistoryStore) -> PreparedWorkspaceGraphBinding {
         serde_json::from_slice(&store.backend.prepared_artifact(&store.workspace_id).binding)
             .expect("a recorded binding decodes")
@@ -12568,7 +12629,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_is_written_on_a_miss_and_served_on_the_next_open() {
-        let store = build_synthetic_history_store(3, 12, 2, 4);
+        let (store, _staged) = build_overlaid_history_store(3, 12, 2, 4);
         let fresh = materialize_synthetic(&store);
 
         let first = reopen_synthetic(&store);
@@ -12607,7 +12668,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_every_mismatched_binding_field() {
-        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
         let fresh = materialize_synthetic(&store);
         materialize_through(&reopen_synthetic(&store), &store.workspace_id);
         let recorded = store.backend.prepared_artifact(&store.workspace_id);
@@ -12674,7 +12735,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_a_payload_its_binding_does_not_name() {
-        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
         let fresh = materialize_synthetic(&store);
         materialize_through(&reopen_synthetic(&store), &store.workspace_id);
 
@@ -12702,7 +12763,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_a_payload_whose_own_frame_is_corrupt() {
-        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
         let fresh = materialize_synthetic(&store);
         materialize_through(&reopen_synthetic(&store), &store.workspace_id);
 
@@ -12737,21 +12798,34 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_a_stale_artifact_after_a_workspace_mutation() {
-        let store = build_synthetic_history_store(2, 8, 1, 3);
-        let clean = materialize_synthetic(&store);
+        let (store, first) = build_overlaid_history_store(2, 8, 1, 3);
+        let before = materialize_synthetic(&store);
         let opened = reopen_synthetic(&store);
         materialize_through(&opened, &store.workspace_id);
         assert_eq!(opened.prepared_workspace_graph_stats().writes, 1);
         let stale_binding = stored_prepared_binding(&store);
 
-        // A staged overlay is committed through the real transaction surface,
-        // so the authority bytes move and the artifact stops applying.
-        let staged = stage_synthetic_overlay(&store);
-        let dirty = materialize_synthetic(&store);
-        assert_ne!(
-            clean.relations.contains_key(&staged.id),
-            dirty.relations.contains_key(&staged.id),
-            "the staged overlay must actually change what the workspace resolves"
+        // A second overlay relation committed through the real transaction
+        // surface, so the authority bytes move and the artifact stops applying.
+        let second = stage_overlay_relation(
+            &store,
+            0xf1_2334,
+            Relation {
+                id: RelationId::from_content(
+                    &store.modified_entity.to_string(),
+                    &store.chain_source.to_string(),
+                    "overlay-calls",
+                ),
+                src: GraphNodeId::Entity(store.modified_entity),
+                dst: GraphNodeId::Entity(store.chain_source),
+                ..first
+            },
+        );
+        let mutated = materialize_synthetic(&store);
+        assert!(
+            !before.relations.contains_key(&second.id)
+                && mutated.relations.contains_key(&second.id),
+            "the second overlay relation must actually change what the workspace resolves"
         );
 
         let after_mutation = reopen_synthetic(&store);
@@ -12777,7 +12851,7 @@ mod tests {
             "a workspace mutation must produce different authority bytes and a different digest"
         );
         assert_ne!(stale_binding.generation, fresh_binding.generation);
-        assert_workspace_snapshots_identical(&materialized, &dirty);
+        assert_workspace_snapshots_identical(&materialized, &mutated);
 
         let rewritten = reopen_synthetic(&store);
         let served = materialize_through(&rewritten, &store.workspace_id);
@@ -12786,12 +12860,12 @@ mod tests {
             1,
             "the rewrite after the mutation must serve the new state"
         );
-        assert_workspace_snapshots_identical(&served, &dirty);
+        assert_workspace_snapshots_identical(&served, &mutated);
     }
 
     #[test]
     fn a_backend_without_prepared_state_materializes_and_serves_nothing() {
-        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
         let fresh = materialize_synthetic(&store);
         let blind = Arc::new(PreparedBlindBackend(Arc::clone(&store.backend)));
 
@@ -12823,6 +12897,41 @@ mod tests {
     }
 
     #[test]
+    fn prepared_workspace_state_is_skipped_where_materializing_is_already_cheaper() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        assert!(
+            store.manager.read_authority().metadata().workspaces[0]
+                .semantic_overlay
+                .is_empty(),
+            "a workspace matching its committed base carries no overlay"
+        );
+        let fresh = materialize_synthetic(&store);
+
+        for round in 0..2 {
+            let manager = reopen_synthetic(&store);
+            let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_workspace_snapshots_identical(&materialized, &fresh);
+            assert_eq!(
+                manager.prepared_workspace_graph_stats(),
+                PreparedWorkspaceGraphStats::default(),
+                "round {round}: a workspace whose materialization takes the clean fast path must \
+                 neither look for an artifact nor pay to write one"
+            );
+        }
+        assert!(
+            store
+                .backend
+                .load_prepared_workspace_graph(
+                    repository_id().as_str(),
+                    &store.workspace_id.to_string(),
+                )
+                .unwrap()
+                .is_none(),
+            "no artifact may reach durable storage for a workspace that will never be served one"
+        );
+    }
+
+    #[test]
     fn prepared_workspace_state_survives_a_local_backend_reopen() {
         let directory = TempDir::new().unwrap();
         let backend = Arc::new(LocalFileBackend::new(directory.path()));
@@ -12830,6 +12939,23 @@ mod tests {
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
         let transaction = unborn_workspace_transaction(&manager, 0x2334, 0x2335, b"main");
         manager.commit_repository_transaction(transaction).unwrap();
+        // Prepared state is admitted only for a workspace carrying an overlay,
+        // so stage one through the real transaction surface.
+        let mut staged = semantic_test_entity("src/local.rs", "local", LanguageId::Rust, 0x77);
+        staged.file_origin = None;
+        manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &manager,
+                0x2337,
+                WorkspaceSemanticDelta::new(
+                    vec![EntityDelta::Added {
+                        new: staged.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
         let workspace_id = manager.read_authority().metadata().workspaces[0].workspace_id;
 
         let first =
@@ -12927,6 +13053,16 @@ mod tests {
     #[test]
     #[ignore = "wall-clock bench; run explicitly in release mode"]
     fn prepared_workspace_state_cold_open_bench() {
+        fn report(label: &str, mut samples: Vec<f64>) {
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+        }
+
         let build_started = std::time::Instant::now();
         let store = build_synthetic_history_store(40, 500, 20, 100);
         eprintln!(
@@ -12960,19 +13096,13 @@ mod tests {
                     "{label} did not take the path it is measuring, got {stats:?}"
                 );
             }
-            samples.sort_by(f64::total_cmp);
-            eprintln!(
-                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
-                samples[samples.len() / 2],
-                samples[0],
-                samples[samples.len() - 1]
-            );
+            report(label, samples);
             latest.expect("at least one round ran")
         };
 
-        // The baseline this change has to be judged against: the same
-        // materialization through a backend that keeps no prepared state, so
-        // it pays neither a lookup nor a write.
+        // The baseline every arm is judged against: the same materialization
+        // through a backend that keeps no prepared state, so it pays neither a
+        // lookup nor a write.
         let blind = Arc::new(PreparedBlindBackend(Arc::clone(&store.backend)));
         let time_blind_rounds = |label: &str| {
             let mut samples = Vec::new();
@@ -12992,29 +13122,69 @@ mod tests {
                 );
                 std::hint::black_box(materialized);
             }
-            samples.sort_by(f64::total_cmp);
-            eprintln!(
-                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
-                samples[samples.len() / 2],
-                samples[0],
-                samples[samples.len() - 1]
-            );
+            report(label, samples);
         };
-        time_blind_rounds("clean-workspace materialize, no prepared state");
 
-        // The materialize rounds include the artifact write they end with,
-        // which is the honest cost of a miss under this change.
-        let materialized = time_rounds("clean-workspace materialize and record", false);
-        assert_synthetic_materialization(&store, &materialized, None);
-        let served = time_rounds("clean-workspace prepared serve", true);
-        assert_synthetic_materialization(&store, &served, None);
-        assert_workspace_snapshots_identical(&served, &materialized);
+        // Clean workspace. `prepared_workspace_state_pays_for_itself` refuses
+        // to admit an artifact here, so the two arms below must come out the
+        // same: enabling prepared state costs a clean workspace nothing.
+        time_blind_rounds("clean materialize, backend without prepared state");
+        let mut clean = None;
+        {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let manager = reopen_synthetic(&store);
+                let started = std::time::Instant::now();
+                let materialized = materialize_through(&manager, &store.workspace_id);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(
+                    manager.prepared_workspace_graph_stats(),
+                    PreparedWorkspaceGraphStats::default(),
+                    "a clean workspace must be passed over by the cost rule"
+                );
+                clean = Some(materialized);
+            }
+            report("clean materialize, prepared state available", samples);
+        }
+        let clean = clean.expect("at least one round ran");
+        assert_synthetic_materialization(&store, &clean, None);
 
+        // The number the cost rule rests on, and the reason it exists. This is
+        // NOT a shipped path: the gate is bypassed here so a later reader can
+        // re-measure whether serving a clean workspace is still a loss.
+        {
+            let manager = reopen_synthetic(&store);
+            let lease = manager.read_authority();
+            let generation = lease.generation();
+            let workspace = lease.metadata().workspaces[0].clone();
+            drop(lease);
+            let cache = manager
+                .prepared
+                .as_ref()
+                .expect("a reopen with persisted authority binds prepared state");
+            cache.record(generation, &workspace, &clean);
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                let served = cache
+                    .serve(generation, &workspace)
+                    .expect("the artifact just recorded must serve");
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(served);
+            }
+            report(
+                "clean prepared serve (gate bypassed, NOT a shipped path)",
+                samples,
+            );
+            store.backend.prepared.lock().clear();
+        }
+
+        // Dirty workspace, where materialization cannot take its fast path.
         let staged = stage_synthetic_overlay(&store);
-        time_blind_rounds("dirty-workspace materialize, no prepared state");
-        let dirty_materialized = time_rounds("dirty-workspace materialize and record", false);
+        time_blind_rounds("dirty materialize, backend without prepared state");
+        let dirty_materialized = time_rounds("dirty materialize and record", false);
         assert_synthetic_materialization(&store, &dirty_materialized, Some(&staged));
-        let dirty_served = time_rounds("dirty-workspace prepared serve", true);
+        let dirty_served = time_rounds("dirty prepared serve", true);
         assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
         assert_workspace_snapshots_identical(&dirty_served, &dirty_materialized);
     }
