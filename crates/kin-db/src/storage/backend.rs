@@ -7447,6 +7447,22 @@ impl StorageBackend for LocalFileBackend {
         Ok(Some(data))
     }
 
+    /// Prepared state is deliberately read and written WITHOUT the repository
+    /// lock every other surface here takes.
+    ///
+    /// Two reasons, and both have to hold. It is not authority: nothing about
+    /// a repository's truth depends on this pair existing, being current, or
+    /// being readable, and its consumer refuses it outright on any doubt. And
+    /// it is self-validating: each half lands by rename, so a reader sees one
+    /// whole file or the other, and a pair torn across the two renames is
+    /// caught by the payload digest the binding names.
+    ///
+    /// Taking the lock would be worse than useless. Materializing a workspace
+    /// query snapshot holds no backend lock today, so acquiring one here would
+    /// serialize a read path that never blocked, and would deadlock outright
+    /// against a caller that materializes while holding a local authority
+    /// freeze, since `flock` blocks a second acquisition from the same
+    /// process.
     fn load_prepared_workspace_graph(
         &self,
         repo_id: &str,
@@ -7454,27 +7470,19 @@ impl StorageBackend for LocalFileBackend {
     ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
         let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
         let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
-        if self.existing_repository_path(repo_id)?.is_none() {
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
             return Ok(None);
-        }
-        let lock = self.acquire_existing_lock(repo_id)?;
-        let Some(prepared) = lock
-            .namespace
-            .surface(Self::prepared_surface_name(), false)?
-        else {
-            self.confirm_repository_visible(&lock.namespace)?;
+        };
+        let Some(prepared) = namespace.surface(Self::prepared_surface_name(), false)? else {
             return Ok(None);
         };
         // Either half alone is an interrupted write, not an artifact.
         if !prepared.exists(&binding_leaf)? || !prepared.exists(&payload_leaf)? {
-            lock.namespace.confirm_surface_visible(&prepared)?;
-            self.confirm_repository_visible(&lock.namespace)?;
             return Ok(None);
         }
         let binding = prepared.read_regular(&binding_leaf, "local prepared workspace binding")?;
         let payload = prepared.read_regular(&payload_leaf, "local prepared workspace graph")?;
-        lock.namespace.confirm_surface_visible(&prepared)?;
-        self.confirm_repository_visible(&lock.namespace)?;
+        namespace.confirm_surface_visible(&prepared)?;
         Ok(Some(PreparedWorkspaceGraphArtifact { binding, payload }))
     }
 
@@ -7486,9 +7494,12 @@ impl StorageBackend for LocalFileBackend {
     ) -> Result<bool, KinDbError> {
         let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
         let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
-        let lock = self.acquire_existing_lock(repo_id)?;
-        let prepared = lock
-            .namespace
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no local namespace to record prepared workspace state in"
+            )));
+        };
+        let prepared = namespace
             .surface(Self::prepared_surface_name(), true)?
             .ok_or_else(|| {
                 KinDbError::StorageError(format!(
@@ -7503,8 +7514,7 @@ impl StorageBackend for LocalFileBackend {
         // refusal costs one materialization, a wrong serve costs correctness.
         prepared.atomic_write(&payload_leaf, &artifact.payload)?;
         prepared.atomic_write(&binding_leaf, &artifact.binding)?;
-        lock.namespace.confirm_surface_visible(&prepared)?;
-        self.confirm_repository_visible(&lock.namespace)?;
+        namespace.confirm_surface_visible(&prepared)?;
         Ok(true)
     }
 
@@ -10720,6 +10730,38 @@ mod tests {
                 removed.display()
             );
         }
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_does_not_wait_on_the_repository_lock() {
+        let dir = TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(LocalFileBackend::new(dir.path()));
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000cc";
+        // Materializing a workspace query snapshot holds no backend lock, so
+        // neither may reading or writing the prepared state beside it. Held
+        // here from the same process on purpose: `flock` blocks a second
+        // acquisition from one process exactly as it does across two, which is
+        // what would deadlock a caller materializing under a local authority
+        // freeze.
+        let held = backend.acquire_existing_lock("test-repo").unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || {
+            let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+            let recorded =
+                worker.record_prepared_workspace_graph("test-repo", workspace, &artifact);
+            let loaded = worker.load_prepared_workspace_graph("test-repo", workspace);
+            let _ = sender.send((recorded, loaded));
+        });
+        let (recorded, loaded) = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("prepared state must not wait on the repository lock");
+        drop(held);
+
+        assert!(recorded.unwrap());
+        assert!(loaded.unwrap().is_some());
     }
 
     #[test]
