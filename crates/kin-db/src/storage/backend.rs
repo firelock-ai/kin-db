@@ -2158,6 +2158,43 @@ pub trait StorageBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Load the durable prepared query-graph artifact for one workspace.
+    ///
+    /// Storage never interprets the binding record and never decides whether
+    /// the payload still describes the state being opened: it returns the pair
+    /// exactly as it was written and the repository validator refuses or
+    /// accepts it. A backend must return `Ok(None)` when either half is
+    /// missing, because the pair is the artifact and half of it answers
+    /// nothing.
+    ///
+    /// `Ok(None)` is also the answer for every backend with nowhere to keep
+    /// prepared state, which is why this defaults to it.
+    fn load_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+        let _ = (repo_id, workspace_id);
+        Ok(None)
+    }
+
+    /// Record the prepared query-graph artifact for one workspace, replacing
+    /// whatever that workspace already had.
+    ///
+    /// `Ok(false)` means the backend has no durable place for prepared state.
+    /// A caller treats both that and an error as "materialize again next
+    /// time": prepared state is an accelerator bound to authority truth, never
+    /// a source of it.
+    fn record_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError> {
+        let _ = (repo_id, workspace_id, artifact);
+        Ok(false)
+    }
+
     /// Read snapshot authority and its journal from one coherent backend view.
     /// Transactional/lock-backed implementations override this so authority
     /// cannot move between the snapshot and journal reads.
@@ -2484,6 +2521,8 @@ impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSour
 /// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
 /// {base_path}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
+/// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg — prepared query graph
+/// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg.json — its binding
 /// ```
 ///
 /// Snapshot and delta files are staged and fsynced before `authority.json` is
@@ -3353,6 +3392,20 @@ pub struct HistoryValidationProof {
     pub repository_id: String,
     pub generation: Generation,
     pub snapshot_sha256: String,
+}
+
+/// One durable prepared query-graph artifact for a workspace.
+///
+/// `payload` is the KNDB frame of a materialized workspace snapshot and
+/// `binding` is the record that says which authority state that frame stands
+/// for. They are one artifact: a payload with no binding beside it vouches for
+/// nothing, and a binding with no payload names bytes that are not there.
+/// Storage keeps them together and hands both back untouched, leaving every
+/// judgement about whether they still apply to the repository validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorkspaceGraphArtifact {
+    pub binding: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4767,6 +4820,41 @@ impl LocalFileBackend {
 
     fn overlays_surface_name() -> &'static str {
         "overlays"
+    }
+
+    fn prepared_surface_name() -> &'static str {
+        "prepared"
+    }
+
+    #[cfg(test)]
+    fn prepared_dir(&self, repo_id: &str) -> PathBuf {
+        self.base_path.join(repo_id).join("prepared")
+    }
+
+    fn prepared_leaf(workspace_id: &str, extension: &str) -> Result<PathBuf, KinDbError> {
+        validate_local_storage_component(workspace_id, "prepared workspace id")?;
+        if workspace_id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(KinDbError::StorageError(
+                "prepared workspace id must use canonical lowercase ASCII".to_string(),
+            ));
+        }
+        let leaf = format!("{workspace_id}{extension}");
+        validate_local_storage_component(&leaf, "prepared workspace id")?;
+        if leaf.len() > mmap::MAX_ATOMIC_DESTINATION_LEAF_BYTES {
+            return Err(KinDbError::StorageError(
+                "prepared workspace id exceeds the portable atomic recovery-staging filename budget"
+                    .to_string(),
+            ));
+        }
+        Ok(PathBuf::from(leaf))
+    }
+
+    fn prepared_payload_leaf(workspace_id: &str) -> Result<PathBuf, KinDbError> {
+        Self::prepared_leaf(workspace_id, ".kpqg")
+    }
+
+    fn prepared_binding_leaf(workspace_id: &str) -> Result<PathBuf, KinDbError> {
+        Self::prepared_leaf(workspace_id, ".kpqg.json")
     }
 
     fn overlay_leaf(session_id: &str) -> Result<PathBuf, KinDbError> {
@@ -7357,6 +7445,67 @@ impl StorageBackend for LocalFileBackend {
         lock.namespace.confirm_surface_visible(&overlays)?;
         self.confirm_repository_visible(&lock.namespace)?;
         Ok(Some(data))
+    }
+
+    fn load_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+        let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(None);
+        }
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let Some(prepared) = lock
+            .namespace
+            .surface(Self::prepared_surface_name(), false)?
+        else {
+            self.confirm_repository_visible(&lock.namespace)?;
+            return Ok(None);
+        };
+        // Either half alone is an interrupted write, not an artifact.
+        if !prepared.exists(&binding_leaf)? || !prepared.exists(&payload_leaf)? {
+            lock.namespace.confirm_surface_visible(&prepared)?;
+            self.confirm_repository_visible(&lock.namespace)?;
+            return Ok(None);
+        }
+        let binding = prepared.read_regular(&binding_leaf, "local prepared workspace binding")?;
+        let payload = prepared.read_regular(&payload_leaf, "local prepared workspace graph")?;
+        lock.namespace.confirm_surface_visible(&prepared)?;
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok(Some(PreparedWorkspaceGraphArtifact { binding, payload }))
+    }
+
+    fn record_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError> {
+        let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let prepared = lock
+            .namespace
+            .surface(Self::prepared_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "prepared surface disappeared while writing repo {repo_id}"
+                ))
+            })?;
+        // Payload first, binding last. A crash between the two leaves a
+        // payload nobody will read, while the reverse would leave a record
+        // naming bytes that are not there. A reader that catches the window
+        // during a rewrite sees the new payload under the old binding and
+        // refuses on the payload digest, which is the correct outcome: a
+        // refusal costs one materialization, a wrong serve costs correctness.
+        prepared.atomic_write(&payload_leaf, &artifact.payload)?;
+        prepared.atomic_write(&binding_leaf, &artifact.binding)?;
+        lock.namespace.confirm_surface_visible(&prepared)?;
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok(true)
     }
 
     fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {

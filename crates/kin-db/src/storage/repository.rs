@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -45,8 +46,9 @@ use crate::storage::authority::{
 use crate::storage::backend::{
     load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
     AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
-    RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest,
-    SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
+    PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome,
+    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
+    MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
@@ -115,6 +117,380 @@ const _: () = assert!(
     HISTORY_VALIDATION_COVERAGE_REVISION < HISTORY_VALIDATION_SCHEMA_STRIDE,
     "the coverage revision must stay inside its slot so it cannot alias a schema bump"
 );
+
+/// Envelope revision of a durable prepared workspace query-graph artifact.
+///
+/// This names what the payload and its binding record mean, so bumping it
+/// refuses every artifact written before the bump. Move it whenever the
+/// binding gains or loses a field, whenever what materialization returns for
+/// the same inputs changes, or whenever an artifact written by an earlier
+/// build could otherwise be served as if this build had produced it. The cost
+/// of a bump is one materialization per workspace per store, which is exactly
+/// the cost of not having the artifact at all.
+pub const PREPARED_WORKSPACE_GRAPH_VERSION: u32 = 1;
+
+/// Binding record stored beside one prepared workspace query-graph payload.
+///
+/// Every field is a question the reader must answer the same way the writer
+/// did, and the two that carry the weight are `authority_snapshot_sha256` and
+/// `payload_sha256`. The first binds the artifact to the exact authority bytes
+/// it was derived from: workspace trees and semantic overlays live inside the
+/// authority snapshot, so any commit, ref move, overlay edit, or tree change
+/// moves those bytes, moves their digest, and refuses the artifact. The second
+/// binds the record to the exact payload beside it, so a payload swapped for
+/// another perfectly valid frame is refused too.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PreparedWorkspaceGraphBinding {
+    prepared_version: u32,
+    history_validation_version: u32,
+    snapshot_version: u32,
+    repository_id: String,
+    workspace_id: String,
+    generation: Generation,
+    authority_snapshot_sha256: String,
+    payload_sha256: String,
+}
+
+/// What one repository's prepared query-graph state did since it was opened.
+///
+/// Surfaced so an operator can tell a prepared serve from a materialization
+/// directly rather than inferring it from how long an open took, and so a
+/// refusal names the binding field that failed instead of disappearing into a
+/// silently slower path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparedWorkspaceGraphStats {
+    /// Workspace snapshots answered from a validated durable artifact.
+    pub serves: u64,
+    /// Artifacts written after a materialization.
+    pub writes: u64,
+    /// Artifacts refused, each of which fell back to materialization.
+    pub refusals: u64,
+    /// Binding field that failed on the most recent refusal.
+    pub last_refusal: Option<String>,
+}
+
+/// Durable prepared-state surface for one repository, captured at open.
+///
+/// This exists so the published authority state can reach durable prepared
+/// bytes without carrying the backend's type parameter through every reader.
+trait PreparedWorkspaceGraphStore: Send + Sync {
+    fn load(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError>;
+
+    fn record(
+        &self,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError>;
+}
+
+struct BackendPreparedWorkspaceGraphStore<B: StorageBackend + ?Sized + 'static> {
+    backend: Arc<B>,
+    repository_id: RepositoryId,
+}
+
+impl<B: StorageBackend + ?Sized + 'static> PreparedWorkspaceGraphStore
+    for BackendPreparedWorkspaceGraphStore<B>
+{
+    fn load(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+        self.backend
+            .load_prepared_workspace_graph(self.repository_id.as_str(), workspace_id)
+    }
+
+    fn record(
+        &self,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError> {
+        self.backend.record_prepared_workspace_graph(
+            self.repository_id.as_str(),
+            workspace_id,
+            artifact,
+        )
+    }
+}
+
+/// Prepared workspace query-graph state bound to the exact authority bytes one
+/// open loaded.
+///
+/// A serve is allowed only while the reading lease still names the generation
+/// this binding was captured at, and only when every binding field agrees with
+/// what this process is holding. Anything else is a refusal reported by the
+/// name of the field that failed, and a refusal falls back to the real
+/// graph-native materialization and rewrites the artifact. There is no
+/// heuristic repair and no filesystem answer anywhere on this path: the
+/// artifact is graph-derived state cryptographically bound to graph authority,
+/// and on any doubt the answer comes from graph truth instead.
+struct PreparedWorkspaceGraphCache {
+    store: Arc<dyn PreparedWorkspaceGraphStore>,
+    repository_id: RepositoryId,
+    generation: Generation,
+    authority_snapshot_sha256: String,
+    serves: AtomicU64,
+    writes: AtomicU64,
+    refusals: AtomicU64,
+    last_refusal: Mutex<Option<String>>,
+}
+
+impl std::fmt::Debug for PreparedWorkspaceGraphCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedWorkspaceGraphCache")
+            .field("repository_id", &self.repository_id)
+            .field("generation", &self.generation)
+            .field("authority_snapshot_sha256", &self.authority_snapshot_sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedWorkspaceGraphCache {
+    fn new(
+        store: Arc<dyn PreparedWorkspaceGraphStore>,
+        repository_id: RepositoryId,
+        generation: Generation,
+        authority_snapshot_sha256: String,
+    ) -> Self {
+        Self {
+            store,
+            repository_id,
+            generation,
+            authority_snapshot_sha256,
+            serves: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            refusals: AtomicU64::new(0),
+            last_refusal: Mutex::new(None),
+        }
+    }
+
+    fn stats(&self) -> PreparedWorkspaceGraphStats {
+        PreparedWorkspaceGraphStats {
+            serves: self.serves.load(AtomicOrdering::SeqCst),
+            writes: self.writes.load(AtomicOrdering::SeqCst),
+            refusals: self.refusals.load(AtomicOrdering::SeqCst),
+            last_refusal: self.last_refusal.lock().clone(),
+        }
+    }
+
+    /// Report one refusal by the name of the binding field that failed.
+    fn refuse(&self, workspace_id: &WorkspaceId, field: &str, detail: &str) {
+        self.refusals.fetch_add(1, AtomicOrdering::SeqCst);
+        *self.last_refusal.lock() = Some(field.to_string());
+        tracing::warn!(
+            repository = %self.repository_id,
+            workspace = %workspace_id,
+            field,
+            detail,
+            "refused prepared workspace query state; materializing from graph authority instead"
+        );
+    }
+
+    fn expected_binding(
+        &self,
+        workspace_id: &WorkspaceId,
+        payload_sha256: String,
+    ) -> PreparedWorkspaceGraphBinding {
+        PreparedWorkspaceGraphBinding {
+            prepared_version: PREPARED_WORKSPACE_GRAPH_VERSION,
+            history_validation_version: HISTORY_VALIDATION_VERSION,
+            snapshot_version: GraphSnapshot::CURRENT_VERSION,
+            repository_id: self.repository_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            generation: self.generation,
+            authority_snapshot_sha256: self.authority_snapshot_sha256.clone(),
+            payload_sha256,
+        }
+    }
+
+    /// Answer one workspace snapshot from durable prepared bytes, or refuse.
+    ///
+    /// `None` is never an error the caller has to handle: it means the caller
+    /// materializes, which is what it would have done anyway.
+    fn serve(&self, generation: Generation, workspace: &WorkspaceState) -> Option<GraphSnapshot> {
+        let workspace_id = &workspace.workspace_id;
+        if generation != self.generation {
+            self.refuse(
+                workspace_id,
+                "generation",
+                &format!(
+                    "lease names generation {generation}, prepared state was bound at {}",
+                    self.generation
+                ),
+            );
+            return None;
+        }
+        let artifact = match self.store.load(&workspace_id.to_string()) {
+            Ok(Some(artifact)) => artifact,
+            // No artifact yet is an ordinary first open, not a refusal.
+            Ok(None) => return None,
+            Err(error) => {
+                self.refuse(workspace_id, "artifact", &error.to_string());
+                return None;
+            }
+        };
+        let binding: PreparedWorkspaceGraphBinding =
+            match serde_json::from_slice(&artifact.binding) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    self.refuse(workspace_id, "binding", &error.to_string());
+                    return None;
+                }
+            };
+        let expected =
+            self.expected_binding(workspace_id, hex::encode(Sha256::digest(&artifact.payload)));
+        // Named one at a time so a refusal is a diagnosis rather than a shrug.
+        for (field, held, found) in [
+            (
+                "prepared_version",
+                expected.prepared_version.to_string(),
+                binding.prepared_version.to_string(),
+            ),
+            (
+                "history_validation_version",
+                expected.history_validation_version.to_string(),
+                binding.history_validation_version.to_string(),
+            ),
+            (
+                "snapshot_version",
+                expected.snapshot_version.to_string(),
+                binding.snapshot_version.to_string(),
+            ),
+            (
+                "repository_id",
+                expected.repository_id.clone(),
+                binding.repository_id.clone(),
+            ),
+            (
+                "workspace_id",
+                expected.workspace_id.clone(),
+                binding.workspace_id.clone(),
+            ),
+            (
+                "generation",
+                expected.generation.to_string(),
+                binding.generation.to_string(),
+            ),
+            (
+                "authority_snapshot_sha256",
+                expected.authority_snapshot_sha256.clone(),
+                binding.authority_snapshot_sha256.clone(),
+            ),
+            (
+                "payload_sha256",
+                expected.payload_sha256.clone(),
+                binding.payload_sha256.clone(),
+            ),
+        ] {
+            if held != found {
+                self.refuse(
+                    workspace_id,
+                    field,
+                    &format!("holding {held}, artifact names {found}"),
+                );
+                return None;
+            }
+        }
+        // The frame carries its own checksum over its own body, so this
+        // refuses bytes the binding record vouches for but the encoder never
+        // produced, and it revalidates storage admission over the payload.
+        let snapshot = match GraphSnapshot::from_bytes(&artifact.payload) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.refuse(workspace_id, "payload_frame", &error.to_string());
+                return None;
+            }
+        };
+        if snapshot.repository_authority.is_some() {
+            self.refuse(
+                workspace_id,
+                "repository_authority",
+                "prepared query state must not carry a second authority envelope",
+            );
+            return None;
+        }
+        // The invariant materialization asserts about its own output. A
+        // prepared serve has to clear the same bar or it is not the same
+        // answer.
+        if snapshot.resolved_tree != workspace.tree {
+            self.refuse(
+                workspace_id,
+                "resolved_tree",
+                "prepared state does not resolve the workspace's exact persisted tree",
+            );
+            return None;
+        }
+        self.serves.fetch_add(1, AtomicOrdering::SeqCst);
+        tracing::debug!(
+            repository = %self.repository_id,
+            workspace = %workspace_id,
+            generation,
+            "served workspace query state from validated durable bytes"
+        );
+        Some(snapshot)
+    }
+
+    /// Record what materialization just produced, best effort.
+    ///
+    /// A store that cannot record this is correct and slow, never wrong, so
+    /// nothing here can fail a materialization that already succeeded.
+    fn record(&self, generation: Generation, workspace: &WorkspaceState, snapshot: &GraphSnapshot) {
+        let workspace_id = &workspace.workspace_id;
+        if generation != self.generation {
+            return;
+        }
+        // Materialization validated exactly this object on the way out, on
+        // both its clean and its dirty path, so serialization does not walk it
+        // again to reach the same verdict.
+        let payload = match snapshot.to_bytes_pre_validated() {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::debug!(
+                    repository = %self.repository_id,
+                    workspace = %workspace_id,
+                    error = %error,
+                    "could not encode prepared workspace query state; the next open materializes again"
+                );
+                return;
+            }
+        };
+        let binding = self.expected_binding(workspace_id, hex::encode(Sha256::digest(&payload)));
+        let binding = match serde_json::to_vec(&binding) {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::debug!(
+                    repository = %self.repository_id,
+                    workspace = %workspace_id,
+                    error = %error,
+                    "could not encode a prepared workspace binding; the next open materializes again"
+                );
+                return;
+            }
+        };
+        let artifact = PreparedWorkspaceGraphArtifact { binding, payload };
+        match self.store.record(&workspace_id.to_string(), &artifact) {
+            Ok(true) => {
+                self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+                tracing::debug!(
+                    repository = %self.repository_id,
+                    workspace = %workspace_id,
+                    generation,
+                    "recorded prepared workspace query state for the opened authority"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                repository = %self.repository_id,
+                workspace = %workspace_id,
+                error = %error,
+                "could not record prepared workspace query state; the next open materializes again"
+            ),
+        }
+    }
+}
 
 /// Shared admission policy resolved at one exact semantic change.
 ///
@@ -405,6 +781,9 @@ pub struct RepositoryAuthorityState {
     /// Derived acceleration over immutable, externally authenticated Git
     /// history. This is never serialized or accepted from a transaction.
     authenticated_gitlinks: Arc<BTreeSet<(ArtifactId, GitObjectId)>>,
+    /// Durable prepared query-graph state bound to the exact authority bytes
+    /// this process opened. Present only on the state that open published.
+    prepared: Option<Arc<PreparedWorkspaceGraphCache>>,
 }
 
 impl RepositoryAuthorityState {
@@ -416,7 +795,14 @@ impl RepositoryAuthorityState {
         Self {
             snapshot,
             authenticated_gitlinks: Arc::new(authenticated_gitlinks),
+            prepared: None,
         }
+    }
+
+    /// Attach the prepared query-graph state open bound to these exact bytes.
+    fn with_prepared_workspace_graphs(mut self, prepared: Arc<PreparedWorkspaceGraphCache>) -> Self {
+        self.prepared = Some(prepared);
+        self
     }
 
     /// Carry the immutable authority index forward and add only Git-origin
@@ -435,6 +821,11 @@ impl RepositoryAuthorityState {
         Self {
             snapshot,
             authenticated_gitlinks,
+            // A commit rewrote the authority bytes, so the digest the open
+            // bound its prepared state to no longer describes this
+            // repository. The successor carries no binding at all rather than
+            // one that could only ever refuse.
+            prepared: None,
         }
     }
 
@@ -492,6 +883,12 @@ impl RepositoryAuthorityState {
     /// Unsupported languages, configuration, binary artifacts, symlinks, and
     /// gitlinks are preserved through `WorkspaceState::tree`; no filesystem or
     /// Git fallback participates in materialization.
+    ///
+    /// A reopen of unchanged state may answer from durable prepared bytes
+    /// instead, but only after every field of that artifact's binding record
+    /// agrees with the authority this lease holds. A refusal is reported by
+    /// the name of the field that failed and materializes from graph truth,
+    /// which then rewrites the artifact.
     pub fn workspace_graph_snapshot(
         &self,
         workspace_id: &WorkspaceId,
@@ -505,7 +902,17 @@ impl RepositoryAuthorityState {
             return Ok(None);
         };
 
-        materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace).map(Some)
+        if let Some(prepared) = &self.prepared {
+            if let Some(snapshot) = prepared.serve(self.generation(), workspace) {
+                return Ok(Some(snapshot));
+            }
+        }
+        let materialized =
+            materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace)?;
+        if let Some(prepared) = &self.prepared {
+            prepared.record(self.generation(), workspace, &materialized);
+        }
+        Ok(Some(materialized))
     }
 }
 
@@ -742,6 +1149,10 @@ pub struct RepositoryAuthorityManager<B: StorageBackend + ?Sized + 'static> {
     /// Whether the open that produced this manager trusted a durable history
     /// validation rather than replaying the whole history.
     opened_by_history_validation: bool,
+    /// Prepared query-graph state bound to the exact authority bytes this open
+    /// loaded. Retained here so its counters outlive the published state a
+    /// later commit replaces.
+    prepared: Option<Arc<PreparedWorkspaceGraphCache>>,
 }
 
 /// Exclusive, cross-process lease over one fully revalidated local repository
@@ -994,7 +1405,24 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             "repository authority open"
         );
 
-        let initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
+        let mut initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
+        // Prepared state binds to the digest of the bytes this open actually
+        // loaded, so a repository with no persisted authority yet has nothing
+        // to bind to and gets no cache at all.
+        let prepared = loaded_digest.as_ref().map(|digest| {
+            Arc::new(PreparedWorkspaceGraphCache::new(
+                Arc::new(BackendPreparedWorkspaceGraphStore {
+                    backend: Arc::clone(&backend),
+                    repository_id: repository_id.clone(),
+                }),
+                repository_id.clone(),
+                initial.generation(),
+                digest.clone(),
+            ))
+        });
+        if let Some(prepared) = &prepared {
+            initial = initial.with_prepared_workspace_graphs(Arc::clone(prepared));
+        }
         let persistence = RepositorySnapshotPersistence {
             backend: Arc::clone(&backend),
             repository_id: repository_id.clone(),
@@ -1005,6 +1433,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             backend,
             publication: AuthorityPublication::new(initial, persistence),
             opened_by_history_validation: reopen_proof.is_some(),
+            prepared,
         };
         if let Some(generation) = reopen_proof {
             tracing::debug!(
@@ -1025,6 +1454,19 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// directly, rather than inferring it from how long an open took.
     pub const fn opened_by_history_validation(&self) -> bool {
         self.opened_by_history_validation
+    }
+
+    /// What prepared workspace query-graph state did since this open.
+    ///
+    /// A repository whose backend keeps no prepared state reports zeros, which
+    /// is also what a repository that has only ever materialized reports. The
+    /// two are distinguished by `writes`: a backend with nowhere to record
+    /// never accumulates any.
+    pub fn prepared_workspace_graph_stats(&self) -> PreparedWorkspaceGraphStats {
+        self.prepared
+            .as_ref()
+            .map(|prepared| prepared.stats())
+            .unwrap_or_default()
     }
 
     /// Record that the state just validated in full is durably validated, so
