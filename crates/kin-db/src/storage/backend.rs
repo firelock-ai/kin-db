@@ -10648,6 +10648,104 @@ mod tests {
         assert_eq!(loaded, overlay_data);
     }
 
+    fn prepared_fixture(binding: &[u8], payload: &[u8]) -> PreparedWorkspaceGraphArtifact {
+        PreparedWorkspaceGraphArtifact {
+            binding: binding.to_vec(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+
+        assert!(backend
+            .load_prepared_workspace_graph("test-repo", workspace)
+            .unwrap()
+            .is_none());
+
+        let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+        assert!(backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap());
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(artifact),
+            "the pair must come back exactly as it was written"
+        );
+        let prepared = backend.prepared_dir("test-repo");
+        assert!(prepared.join(format!("{workspace}.kpqg")).exists());
+        assert!(prepared.join(format!("{workspace}.kpqg.json")).exists());
+
+        let replacement = prepared_fixture(br#"{"prepared_version":2}"#, b"KNDB later payload");
+        assert!(backend
+            .record_prepared_workspace_graph("test-repo", workspace, &replacement)
+            .unwrap());
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(replacement),
+            "recording again must replace both halves, not append a second artifact"
+        );
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_needs_both_halves() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000aa";
+        let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+
+        for orphaned in ["{workspace}.kpqg.json", "{workspace}.kpqg"] {
+            backend
+                .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+                .unwrap();
+            let removed = backend
+                .prepared_dir("test-repo")
+                .join(orphaned.replace("{workspace}", workspace));
+            std::fs::remove_file(&removed).unwrap();
+            assert!(
+                backend
+                    .load_prepared_workspace_graph("test-repo", workspace)
+                    .unwrap()
+                    .is_none(),
+                "half an artifact answers nothing, missing {}",
+                removed.display()
+            );
+        }
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_is_namespaced_per_repository() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        initialize_local_repository_namespace(&backend, "repo-b");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000bb";
+
+        backend
+            .record_prepared_workspace_graph(
+                "repo-a",
+                workspace,
+                &prepared_fixture(br#"{"repository_id":"repo-a"}"#, b"KNDB repo-a payload"),
+            )
+            .unwrap();
+        assert!(
+            backend
+                .load_prepared_workspace_graph("repo-b", workspace)
+                .unwrap()
+                .is_none(),
+            "one repository's prepared state is never another's"
+        );
+    }
+
     #[test]
     fn local_backend_delete_overlay() {
         let dir = TempDir::new().unwrap();

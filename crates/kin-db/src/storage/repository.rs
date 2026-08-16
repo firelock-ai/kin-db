@@ -332,14 +332,14 @@ impl PreparedWorkspaceGraphCache {
                 return None;
             }
         };
-        let binding: PreparedWorkspaceGraphBinding =
-            match serde_json::from_slice(&artifact.binding) {
-                Ok(binding) => binding,
-                Err(error) => {
-                    self.refuse(workspace_id, "binding", &error.to_string());
-                    return None;
-                }
-            };
+        let binding: PreparedWorkspaceGraphBinding = match serde_json::from_slice(&artifact.binding)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.refuse(workspace_id, "binding", &error.to_string());
+                return None;
+            }
+        };
         let expected =
             self.expected_binding(workspace_id, hex::encode(Sha256::digest(&artifact.payload)));
         // Named one at a time so a refusal is a diagnosis rather than a shrug.
@@ -800,7 +800,10 @@ impl RepositoryAuthorityState {
     }
 
     /// Attach the prepared query-graph state open bound to these exact bytes.
-    fn with_prepared_workspace_graphs(mut self, prepared: Arc<PreparedWorkspaceGraphCache>) -> Self {
+    fn with_prepared_workspace_graphs(
+        mut self,
+        prepared: Arc<PreparedWorkspaceGraphCache>,
+    ) -> Self {
         self.prepared = Some(prepared);
         self
     }
@@ -5662,10 +5665,164 @@ mod tests {
     struct MemoryBackend {
         snapshot: Mutex<Option<(Vec<u8>, Generation)>>,
         blobs: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+        prepared: Mutex<HashMap<String, PreparedWorkspaceGraphArtifact>>,
         fail_next_snapshot: AtomicBool,
         source_load_count: AtomicUsize,
         verified_batch_behavior: AtomicUsize,
         source_load_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    }
+
+    impl MemoryBackend {
+        fn prepared_artifact(&self, workspace_id: &WorkspaceId) -> PreparedWorkspaceGraphArtifact {
+            self.prepared
+                .lock()
+                .get(&workspace_id.to_string())
+                .cloned()
+                .expect("a prepared artifact was recorded for this workspace")
+        }
+
+        fn install_prepared_artifact(
+            &self,
+            workspace_id: &WorkspaceId,
+            artifact: PreparedWorkspaceGraphArtifact,
+        ) {
+            self.prepared
+                .lock()
+                .insert(workspace_id.to_string(), artifact);
+        }
+
+        /// Rewrite one field of a stored binding record, leaving every other
+        /// field and the payload exactly as they were written.
+        fn corrupt_prepared_binding_field(
+            &self,
+            workspace_id: &WorkspaceId,
+            field: &str,
+            value: serde_json::Value,
+        ) {
+            let mut artifact = self.prepared_artifact(workspace_id);
+            let mut binding: serde_json::Value =
+                serde_json::from_slice(&artifact.binding).expect("stored binding decodes");
+            let object = binding.as_object_mut().expect("bindings are JSON objects");
+            assert!(
+                object.contains_key(field),
+                "binding has no field {field} to corrupt"
+            );
+            object.insert(field.to_string(), value);
+            artifact.binding = serde_json::to_vec(&binding).expect("binding re-encodes");
+            self.install_prepared_artifact(workspace_id, artifact);
+        }
+    }
+
+    /// A backend that never implements the prepared-state methods, so it takes
+    /// the default no-op surface every foreign backend takes.
+    struct PreparedBlindBackend(Arc<MemoryBackend>);
+
+    impl StorageBackend for PreparedBlindBackend {
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            self.0.load_snapshot(repo_id)
+        }
+
+        fn save_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            data: &[u8],
+        ) -> Result<(), KinDbError> {
+            self.0.save_source_blob(repo_id, digest, data)
+        }
+
+        fn load_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.0.load_source_blob(repo_id, digest)
+        }
+
+        fn load_source_blob_bounded(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            max_bytes: u64,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.0.load_source_blob_bounded(repo_id, digest, max_bytes)
+        }
+
+        fn with_verified_source_blob_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+        ) -> Result<(), KinDbError> {
+            self.0.with_verified_source_blob_batch(repo_id, operation)
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            self.0.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_snapshot_classified(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_cursor: SnapshotCursor,
+        ) -> SnapshotSaveOutcome {
+            self.0
+                .save_snapshot_classified(repo_id, data, expected_cursor)
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            self.0.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            self.0.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
+            self.0.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> Result<(), KinDbError> {
+            self.0.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.0.load_overlay(repo_id, session_id)
+        }
+
+        fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
+            self.0.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            self.0.list_repos()
+        }
     }
 
     struct MemoryVerifiedSourceBlobBatch<'a> {
@@ -5850,6 +6007,26 @@ mod tests {
 
         fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
             Ok(())
+        }
+
+        fn load_prepared_workspace_graph(
+            &self,
+            _repo_id: &str,
+            workspace_id: &str,
+        ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+            Ok(self.prepared.lock().get(workspace_id).cloned())
+        }
+
+        fn record_prepared_workspace_graph(
+            &self,
+            _repo_id: &str,
+            workspace_id: &str,
+            artifact: &PreparedWorkspaceGraphArtifact,
+        ) -> Result<bool, KinDbError> {
+            self.prepared
+                .lock()
+                .insert(workspace_id.to_string(), artifact.clone());
+            Ok(true)
         }
 
         fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
@@ -11794,6 +11971,7 @@ mod tests {
     /// repository tree and no source bodies; the costs under measurement
     /// (history replay, snapshot copying, admission passes) involve neither.
     struct SyntheticHistoryStore {
+        backend: Arc<MemoryBackend>,
         manager: RepositoryAuthorityManager<MemoryBackend>,
         workspace_id: WorkspaceId,
         change_count: usize,
@@ -11998,6 +12176,7 @@ mod tests {
         manager.commit_repository_transaction(initial).unwrap();
 
         SyntheticHistoryStore {
+            backend,
             manager,
             workspace_id,
             change_count,
@@ -12215,6 +12394,478 @@ mod tests {
         }
     }
 
+    /// Compare two workspace query snapshots domain by domain.
+    ///
+    /// Destructured rather than field-selected so a new snapshot domain fails
+    /// to compile here until someone decides whether a prepared serve has to
+    /// reproduce it. Counting entities would pass for a serve that dropped
+    /// every review, session, or revision the materialization carried.
+    fn assert_workspace_snapshots_identical(served: &GraphSnapshot, fresh: &GraphSnapshot) {
+        let GraphSnapshot {
+            version,
+            entities,
+            relations,
+            outgoing,
+            incoming,
+            changes,
+            change_children,
+            work_items,
+            annotations,
+            work_links,
+            reviews,
+            review_decisions,
+            review_notes,
+            review_discussions,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            mock_hints,
+            contracts,
+            actors,
+            delegations,
+            approvals,
+            audit_events,
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+            resolved_tree,
+            sessions,
+            intents,
+            downstream_warnings,
+            entity_revisions,
+            repository_authority,
+            external_references,
+        } = served;
+        assert_eq!(*version, fresh.version);
+        assert_eq!(*entities, fresh.entities);
+        assert_eq!(*relations, fresh.relations);
+        assert_eq!(*outgoing, fresh.outgoing);
+        assert_eq!(*incoming, fresh.incoming);
+        assert_eq!(*changes, fresh.changes);
+        assert_eq!(*change_children, fresh.change_children);
+        assert_eq!(*resolved_tree, fresh.resolved_tree);
+        assert_eq!(*entity_revisions, fresh.entity_revisions);
+        assert_eq!(*external_references, fresh.external_references);
+        assert!(
+            repository_authority.is_none() && fresh.repository_authority.is_none(),
+            "a workspace query snapshot never carries an authority envelope"
+        );
+        // The remaining domains carry kin-model types with no `PartialEq`, so
+        // they are compared as canonically ordered encodings instead. None of
+        // them contains a `HashMap`, so each entry's encoding is stable and
+        // only the order two maps happen to iterate in has to be removed.
+        assert_eq!(canonical_map(work_items), canonical_map(&fresh.work_items));
+        assert_eq!(
+            canonical_map(annotations),
+            canonical_map(&fresh.annotations)
+        );
+        assert_eq!(
+            canonical_value(work_links),
+            canonical_value(&fresh.work_links)
+        );
+        assert_eq!(canonical_map(reviews), canonical_map(&fresh.reviews));
+        assert_eq!(
+            canonical_map(review_decisions),
+            canonical_map(&fresh.review_decisions)
+        );
+        assert_eq!(
+            canonical_value(review_notes),
+            canonical_value(&fresh.review_notes)
+        );
+        assert_eq!(
+            canonical_value(review_discussions),
+            canonical_value(&fresh.review_discussions)
+        );
+        assert_eq!(
+            canonical_map(review_assignments),
+            canonical_map(&fresh.review_assignments)
+        );
+        assert_eq!(canonical_map(test_cases), canonical_map(&fresh.test_cases));
+        assert_eq!(canonical_map(assertions), canonical_map(&fresh.assertions));
+        assert_eq!(
+            canonical_map(verification_runs),
+            canonical_map(&fresh.verification_runs)
+        );
+        assert_eq!(
+            canonical_value(mock_hints),
+            canonical_value(&fresh.mock_hints)
+        );
+        assert_eq!(canonical_map(contracts), canonical_map(&fresh.contracts));
+        assert_eq!(canonical_map(actors), canonical_map(&fresh.actors));
+        assert_eq!(
+            canonical_value(delegations),
+            canonical_value(&fresh.delegations)
+        );
+        assert_eq!(
+            canonical_value(approvals),
+            canonical_value(&fresh.approvals)
+        );
+        assert_eq!(
+            canonical_value(audit_events),
+            canonical_value(&fresh.audit_events)
+        );
+        assert_eq!(
+            canonical_value(shallow_files),
+            canonical_value(&fresh.shallow_files)
+        );
+        assert_eq!(
+            canonical_value(file_layouts),
+            canonical_value(&fresh.file_layouts)
+        );
+        assert_eq!(
+            canonical_value(structured_artifacts),
+            canonical_value(&fresh.structured_artifacts)
+        );
+        assert_eq!(
+            canonical_value(opaque_artifacts),
+            canonical_value(&fresh.opaque_artifacts)
+        );
+        assert_eq!(canonical_map(sessions), canonical_map(&fresh.sessions));
+        assert_eq!(canonical_map(intents), canonical_map(&fresh.intents));
+        assert_eq!(
+            canonical_value(downstream_warnings),
+            canonical_value(&fresh.downstream_warnings)
+        );
+    }
+
+    fn canonical_value<T: Serialize>(value: &T) -> Vec<u8> {
+        rmp_serde::to_vec(value).expect("a snapshot domain encodes")
+    }
+
+    fn canonical_map<K: Serialize, V: Serialize>(map: &HashMap<K, V>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut entries: Vec<_> = map
+            .iter()
+            .map(|(key, value)| (canonical_value(key), canonical_value(value)))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Reopen the synthetic store the way a cold process would, so the open
+    /// binds prepared state to the exact durable authority bytes.
+    fn reopen_synthetic(
+        store: &SyntheticHistoryStore,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap()
+    }
+
+    fn stored_prepared_binding(store: &SyntheticHistoryStore) -> PreparedWorkspaceGraphBinding {
+        serde_json::from_slice(&store.backend.prepared_artifact(&store.workspace_id).binding)
+            .expect("a recorded binding decodes")
+    }
+
+    fn materialize_through(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        workspace_id: &WorkspaceId,
+    ) -> GraphSnapshot {
+        manager
+            .workspace_graph_snapshot(&repository_id(), workspace_id)
+            .unwrap()
+            .expect("the synthetic workspace exists")
+    }
+
+    #[test]
+    fn prepared_workspace_state_is_written_on_a_miss_and_served_on_the_next_open() {
+        let store = build_synthetic_history_store(3, 12, 2, 4);
+        let fresh = materialize_synthetic(&store);
+
+        let first = reopen_synthetic(&store);
+        assert_eq!(
+            first.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats::default(),
+            "an open that has answered nothing yet has done nothing"
+        );
+        let materialized = materialize_through(&first, &store.workspace_id);
+        assert_eq!(
+            first.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 0,
+                writes: 1,
+                refusals: 0,
+                last_refusal: None,
+            },
+            "the first open of a store with no artifact materializes and records one"
+        );
+        assert_workspace_snapshots_identical(&materialized, &fresh);
+
+        let second = reopen_synthetic(&store);
+        let served = materialize_through(&second, &store.workspace_id);
+        assert_eq!(
+            second.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 1,
+                writes: 0,
+                refusals: 0,
+                last_refusal: None,
+            },
+            "an identical reopen answers from the artifact and writes nothing"
+        );
+        assert_workspace_snapshots_identical(&served, &fresh);
+    }
+
+    #[test]
+    fn prepared_workspace_state_refuses_every_mismatched_binding_field() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        let recorded = store.backend.prepared_artifact(&store.workspace_id);
+
+        for (field, corruption) in [
+            (
+                "prepared_version",
+                serde_json::json!(PREPARED_WORKSPACE_GRAPH_VERSION + 1),
+            ),
+            (
+                "history_validation_version",
+                serde_json::json!(HISTORY_VALIDATION_VERSION + 1),
+            ),
+            (
+                "snapshot_version",
+                serde_json::json!(GraphSnapshot::CURRENT_VERSION + 1),
+            ),
+            ("repository_id", serde_json::json!("some-other-repository")),
+            (
+                "workspace_id",
+                serde_json::json!(WorkspaceId::from_uuid(Uuid::from_u128(0x2334)).to_string()),
+            ),
+            ("generation", serde_json::json!(4_242u64)),
+            (
+                "authority_snapshot_sha256",
+                serde_json::json!(hex::encode(Sha256::digest(b"different authority bytes"))),
+            ),
+            (
+                "payload_sha256",
+                serde_json::json!(hex::encode(Sha256::digest(b"different payload bytes"))),
+            ),
+        ] {
+            store
+                .backend
+                .install_prepared_artifact(&store.workspace_id, recorded.clone());
+            store
+                .backend
+                .corrupt_prepared_binding_field(&store.workspace_id, field, corruption);
+
+            let manager = reopen_synthetic(&store);
+            let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_eq!(
+                manager.prepared_workspace_graph_stats(),
+                PreparedWorkspaceGraphStats {
+                    serves: 0,
+                    writes: 1,
+                    refusals: 1,
+                    last_refusal: Some(field.to_string()),
+                },
+                "a mismatched {field} must refuse by name, materialize, and rewrite"
+            );
+            assert_workspace_snapshots_identical(&materialized, &fresh);
+
+            let rewritten = reopen_synthetic(&store);
+            let served = materialize_through(&rewritten, &store.workspace_id);
+            assert_eq!(
+                rewritten.prepared_workspace_graph_stats().serves,
+                1,
+                "the rewrite after a {field} refusal must be servable"
+            );
+            assert_workspace_snapshots_identical(&served, &fresh);
+        }
+    }
+
+    #[test]
+    fn prepared_workspace_state_refuses_a_payload_its_binding_does_not_name() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+
+        let mut artifact = store.backend.prepared_artifact(&store.workspace_id);
+        let last = artifact.payload.len() - 1;
+        artifact.payload[last] ^= 0xff;
+        store
+            .backend
+            .install_prepared_artifact(&store.workspace_id, artifact);
+
+        let manager = reopen_synthetic(&store);
+        let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            manager.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 0,
+                writes: 1,
+                refusals: 1,
+                last_refusal: Some("payload_sha256".to_string()),
+            },
+            "payload bytes the binding does not name are refused before they are decoded"
+        );
+        assert_workspace_snapshots_identical(&materialized, &fresh);
+    }
+
+    #[test]
+    fn prepared_workspace_state_refuses_a_payload_whose_own_frame_is_corrupt() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+
+        // Break the frame's body under its own checksum trailer, then restamp
+        // the binding so the artifact agrees with itself. Only the frame's own
+        // integrity is left to catch this.
+        let mut artifact = store.backend.prepared_artifact(&store.workspace_id);
+        artifact.payload[20] ^= 0xff;
+        store
+            .backend
+            .install_prepared_artifact(&store.workspace_id, artifact.clone());
+        store.backend.corrupt_prepared_binding_field(
+            &store.workspace_id,
+            "payload_sha256",
+            serde_json::json!(hex::encode(Sha256::digest(&artifact.payload))),
+        );
+
+        let manager = reopen_synthetic(&store);
+        let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            manager.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 0,
+                writes: 1,
+                refusals: 1,
+                last_refusal: Some("payload_frame".to_string()),
+            },
+            "a frame that fails its own checksum is refused even when its binding agrees"
+        );
+        assert_workspace_snapshots_identical(&materialized, &fresh);
+    }
+
+    #[test]
+    fn prepared_workspace_state_refuses_a_stale_artifact_after_a_workspace_mutation() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let clean = materialize_synthetic(&store);
+        let opened = reopen_synthetic(&store);
+        materialize_through(&opened, &store.workspace_id);
+        assert_eq!(opened.prepared_workspace_graph_stats().writes, 1);
+        let stale_binding = stored_prepared_binding(&store);
+
+        // A staged overlay is committed through the real transaction surface,
+        // so the authority bytes move and the artifact stops applying.
+        let staged = stage_synthetic_overlay(&store);
+        let dirty = materialize_synthetic(&store);
+        assert_ne!(
+            clean.relations.contains_key(&staged.id),
+            dirty.relations.contains_key(&staged.id),
+            "the staged overlay must actually change what the workspace resolves"
+        );
+
+        let after_mutation = reopen_synthetic(&store);
+        let materialized = materialize_through(&after_mutation, &store.workspace_id);
+        // The mutation moved the logical generation too, and that is the
+        // cheaper mismatch, so it is the one reported. The authority digest is
+        // what makes the refusal sound rather than incidental, so assert it
+        // moved as well: a change that somehow held the generation still would
+        // still have to clear that field.
+        assert_eq!(
+            after_mutation.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 0,
+                writes: 1,
+                refusals: 1,
+                last_refusal: Some("generation".to_string()),
+            },
+            "an artifact bound to superseded authority is refused by name"
+        );
+        let fresh_binding = stored_prepared_binding(&store);
+        assert_ne!(
+            stale_binding.authority_snapshot_sha256, fresh_binding.authority_snapshot_sha256,
+            "a workspace mutation must produce different authority bytes and a different digest"
+        );
+        assert_ne!(stale_binding.generation, fresh_binding.generation);
+        assert_workspace_snapshots_identical(&materialized, &dirty);
+
+        let rewritten = reopen_synthetic(&store);
+        let served = materialize_through(&rewritten, &store.workspace_id);
+        assert_eq!(
+            rewritten.prepared_workspace_graph_stats().serves,
+            1,
+            "the rewrite after the mutation must serve the new state"
+        );
+        assert_workspace_snapshots_identical(&served, &dirty);
+    }
+
+    #[test]
+    fn a_backend_without_prepared_state_materializes_and_serves_nothing() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        let blind = Arc::new(PreparedBlindBackend(Arc::clone(&store.backend)));
+
+        for round in 0..2 {
+            let manager =
+                RepositoryAuthorityManager::open(repository_id(), Arc::clone(&blind)).unwrap();
+            let materialized = manager
+                .workspace_graph_snapshot(&repository_id(), &store.workspace_id)
+                .unwrap()
+                .expect("the synthetic workspace exists");
+            assert_workspace_snapshots_identical(&materialized, &fresh);
+            assert_eq!(
+                manager.prepared_workspace_graph_stats(),
+                PreparedWorkspaceGraphStats::default(),
+                "round {round} on a backend with nowhere to record must serve and record nothing"
+            );
+        }
+        assert!(
+            store
+                .backend
+                .load_prepared_workspace_graph(
+                    repository_id().as_str(),
+                    &store.workspace_id.to_string(),
+                )
+                .unwrap()
+                .is_none(),
+            "a default no-op backend must not have reached durable prepared state"
+        );
+    }
+
+    #[test]
+    fn prepared_workspace_state_survives_a_local_backend_reopen() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = unborn_workspace_transaction(&manager, 0x2334, 0x2335, b"main");
+        manager.commit_repository_transaction(transaction).unwrap();
+        let workspace_id = manager.read_authority().metadata().workspaces[0].workspace_id;
+
+        let first =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let materialized = first
+            .workspace_graph_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("the committed workspace exists");
+        assert_eq!(first.prepared_workspace_graph_stats().writes, 1);
+        assert!(
+            backend
+                .load_prepared_workspace_graph(repository_id().as_str(), &workspace_id.to_string())
+                .unwrap()
+                .is_some(),
+            "the local backend must hold a durable artifact after a materialization miss"
+        );
+
+        let second =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let served = second
+            .workspace_graph_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("the committed workspace exists");
+        assert_eq!(
+            second.prepared_workspace_graph_stats(),
+            PreparedWorkspaceGraphStats {
+                serves: 1,
+                writes: 0,
+                refusals: 0,
+                last_refusal: None,
+            },
+            "a local reopen of unchanged state answers from durable bytes"
+        );
+        assert_workspace_snapshots_identical(&served, &materialized);
+    }
+
     /// Local, non-citable cold-open materialization wall-clock probe for
     /// FIR-2322. Run explicitly in release mode:
     ///
@@ -12259,5 +12910,78 @@ mod tests {
         let staged = stage_synthetic_overlay(&store);
         let dirty = time_rounds("dirty-workspace materialize");
         assert_synthetic_materialization(&store, &dirty, Some(&staged));
+    }
+
+    /// Local, non-citable probe of what a prepared serve costs against what
+    /// materializing the same workspace costs, on the same store, in the same
+    /// process. Run explicitly in release mode:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     prepared_workspace_state_cold_open_bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// The backend is in memory, so these numbers isolate encode, decode, and
+    /// validation and exclude filesystem IO. A serve that loses here loses on
+    /// decode cost alone and would only lose harder on a real disk.
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn prepared_workspace_state_cold_open_bench() {
+        let build_started = std::time::Instant::now();
+        let store = build_synthetic_history_store(40, 500, 20, 100);
+        eprintln!(
+            "store: {} entities, {} relations, {} changes, built in {:.1}s",
+            store.entity_count,
+            store.relation_count,
+            store.change_count,
+            build_started.elapsed().as_secs_f64()
+        );
+
+        let time_rounds = |label: &str, expect_serves: u64| {
+            let mut samples = Vec::new();
+            let mut latest = None;
+            for _ in 0..5 {
+                // One fresh open per round, because that is the shape the
+                // artifact exists for: a cold process asking once.
+                let manager = reopen_synthetic(&store);
+                let started = std::time::Instant::now();
+                latest = Some(materialize_through(&manager, &store.workspace_id));
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(
+                    manager.prepared_workspace_graph_stats().serves,
+                    expect_serves,
+                    "{label} did not take the path it is measuring"
+                );
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+            latest.expect("at least one round ran")
+        };
+
+        // The first open writes the artifact; every later one can serve it.
+        let miss = materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        assert_synthetic_materialization(&store, &miss, None);
+        let served = time_rounds("clean-workspace prepared serve", 1);
+        assert_synthetic_materialization(&store, &served, None);
+        assert_workspace_snapshots_identical(&served, &miss);
+
+        store.backend.prepared.lock().clear();
+        let materialized = time_rounds("clean-workspace materialize", 0);
+        assert_synthetic_materialization(&store, &materialized, None);
+
+        let staged = stage_synthetic_overlay(&store);
+        let dirty_miss = materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        assert_synthetic_materialization(&store, &dirty_miss, Some(&staged));
+        let dirty_served = time_rounds("dirty-workspace prepared serve", 1);
+        assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
+
+        store.backend.prepared.lock().clear();
+        let dirty_materialized = time_rounds("dirty-workspace materialize", 0);
+        assert_synthetic_materialization(&store, &dirty_materialized, Some(&staged));
     }
 }
