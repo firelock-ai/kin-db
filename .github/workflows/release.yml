@@ -23,7 +23,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: ./.github/actions/rust-toolchain
       # Mirror ci.yml / ci-linux.yml: HF_HUB_OFFLINE keeps the run deterministic
       # and offline. The three tests that construct a real embedder needing HF
       # weights are skipped here too (same skip as CI) until an offline

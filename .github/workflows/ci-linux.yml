@@ -55,7 +55,7 @@ jobs:
           path: kin-db
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: ./kin-db/.github/actions/rust-toolchain
         with:
           # Downstream release artifacts link this crate statically against musl,
           # so musl is a Linux target this workflow owns rather than a target a
