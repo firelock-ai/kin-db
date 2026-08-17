@@ -10771,7 +10771,10 @@ mod tests {
         let mut repo = AmbientWorkspace::start(0xb100);
         repo.pass(
             0xb101,
-            &[(".gitignore", b"build/\n"), ("src/lib.rs", b"pub fn kin() {}\n")],
+            &[
+                (".gitignore", b"build/\n"),
+                ("src/lib.rs", b"pub fn kin() {}\n"),
+            ],
         )
         .unwrap();
 
@@ -10841,7 +10844,11 @@ mod tests {
 
         // Fail-loud survives: the rule is in force for the next commit.
         let error = repo
-            .commit(0xc104, "admit an excluded log", &[("logs/old.log", b"line\n")])
+            .commit(
+                0xc104,
+                "admit an excluded log",
+                &[("logs/old.log", b"line\n")],
+            )
             .expect_err("a newly introduced excluded path must still fail the change");
         assert_policy_exclusion(&error, "logs/old.log");
     }
