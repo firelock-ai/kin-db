@@ -3262,13 +3262,46 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
     verify_workspace_admission(backend, current, replay, snapshot, metadata, transaction)?;
-    verify_native_change_admission(
-        backend,
-        current.authenticated_gitlinks(),
-        replay,
-        metadata,
-        transaction,
-    )
+    verify_native_change_admission(backend, current, replay, metadata, transaction)
+}
+
+/// The exclusion-rule generation that judges what a transaction introduces.
+///
+/// Exclusion rules apply forward. Newly proposed artifacts are judged by the
+/// policy generation that was already in force, never by the generation the
+/// same transaction publishes, because that successor policy is derived from
+/// the very tree it would be judging: `SharedAdmissionPolicy::derive_from_tree`
+/// reads the desired tree's own `.gitignore` and `.kinignore` blobs. A
+/// transaction that introduces a rule beside the untracked content that rule
+/// newly excludes therefore refuted itself, and refuted itself identically on
+/// every retry, because the rule file could never land. That is a livelock
+/// rather than a refusal, and it is what judging by the predecessor resolves.
+/// It is also what Git does: a new ignore rule does not reach back into what a
+/// repository already holds.
+///
+/// The generation in force before a workspace mutation is the pre-transaction
+/// state of that same workspace. A workspace this transaction creates has no
+/// earlier generation at all, so the policy it publishes is the only one that
+/// has ever applied to its content, and that policy judges it.
+///
+/// Two things deliberately stay at the successor generation. The frozen local
+/// overlay is host configuration the caller records rather than anything
+/// derived from the tree being judged, so it carries none of the circularity
+/// above. Sensitive-artifact allowances stay on
+/// `ArtifactAdmissionContext::policy`, because an allowance is an explicit
+/// per-path grant naming an exact content hash and the transaction that records
+/// one means to admit the artifact it approves.
+///
+/// Fail-loud is intact under the judging generation: content the rules already
+/// in force exclude still fails the whole transaction, and every later proposal
+/// is judged by the rule that just landed.
+fn judging_shared_policy<'a>(
+    previous_workspace: Option<&'a WorkspaceState>,
+    published: &'a SharedAdmissionPolicy,
+) -> &'a SharedAdmissionPolicy {
+    previous_workspace
+        .map(|previous| &previous.shared_admission_policy)
+        .unwrap_or(published)
 }
 
 fn verify_workspace_admission<B: StorageBackend + ?Sized>(
@@ -3292,11 +3325,16 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
                 mutation.workspace_id
             ))
         })?;
+    let previous_workspace = current
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|candidate| candidate.workspace_id == workspace.workspace_id);
     let overlay = local_overlay_for_workspace(metadata, workspace)?;
     let matcher = resolve_admission_matcher(
         backend,
         &transaction.repository_id,
-        &workspace.shared_admission_policy,
+        judging_shared_policy(previous_workspace, &workspace.shared_admission_policy),
         overlay,
     )?;
 
@@ -3308,12 +3346,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     // transaction cannot authorize an arbitrary target.
     let authenticated_gitlinks = current.authenticated_gitlinks();
     let mut contextual_gitlinks = BTreeSet::new();
-    if let Some(previous) = current
-        .metadata()
-        .workspaces
-        .iter()
-        .find(|candidate| candidate.workspace_id == workspace.workspace_id)
-    {
+    if let Some(previous) = previous_workspace {
         tracked.extend(
             previous
                 .tree
@@ -3378,11 +3411,12 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
 
 fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     backend: &B,
-    authenticated_gitlinks: &BTreeSet<(ArtifactId, GitObjectId)>,
+    current: &RepositoryAuthorityState,
     replay: &SharedReplayGraph<'_>,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
+    let authenticated_gitlinks = current.authenticated_gitlinks();
     let native_changes = transaction
         .changes
         .iter()
@@ -3469,8 +3503,44 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 ))
             })?;
         let overlay = local_overlay_for_workspace(metadata, workspace)?;
+        let previous_workspace = current
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.workspace_id == workspace.workspace_id);
+        // The generation in force before this change is its first parent's, and
+        // a root change has no parent, so the workspace it is bound to supplies
+        // the one that was in force. See `judging_shared_policy`: a change that
+        // carries a new rule file is derived from the same tree the rule would
+        // judge, so judging it by its own generation is the FIR-2348 livelock.
+        let judging = change
+            .parents
+            .first()
+            .and_then(|parent| {
+                metadata
+                    .admission_policies
+                    .iter()
+                    .find(|resolved| resolved.change_id == *parent)
+            })
+            .and_then(|resolved| resolved.policy.as_ref())
+            .unwrap_or_else(|| judging_shared_policy(previous_workspace, policy));
         let matcher =
-            resolve_admission_matcher(backend, &transaction.repository_id, policy, overlay)?;
+            resolve_admission_matcher(backend, &transaction.repository_id, judging, overlay)?;
+        // An artifact the pre-transaction workspace already carried is already
+        // repository authority, exactly as `verify_workspace_admission` treats
+        // it. The parent comparison above cannot see that on its own: a change
+        // publishing an already-admitted workspace tree introduces every path
+        // its parent lacks, including paths an earlier generation admitted
+        // under the rules that were in force then.
+        let workspace_tracked = previous_workspace
+            .map(|previous| {
+                previous
+                    .tree
+                    .artifacts()
+                    .map(|artifact| artifact.artifact_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         for artifact in introduced {
             let gitlink_is_admitted = match artifact.entry {
                 TreeEntry::Gitlink { target } => {
@@ -3485,7 +3555,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 artifact,
                 ArtifactAdmissionContext {
                     policy,
-                    tracked: false,
+                    tracked: workspace_tracked.contains(&artifact.artifact_id),
                     gitlink_is_admitted,
                     label: &format!("native change {}", change.id),
                 },
@@ -3645,6 +3715,16 @@ struct ArtifactAdmissionContext<'a> {
     label: &'a str,
 }
 
+/// Judge one proposed artifact against the exact rules that bind it.
+///
+/// The two halves answer to different generations on purpose. `matcher` carries
+/// the exclusion rules that were in force BEFORE this transaction, which is the
+/// contract `judging_shared_policy` states and the reason a transaction can
+/// introduce an ignore rule at all. `context.policy` carries the successor's
+/// sensitive-artifact allowances, so a transaction that records an allowance
+/// admits the artifact it approves. Neither half is skipped: an artifact the
+/// standing rules exclude, and untracked sensitive content with no allowance,
+/// each fail the whole transaction.
 fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
