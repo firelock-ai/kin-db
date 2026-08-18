@@ -12910,4 +12910,361 @@ mod tests {
         assert!(lock_path.exists(), "lock file should be created");
         // Lock is released when _lock is dropped
     }
+
+    // ---------------------------------------------------------------------
+    // Authority frame appends at the storage boundary.
+    //
+    // Storage verifies a frame's header and checksum and never decodes its
+    // body, so these fixtures carry arbitrary bodies under a valid header.
+    // ---------------------------------------------------------------------
+
+    fn frame_bytes_with_body(body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&crate::storage::authority_frame::AuthorityFrame::MAGIC);
+        buf.extend_from_slice(
+            &crate::storage::authority_frame::AuthorityFrame::CURRENT_VERSION.to_le_bytes(),
+        );
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(body);
+        buf.extend_from_slice(&Sha256::digest(body));
+        buf
+    }
+
+    fn committed_cursor(outcome: SnapshotSaveOutcome) -> SnapshotCursor {
+        match outcome {
+            SnapshotSaveOutcome::Committed { cursor } => cursor,
+            SnapshotSaveOutcome::NotCommitted(error) => {
+                panic!("expected a committed frame, got not committed: {error}")
+            }
+            SnapshotSaveOutcome::Indeterminate(error) => {
+                panic!("expected a committed frame, got indeterminate: {error}")
+            }
+        }
+    }
+
+    fn not_committed_error(outcome: SnapshotSaveOutcome) -> String {
+        match outcome {
+            SnapshotSaveOutcome::NotCommitted(error) => error.to_string(),
+            SnapshotSaveOutcome::Committed { cursor } => panic!(
+                "expected a refusal, but the frame committed at {}",
+                cursor.backend_generation()
+            ),
+            SnapshotSaveOutcome::Indeterminate(error) => {
+                panic!("expected a refusal, got indeterminate: {error}")
+            }
+        }
+    }
+
+    fn record_at(dir: &TempDir, repo_id: &str) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(dir.path().join(repo_id).join("authority.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn frame_appends_extend_only_the_acknowledged_head_and_bind_a_journal_proof() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "frames-cas";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let head = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let first = frame_bytes_with_body(b"first frame");
+        let second = frame_bytes_with_body(b"second frame");
+
+        let stale = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head + 1),
+            Some(7),
+        ));
+        assert!(stale.contains("base generation mismatch"), "{stale}");
+        assert!(
+            !dir.path().join(repo_id).join("deltas").exists()
+                || std::fs::read_dir(dir.path().join(repo_id).join("deltas"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "a refused append installs nothing"
+        );
+
+        let cursor = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert_eq!(cursor.backend_generation(), head + 1);
+        let record = record_at(&dir, repo_id);
+        assert_eq!(
+            record["version"],
+            serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION)
+        );
+        assert_eq!(record["snapshot_generation"], serde_json::json!(head));
+        assert_eq!(record["head_generation"], serde_json::json!(head + 1));
+        assert_eq!(
+            record["acknowledged_deltas"][0]["sha256"],
+            serde_json::json!(hex::encode(Sha256::digest(&first)))
+        );
+        let expected_journal = crate::storage::authority_frame::journal_sha256(
+            &hex::encode(Sha256::digest(&base)),
+            [hex::encode(Sha256::digest(&first))],
+        )
+        .unwrap();
+        assert_eq!(
+            record["history_validation"]["validator_version"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            record["history_validation"]["generation"],
+            serde_json::json!(head + 1)
+        );
+        assert_eq!(
+            record["history_validation"]["snapshot_sha256"],
+            serde_json::json!(hex::encode(Sha256::digest(&base)))
+        );
+        assert_eq!(
+            record["history_validation"]["journal_sha256"],
+            serde_json::json!(expected_journal)
+        );
+
+        // The same bytes at the same cursor are an idempotent retry; different
+        // bytes at a stale cursor are a refusal.
+        let retry = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert_eq!(retry.backend_generation(), head + 1);
+        let displaced = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &second,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert!(
+            displaced.contains("base generation mismatch"),
+            "{displaced}"
+        );
+
+        // A second frame without a validator leaves the head unproven.
+        let cursor = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &second,
+            SnapshotCursor::from_backend_generation(head + 1),
+            None,
+        ));
+        assert_eq!(cursor.backend_generation(), head + 2);
+        let record = record_at(&dir, repo_id);
+        assert!(record["history_validation"].is_null());
+        assert_eq!(record["acknowledged_deltas"].as_array().unwrap().len(), 2);
+
+        // Storage refuses a frame it cannot vouch for by its own header.
+        let mut torn = frame_bytes_with_body(b"third frame");
+        torn.truncate(torn.len() - 1);
+        let refused = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &torn,
+            SnapshotCursor::from_backend_generation(head + 2),
+            None,
+        ));
+        assert!(refused.contains("truncated"), "{refused}");
+    }
+
+    #[test]
+    fn journals_of_one_kind_refuse_entries_of_the_other() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+
+        let generic = "generic-journal";
+        let head = backend
+            .save_snapshot(generic, &base, GENERATION_INIT)
+            .unwrap();
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(head)
+            .to_bytes()
+            .unwrap();
+        backend.save_delta(generic, &delta, head).unwrap();
+        let refused = not_committed_error(backend.save_authority_frame(
+            generic,
+            &frame_bytes_with_body(b"frame"),
+            SnapshotCursor::from_backend_generation(head + 1),
+            None,
+        ));
+        assert!(
+            refused.contains("carries incremental graph deltas"),
+            "{refused}"
+        );
+
+        let framed = "frame-journal";
+        let head = backend
+            .save_snapshot(framed, &base, GENERATION_INIT)
+            .unwrap();
+        committed_cursor(backend.save_authority_frame(
+            framed,
+            &frame_bytes_with_body(b"frame"),
+            SnapshotCursor::from_backend_generation(head),
+            None,
+        ));
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(head + 1)
+            .to_bytes()
+            .unwrap();
+        let error = backend
+            .save_delta(framed, &delta, head + 1)
+            .expect_err("a graph delta must not extend a frame journal");
+        assert!(
+            error
+                .to_string()
+                .contains("carries repository authority frames"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_frame_journal_record_that_acknowledges_nothing_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "empty-frame-journal";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let path = dir.path().join(repo_id).join("authority.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["version"] = serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = backend
+            .load_snapshot_authority(repo_id)
+            .expect_err("a frame journal record must acknowledge at least one frame");
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledges no authority frame"),
+            "{error}"
+        );
+        record["version"] = serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION + 1);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = backend
+            .load_snapshot_authority(repo_id)
+            .expect_err("an unknown record version is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported local authority version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_journal_history_validation_binds_only_the_exact_head_and_chain() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "journal-proof";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let head = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let frame = frame_bytes_with_body(b"frame");
+        committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &frame,
+            SnapshotCursor::from_backend_generation(head),
+            None,
+        ));
+        let base_sha = hex::encode(Sha256::digest(&base));
+        let journal = crate::storage::authority_frame::journal_sha256(
+            &base_sha,
+            [hex::encode(Sha256::digest(&frame))],
+        )
+        .unwrap();
+
+        let moved = backend
+            .record_journal_history_validation(repo_id, head, &base_sha, &journal, 7)
+            .expect_err("a proof for another head must not bind");
+        assert!(moved.to_string().contains("authority moved"), "{moved}");
+        let other_chain = backend
+            .record_journal_history_validation(
+                repo_id,
+                head + 1,
+                &base_sha,
+                &hex::encode(Sha256::digest(b"another chain")),
+                7,
+            )
+            .expect_err("a proof for another chain must not bind");
+        assert!(
+            other_chain.to_string().contains("authority moved"),
+            "{other_chain}"
+        );
+        let journal_free = backend
+            .record_history_validation(repo_id, head + 1, &base_sha, 7)
+            .expect_err("the journal-free binding refuses a journal head");
+        assert!(
+            journal_free.to_string().contains("authority moved"),
+            "{journal_free}"
+        );
+
+        assert!(backend
+            .record_journal_history_validation(repo_id, head + 1, &base_sha, &journal, 7)
+            .unwrap());
+        let record = record_at(&dir, repo_id);
+        assert_eq!(
+            record["history_validation"]["journal_sha256"],
+            serde_json::json!(journal)
+        );
+        assert_eq!(
+            record["history_validation"]["generation"],
+            serde_json::json!(head + 1)
+        );
+    }
+
+    #[test]
+    fn a_full_promotion_discards_a_stale_frame_past_head_but_keeps_refusing_a_stale_delta() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+
+        let framed = "stale-frame";
+        let head = backend
+            .save_snapshot(framed, &base, GENERATION_INIT)
+            .unwrap();
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(framed, head + 1),
+            &frame_bytes_with_body(b"staged by a writer that died"),
+        )
+        .unwrap();
+        let promoted = backend
+            .save_snapshot(framed, &base, head)
+            .expect("a stale authority frame past head must not block a full promotion");
+        assert_eq!(promoted, head + 1);
+        assert!(
+            !backend.delta_path(framed, head + 1).exists(),
+            "the stale frame is discarded before the promotion commits"
+        );
+        let recovered = load_recovered_snapshot(&backend, framed).unwrap().unwrap();
+        assert_eq!(recovered.generation, head + 1);
+        assert_eq!(recovered.deltas_seen, 0);
+
+        let generic = "stale-delta";
+        let head = backend
+            .save_snapshot(generic, &base, GENERATION_INIT)
+            .unwrap();
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(generic, head + 1),
+            &crate::storage::delta::GraphSnapshotDelta::empty(head)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let error = backend
+            .save_snapshot(generic, &base, head)
+            .expect_err("a staged graph delta keeps its racing-writer refusal");
+        assert!(
+            error.to_string().contains("staged unacknowledged delta"),
+            "{error}"
+        );
+    }
 }

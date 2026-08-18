@@ -1181,15 +1181,23 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
-    /// Choose the durable shape of one publication under the journal bound.
-    fn publication_shape(&self, state: &PersistenceState, frame_bytes: u64) -> PublicationShape {
-        if !self.backend.supports_authority_frames() {
-            return PublicationShape::FullSnapshot;
+    /// Whether a frame is even a candidate for the next publication, judged
+    /// on what the writer knows before encoding one: backend support, a base
+    /// to extend, and the frame count bound.
+    fn frame_is_candidate(&self, state: &PersistenceState) -> bool {
+        if !self.backend.supports_authority_frames() || state.base_bytes == 0 {
+            return false;
         }
         let max_frames = self
             .max_journal_frames
             .load(std::sync::atomic::Ordering::Relaxed);
-        if state.journal_frames >= max_frames {
+        state.journal_frames < max_frames
+    }
+
+    /// Choose the durable shape of one publication whose frame is encoded,
+    /// under the journal byte bound.
+    fn publication_shape(&self, state: &PersistenceState, frame_bytes: u64) -> PublicationShape {
+        if !self.frame_is_candidate(state) {
             return PublicationShape::FullSnapshot;
         }
         #[allow(unused_mut)]
@@ -1254,7 +1262,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     ) -> PersistOutcome {
         let mut timer = PublicationPhaseTimer::start();
         let mut state = self.state.lock();
-        let frame = if self.backend.supports_authority_frames() {
+        let frame = if self.frame_is_candidate(&state) {
             match self.encode_frame(current, next) {
                 Ok(frame) => Some(frame),
                 Err(error) => {
@@ -15092,6 +15100,21 @@ mod tests {
         record["history_validation"]["journal_sha256"] =
             serde_json::json!(hex::encode(Sha256::digest(b"another chain")));
         write_authority_json(directory.path(), &record);
+        // Recovery itself must not reuse the forged proof, because reuse is
+        // what skips the head's admission pass; the manager's own check is a
+        // second gate, not the only one.
+        let recovered = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !recovered.reused_complete_validation,
+            "a proof naming another chain must not skip head validation"
+        );
+        assert!(recovered.recovered.history_validation.is_none());
         let reopened = reopen(&directory);
         assert!(!reopened.opened_by_history_validation());
         assert_same_authority(
@@ -15536,6 +15559,78 @@ mod tests {
             error.to_string().contains("change not found")
                 || error.to_string().contains("root bundle")
                 || error.to_string().contains("policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_frame_whose_operation_names_other_base_roots_does_not_apply() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let base = manager.read_authority().snapshot().clone();
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2951, 0x70))
+            .unwrap();
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let mut frame = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
+        // Same generation, same operation, but the predecessor it claims is a
+        // state that never existed: only the roots binding can tell.
+        frame.operation.roots_before.history.hash =
+            Hash256::from_bytes(*Sha256::digest(b"another history").as_ref());
+        let mut applied = base.clone();
+        let error = frame
+            .apply(&mut applied)
+            .expect_err("a frame that names other base roots must not apply");
+        assert!(
+            error.to_string().contains("does not extend the base"),
+            "{error}"
+        );
+        assert_eq!(
+            applied.repository_authority, base.repository_authority,
+            "nothing is applied when a frame is refused"
+        );
+    }
+
+    #[test]
+    fn the_writer_refuses_a_frame_that_would_not_reproduce_the_successor() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let current = manager.read_authority().snapshot().clone();
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2961, 0x71))
+            .unwrap();
+        let next = manager.read_authority().snapshot().clone();
+        crate::storage::AuthorityFrame::encode(&current, &next)
+            .expect("the real successor encodes");
+
+        // A successor whose base-inherited receipt moved is not something a
+        // patch over the base can express, and the writer says so instead of
+        // persisting a frame that rebuilds a different head.
+        let mut drifted = next.clone();
+        drifted.repository_authority.as_mut().unwrap().receipts[0]
+            .roots_before
+            .generation += 1;
+        let error = crate::storage::AuthorityFrame::encode(&current, &drifted)
+            .expect_err("a frame that cannot reproduce the successor is refused by the writer");
+        assert!(
+            error
+                .to_string()
+                .contains("does not reproduce the successor envelope"),
+            "{error}"
+        );
+
+        // So is a successor that dropped a change the base carried, because a
+        // frame only ever adds history.
+        let mut shrunk = next.clone();
+        let some_change = *shrunk.changes.keys().next().unwrap();
+        shrunk.changes.remove(&some_change);
+        let error = crate::storage::AuthorityFrame::encode(&current, &shrunk)
+            .expect_err("a successor with fewer changes than its base cannot be a frame");
+        assert!(
+            error
+                .to_string()
+                .contains("does not account for the successor's changes")
+                || error.to_string().contains("does not reproduce"),
             "{error}"
         );
     }

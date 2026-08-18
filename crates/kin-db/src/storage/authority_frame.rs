@@ -321,7 +321,7 @@ impl AuthorityFrame {
         let workspaces = successor
             .workspaces
             .iter()
-            .filter(|workspace| base_workspaces.get(&workspace.workspace_id) != Some(&workspace))
+            .filter(|workspace| base_workspaces.get(&workspace.workspace_id) != Some(workspace))
             .cloned()
             .collect();
 
@@ -619,4 +619,101 @@ fn decode_digest(hex_digest: &str, label: &str) -> Result<[u8; 32], KinDbError> 
     <[u8; 32]>::try_from(bytes).map_err(|_| {
         KinDbError::StorageError(format!("{label} digest {hex_digest} is not 32 bytes"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame_bytes_from(body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&AuthorityFrame::MAGIC);
+        buf.extend_from_slice(&AuthorityFrame::CURRENT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(body);
+        buf.extend_from_slice(&Sha256::digest(body));
+        buf
+    }
+
+    #[test]
+    fn frame_bytes_are_verified_before_any_body_is_decoded() {
+        let body = b"not a frame body, and never decoded here";
+        let bytes = frame_bytes_from(body);
+        assert_eq!(AuthorityFrame::verify_frame_bytes(&bytes).unwrap(), body);
+        assert!(AuthorityFrame::is_frame_bytes(&bytes));
+
+        let mut wrong_magic = bytes.clone();
+        wrong_magic[0..4].copy_from_slice(b"KNDD");
+        assert!(!AuthorityFrame::is_frame_bytes(&wrong_magic));
+        let error = AuthorityFrame::verify_frame_bytes(&wrong_magic).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid authority frame magic"),
+            "{error}"
+        );
+
+        let mut future_version = bytes.clone();
+        future_version[4..8].copy_from_slice(&(AuthorityFrame::CURRENT_VERSION + 1).to_le_bytes());
+        let error = AuthorityFrame::verify_frame_bytes(&future_version).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported authority frame version"),
+            "{error}"
+        );
+
+        let truncated = &bytes[..bytes.len() - 5];
+        let error = AuthorityFrame::verify_frame_bytes(truncated).unwrap_err();
+        assert!(error.to_string().contains("truncated"), "{error}");
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let error = AuthorityFrame::verify_frame_bytes(&trailing).unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"), "{error}");
+
+        let mut flipped = bytes.clone();
+        flipped[20] ^= 0x01;
+        let error = AuthorityFrame::verify_frame_bytes(&flipped).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+
+        let mut overflowing = bytes.clone();
+        overflowing[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let error = AuthorityFrame::verify_frame_bytes(&overflowing).unwrap_err();
+        assert!(
+            error.to_string().contains("overflows") || error.to_string().contains("truncated"),
+            "{error}"
+        );
+
+        assert!(AuthorityFrame::verify_frame_bytes(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn a_verified_frame_with_an_undecodable_body_still_refuses() {
+        let bytes = frame_bytes_from(b"\xc1");
+        let error = AuthorityFrame::from_bytes(&bytes).unwrap_err();
+        assert!(
+            error.to_string().contains("deserialization failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_journal_digest_is_ordered_and_binds_the_base() {
+        let base = hex::encode(Sha256::digest(b"base"));
+        let first = hex::encode(Sha256::digest(b"frame one"));
+        let second = hex::encode(Sha256::digest(b"frame two"));
+        let chain = journal_sha256(&base, [&first, &second]).unwrap();
+        assert_eq!(chain, journal_sha256(&base, [&first, &second]).unwrap());
+        assert_ne!(chain, journal_sha256(&base, [&second, &first]).unwrap());
+        assert_ne!(chain, journal_sha256(&base, [&first]).unwrap());
+        assert_ne!(
+            chain,
+            journal_sha256(
+                &hex::encode(Sha256::digest(b"other base")),
+                [&first, &second]
+            )
+            .unwrap()
+        );
+        assert!(journal_sha256("not hex", [&first]).is_err());
+        assert!(journal_sha256(&base, ["abcd"]).is_err());
+    }
 }
