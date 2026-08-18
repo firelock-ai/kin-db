@@ -2759,6 +2759,9 @@ impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSour
 /// ```text
 /// {base_path}/{repo_id}/authority.json      — atomic base/head authority
 /// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
+/// {base_path}/{repo_id}/deltas/GEN.kndd     — acknowledged journal entries: incremental
+///                                             graph deltas (KNDD) for a plain graph, or
+///                                             authority frames (KNAF) for repository authority
 /// {base_path}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
 /// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg — prepared query graph
