@@ -245,10 +245,23 @@ impl AuthorityFrame {
     /// the store: new changes are found by probing the successor's change ids
     /// against the base, and every sorted envelope sequence is walked once
     /// against its base counterpart.
+    #[cfg(test)]
     pub(crate) fn encode(
         current: &GraphSnapshot,
         next: &GraphSnapshot,
     ) -> Result<Self, KinDbError> {
+        let frame = Self::drain(current, next)?;
+        frame.prove_reproduces(current, next)?;
+        Ok(frame)
+    }
+
+    /// Drain the mutation into a frame without proving reproduction.
+    ///
+    /// The production writer calls this and then
+    /// [`prove_reproduces`](Self::prove_reproduces) as two timed steps and
+    /// never persists a frame it has not proven; [`encode`](Self::encode) is
+    /// the same pair for tests.
+    pub(crate) fn drain(current: &GraphSnapshot, next: &GraphSnapshot) -> Result<Self, KinDbError> {
         let base = current.repository_authority.as_ref().ok_or_else(|| {
             KinDbError::StorageError(
                 "authority frame base carries no repository authority envelope".to_string(),
@@ -340,7 +353,6 @@ impl AuthorityFrame {
             merge_transactions: successor.merge_transactions.clone(),
         };
         frame.validate_shape()?;
-        frame.prove_reproduces(current, next)?;
         Ok(frame)
     }
 
@@ -350,19 +362,21 @@ impl AuthorityFrame {
     /// The envelope is reconstructed with the exact reader code path and
     /// compared whole. Changes are immutable and the frame carries only ids
     /// absent from the base, so key-set identity is value identity there.
-    fn prove_reproduces(
+    pub(crate) fn prove_reproduces(
         &self,
         current: &GraphSnapshot,
         next: &GraphSnapshot,
     ) -> Result<(), KinDbError> {
-        let base = current
-            .repository_authority
-            .as_ref()
-            .expect("checked by encode");
-        let successor = next
-            .repository_authority
-            .as_ref()
-            .expect("checked by encode");
+        let base = current.repository_authority.as_ref().ok_or_else(|| {
+            KinDbError::StorageError(
+                "authority frame base carries no repository authority envelope".to_string(),
+            )
+        })?;
+        let successor = next.repository_authority.as_ref().ok_or_else(|| {
+            KinDbError::StorageError(
+                "authority frame successor carries no repository authority envelope".to_string(),
+            )
+        })?;
         let reconstructed = self.apply_to_envelope(base.clone())?;
         if reconstructed != *successor {
             return Err(KinDbError::StorageError(format!(

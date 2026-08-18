@@ -1045,6 +1045,17 @@ fn authority_journal_max_frames() -> u64 {
     )
 }
 
+/// One encoded frame with the split of the writer-side work it cost.
+struct EncodedFrame {
+    bytes: Vec<u8>,
+    /// Draining the mutation into the frame.
+    encode_ms: u128,
+    /// Applying the frame to the base envelope and comparing with the successor.
+    self_check_ms: u128,
+    /// MessagePack plus header and checksum.
+    serialize_ms: u128,
+}
+
 /// Which durable shape one publication takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationShape {
@@ -1218,7 +1229,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         &self,
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
-    ) -> Result<Vec<u8>, KinDbError> {
+    ) -> Result<EncodedFrame, KinDbError> {
         #[cfg(test)]
         if self
             .break_frame_encoder
@@ -1229,11 +1240,22 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                     .to_string(),
             ));
         }
-        let frame = crate::storage::authority_frame::AuthorityFrame::encode(
+        let mut timer = PublicationPhaseTimer::start();
+        let frame = crate::storage::authority_frame::AuthorityFrame::drain(
             &current.snapshot,
             &next.snapshot,
         )?;
-        frame.to_bytes()
+        let encode_ms = timer.lap_ms();
+        frame.prove_reproduces(&current.snapshot, &next.snapshot)?;
+        let self_check_ms = timer.lap_ms();
+        let bytes = frame.to_bytes()?;
+        let serialize_ms = timer.lap_ms();
+        Ok(EncodedFrame {
+            bytes,
+            encode_ms,
+            self_check_ms,
+            serialize_ms,
+        })
     }
 
     /// Append one validated authority frame at the current cursor.
@@ -1283,19 +1305,31 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             None
         };
         let shape = match &frame {
-            Some(frame) => self.publication_shape(&state, frame.len() as u64),
+            Some(frame) => self.publication_shape(&state, frame.bytes.len() as u64),
             None => PublicationShape::FullSnapshot,
         };
         match (shape, frame) {
             (PublicationShape::Frame, Some(frame)) => {
-                let serialize_ms = timer.lap_ms();
+                let EncodedFrame {
+                    bytes: frame,
+                    encode_ms,
+                    self_check_ms,
+                    serialize_ms,
+                } = frame;
+                timer.lap_ms();
                 let frame_bytes = frame.len();
                 let outcome = self.persist_frame_bytes(&frame, &mut state);
                 if let PersistOutcome::Indeterminate(_) = &outcome {
                     state.pending_frame = Some((next.generation(), frame));
                 }
                 let write_ms = timer.lap_ms();
-                record_frame_persistence_phases(serialize_ms, write_ms, frame_bytes);
+                record_frame_persistence_phases(
+                    encode_ms,
+                    self_check_ms,
+                    serialize_ms,
+                    write_ms,
+                    frame_bytes,
+                );
                 outcome
             }
             _ => {
@@ -1395,6 +1429,10 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistencePhases {
+    /// Frame publications only: draining the mutation into a frame.
+    encode_ms: u128,
+    /// Frame publications only: the writer's reproduction proof.
+    self_check_ms: u128,
     serialize_ms: u128,
     write_ms: u128,
     payload_bytes: usize,
@@ -1419,6 +1457,8 @@ fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapsh
     #[cfg(test)]
     LAST_PERSISTENCE_PHASES.with(|phases| {
         phases.set(Some(PersistencePhases {
+            encode_ms: 0,
+            self_check_ms: 0,
             serialize_ms,
             write_ms,
             payload_bytes: snapshot_bytes,
@@ -1441,18 +1481,32 @@ fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapsh
     }
 }
 
-/// Name the two persistence phases of one frame publication.
-fn record_frame_persistence_phases(serialize_ms: u128, write_ms: u128, frame_bytes: usize) {
+/// Name the phases of one frame publication.
+///
+/// The writer-side work is split so a slow frame publication can say whether
+/// draining the mutation, proving the frame reproduces the successor, or the
+/// durable write cost the time.
+fn record_frame_persistence_phases(
+    encode_ms: u128,
+    self_check_ms: u128,
+    serialize_ms: u128,
+    write_ms: u128,
+    frame_bytes: usize,
+) {
     #[cfg(test)]
     LAST_PERSISTENCE_PHASES.with(|phases| {
         phases.set(Some(PersistencePhases {
+            encode_ms,
+            self_check_ms,
             serialize_ms,
             write_ms,
             payload_bytes: frame_bytes,
         }))
     });
-    if serialize_ms + write_ms >= SLOW_PUBLICATION_PHASE.as_millis() {
+    if encode_ms + self_check_ms + serialize_ms + write_ms >= SLOW_PUBLICATION_PHASE.as_millis() {
         tracing::info!(
+            encode_ms,
+            self_check_ms,
             serialize_ms,
             write_ms,
             frame_bytes,
@@ -1460,6 +1514,8 @@ fn record_frame_persistence_phases(serialize_ms: u128, write_ms: u128, frame_byt
         );
     } else {
         tracing::debug!(
+            encode_ms,
+            self_check_ms,
             serialize_ms,
             write_ms,
             frame_bytes,
@@ -14742,6 +14798,8 @@ mod tests {
 
         let rounds = 8usize;
         let mut wall = Vec::with_capacity(rounds);
+        let mut encode = Vec::with_capacity(rounds);
+        let mut self_check = Vec::with_capacity(rounds);
         let mut write = Vec::with_capacity(rounds);
         let mut serialize = Vec::with_capacity(rounds);
         let mut payload = Vec::with_capacity(rounds);
@@ -14765,13 +14823,17 @@ mod tests {
             let phases = last_persistence_phases().expect("the publication recorded its phases");
             let after = directory_bytes(&namespace);
             eprintln!(
-                "round {round}: commit {elapsed_ms:.1} ms, serialize {} ms, write {} ms, payload {} bytes, namespace grew {} bytes",
+                "round {round}: commit {elapsed_ms:.1} ms, encode {} ms, self-check {} ms, serialize {} ms, write {} ms, payload {} bytes, namespace grew {} bytes",
+                phases.encode_ms,
+                phases.self_check_ms,
                 phases.serialize_ms,
                 phases.write_ms,
                 phases.payload_bytes,
                 after.saturating_sub(before)
             );
             wall.push(elapsed_ms);
+            encode.push(phases.encode_ms as f64);
+            self_check.push(phases.self_check_ms as f64);
             write.push(phases.write_ms as f64);
             serialize.push(phases.serialize_ms as f64);
             payload.push(phases.payload_bytes as f64);
@@ -14782,8 +14844,10 @@ mod tests {
             samples[samples.len() / 2]
         };
         eprintln!(
-            "medians over {rounds} publications: commit {:.1} ms, serialize {:.1} ms, write {:.1} ms, payload {:.0} bytes, namespace growth {:.0} bytes",
+            "medians over {rounds} publications: commit {:.1} ms, encode {:.1} ms, self-check {:.1} ms, serialize {:.1} ms, write {:.1} ms, payload {:.0} bytes, namespace growth {:.0} bytes",
             median(&mut wall),
+            median(&mut encode),
+            median(&mut self_check),
             median(&mut serialize),
             median(&mut write),
             median(&mut payload),
