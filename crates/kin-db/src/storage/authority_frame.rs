@@ -23,7 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 use kin_model::{
     ExternalChangeAlias, ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority,
@@ -36,7 +37,49 @@ use crate::storage::backend::Generation;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::repository::{
     derive_change_children, ChangeAdmissionPolicy, PersistedRepositoryAuthority,
+    PublicationPhaseTimer,
 };
+
+/// How a frame moves the envelope's Git external authority.
+///
+/// The envelope value is an `Option`, so a removal is an absence, and an
+/// absence nested inside another `Option` does not survive MessagePack:
+/// `Some(None)` and `None` both encode as nil. The patch is therefore an
+/// explicit three-way enum, and every variant has its own wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GitExternalAuthorityPatch {
+    /// The successor carries the base's Git authority unchanged.
+    Unchanged,
+    /// The successor installed or replaced the Git authority with this value.
+    Set(GitExternalAuthority),
+    /// The successor removed the Git authority.
+    Cleared,
+}
+
+impl GitExternalAuthorityPatch {
+    /// The patch that carries `base` to `successor`.
+    pub fn between(
+        base: &Option<GitExternalAuthority>,
+        successor: &Option<GitExternalAuthority>,
+    ) -> Self {
+        if successor == base {
+            Self::Unchanged
+        } else {
+            match successor {
+                Some(authority) => Self::Set(authority.clone()),
+                None => Self::Cleared,
+            }
+        }
+    }
+
+    fn apply_to(&self, target: &mut Option<GitExternalAuthority>) {
+        match self {
+            Self::Unchanged => {}
+            Self::Set(authority) => *target = Some(authority.clone()),
+            Self::Cleared => *target = None,
+        }
+    }
+}
 
 /// One acknowledged successor of a repository-authority state, as a patch over
 /// the state it extends.
@@ -61,8 +104,8 @@ pub struct AuthorityFrame {
     pub external_objects: Vec<ExternalObjectRecord>,
     /// External change aliases absent from the base, sorted by object id.
     pub aliases: Vec<ExternalChangeAlias>,
-    /// `Some(replacement)` only when the successor moved the Git authority.
-    pub git_external_authority: Option<Option<GitExternalAuthority>>,
+    /// How the successor moved the Git authority, if it did.
+    pub git_external_authority: GitExternalAuthorityPatch,
     /// The successor's complete ref state; refs move and disappear.
     pub ref_state: RepositoryRefState,
     /// Successor workspaces that differ from the base, sorted by workspace id.
@@ -78,7 +121,11 @@ impl AuthorityFrame {
     pub const MAGIC: [u8; 4] = *b"KNAF";
 
     /// Current frame format version.
-    pub const CURRENT_VERSION: u32 = 1;
+    ///
+    /// Version 1 carried the Git authority patch as a nested `Option`, which
+    /// the wire cannot represent; it never reached a release, and a reader
+    /// refuses it by version rather than misreading it.
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -236,32 +283,58 @@ impl AuthorityFrame {
         Ok(())
     }
 
-    /// Drain the mutation that carried `current` to `next` into one frame, and
-    /// prove before returning it that applying the frame to `current`
-    /// reproduces `next` exactly.
+    /// Encode the mutation that carried `current` to `next` as the frame the
+    /// writer may persist, proven from its own wire bytes.
+    ///
+    /// This is the only way to obtain a [`ProvenFrame`], and it returns one
+    /// only after the frame has been drained, serialized, decoded back from
+    /// exactly the bytes that will be persisted, applied to a copy of
+    /// `current` with the reader's own [`apply`](Self::apply), and compared
+    /// with `next` collection by collection. A frame the wire cannot carry, or
+    /// a drain that misses a mutation, is refused here, and the caller persists
+    /// a full snapshot instead.
     ///
     /// Both snapshots must carry a repository authority envelope, and `next`
     /// must be the immediate successor of `current`. This computes no diff over
     /// the store: new changes are found by probing the successor's change ids
     /// against the base, and every sorted envelope sequence is walked once
     /// against its base counterpart.
+    pub(crate) fn encode_proven(
+        current: &GraphSnapshot,
+        next: &GraphSnapshot,
+    ) -> Result<ProvenFrame, KinDbError> {
+        let mut timer = PublicationPhaseTimer::start();
+        #[allow(unused_mut)]
+        let mut frame = Self::drain(current, next)?;
+        #[cfg(test)]
+        if let Some(tamper) = take_drained_frame_tamper() {
+            tamper(&mut frame);
+        }
+        let drain_ms = timer.lap_ms();
+        let bytes = frame.to_bytes()?;
+        let serialize_ms = timer.lap_ms();
+        Self::from_bytes(&bytes)?.prove_reproduces(current, next)?;
+        let self_check_ms = timer.lap_ms();
+        Ok(ProvenFrame {
+            bytes,
+            drain_ms,
+            serialize_ms,
+            self_check_ms,
+        })
+    }
+
+    /// The proven frame decoded from its bytes, for tests that inspect what
+    /// the writer built.
     #[cfg(test)]
     pub(crate) fn encode(
         current: &GraphSnapshot,
         next: &GraphSnapshot,
     ) -> Result<Self, KinDbError> {
-        let frame = Self::drain(current, next)?;
-        frame.prove_reproduces(current, next)?;
-        Ok(frame)
+        Self::from_bytes(Self::encode_proven(current, next)?.bytes())
     }
 
     /// Drain the mutation into a frame without proving reproduction.
-    ///
-    /// The production writer calls this and then
-    /// [`prove_reproduces`](Self::prove_reproduces) as two timed steps and
-    /// never persists a frame it has not proven; [`encode`](Self::encode) is
-    /// the same pair for tests.
-    pub(crate) fn drain(current: &GraphSnapshot, next: &GraphSnapshot) -> Result<Self, KinDbError> {
+    fn drain(current: &GraphSnapshot, next: &GraphSnapshot) -> Result<Self, KinDbError> {
         let base = current.repository_authority.as_ref().ok_or_else(|| {
             KinDbError::StorageError(
                 "authority frame base carries no repository authority envelope".to_string(),
@@ -323,9 +396,10 @@ impl AuthorityFrame {
             |record| record.object,
         );
         let aliases = absent_from_base(&base.aliases, &successor.aliases, |alias| alias.oid);
-        let git_external_authority = (successor.git_external_authority
-            != base.git_external_authority)
-            .then(|| successor.git_external_authority.clone());
+        let git_external_authority = GitExternalAuthorityPatch::between(
+            &base.git_external_authority,
+            &successor.git_external_authority,
+        );
         let base_workspaces: BTreeMap<_, _> = base
             .workspaces
             .iter()
@@ -356,64 +430,25 @@ impl AuthorityFrame {
         Ok(frame)
     }
 
-    /// The writer's own check that the reader's `apply` reconstructs `next`
-    /// from `current` and this frame.
+    /// The writer's own check that the reader's [`apply`](Self::apply)
+    /// reconstructs `next` from `current` and this frame.
     ///
-    /// The envelope is reconstructed with the exact reader code path and
-    /// compared whole. Changes are immutable and the frame carries only ids
-    /// absent from the base, so key-set identity is value identity there.
-    pub(crate) fn prove_reproduces(
+    /// The frame is applied to a copy of `current` through the exact reader
+    /// code path and the result is compared with `next` whole: every
+    /// `GraphSnapshot` collection, not only the ones a frame patches, so a
+    /// mutation the drain missed anywhere in the successor is refused here.
+    fn prove_reproduces(
         &self,
         current: &GraphSnapshot,
         next: &GraphSnapshot,
     ) -> Result<(), KinDbError> {
-        let base = current.repository_authority.as_ref().ok_or_else(|| {
-            KinDbError::StorageError(
-                "authority frame base carries no repository authority envelope".to_string(),
-            )
-        })?;
-        let successor = next.repository_authority.as_ref().ok_or_else(|| {
-            KinDbError::StorageError(
-                "authority frame successor carries no repository authority envelope".to_string(),
-            )
-        })?;
-        let reconstructed = self.apply_to_envelope(base.clone())?;
-        if reconstructed != *successor {
+        let mut reconstructed = current.clone();
+        self.apply(&mut reconstructed)?;
+        if let Some(collection) = first_difference(&reconstructed, next) {
             return Err(KinDbError::StorageError(format!(
-                "authority frame for generation {} does not reproduce the successor envelope; refusing to persist it",
+                "authority frame for generation {} does not reproduce the successor: {collection} differ; refusing to persist it",
                 self.generation()
             )));
-        }
-        let expected_changes = current.changes.len().checked_add(self.changes.len());
-        if expected_changes != Some(next.changes.len()) {
-            return Err(KinDbError::StorageError(format!(
-                "authority frame for generation {} does not account for the successor's changes: base {}, frame {}, successor {}",
-                self.generation(),
-                current.changes.len(),
-                self.changes.len(),
-                next.changes.len()
-            )));
-        }
-        for change in &self.changes {
-            if current.changes.contains_key(&change.id) {
-                return Err(KinDbError::StorageError(format!(
-                    "authority frame for generation {} re-adds change {} the base already carries",
-                    self.generation(),
-                    change.id
-                )));
-            }
-        }
-        if !next.entity_revisions.is_empty() {
-            return Err(KinDbError::StorageError(
-                "authority frame successor carries entity revisions, which authority never persists"
-                    .to_string(),
-            ));
-        }
-        if next.change_children != derive_change_children(&next.changes) {
-            return Err(KinDbError::StorageError(
-                "authority frame successor change-child index does not derive from its history"
-                    .to_string(),
-            ));
         }
         Ok(())
     }
@@ -493,9 +528,8 @@ impl AuthorityFrame {
             "external alias",
             generation,
         )?;
-        if let Some(git_external_authority) = &self.git_external_authority {
-            envelope.git_external_authority = git_external_authority.clone();
-        }
+        self.git_external_authority
+            .apply_to(&mut envelope.git_external_authority);
         envelope.ref_state = self.ref_state.clone();
         let mut workspaces: BTreeMap<_, _> = envelope
             .workspaces
@@ -543,6 +577,277 @@ impl AuthorityFrame {
             .sort_by_key(|receipt| receipt.operation_id);
         Ok(envelope)
     }
+}
+
+/// One frame the writer may persist: its exact wire bytes, decoded back from
+/// those bytes and proven to reproduce the successor, with the split of the
+/// writer-side work that proved it.
+///
+/// The fields are private and the only constructor is
+/// [`AuthorityFrame::encode_proven`], so no caller can hand storage frame
+/// bytes the writer has not proven from those same bytes.
+pub(crate) struct ProvenFrame {
+    bytes: Vec<u8>,
+    drain_ms: u128,
+    serialize_ms: u128,
+    self_check_ms: u128,
+}
+
+impl ProvenFrame {
+    /// The frame's wire bytes, exactly the bytes the proof decoded.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Milliseconds spent draining the mutation into the frame.
+    pub(crate) fn drain_ms(&self) -> u128 {
+        self.drain_ms
+    }
+
+    /// Milliseconds spent on MessagePack plus the header and checksum.
+    pub(crate) fn serialize_ms(&self) -> u128 {
+        self.serialize_ms
+    }
+
+    /// Milliseconds spent decoding the bytes back, applying the decoded frame
+    /// to a copy of the base, and comparing the result with the successor.
+    pub(crate) fn self_check_ms(&self) -> u128 {
+        self.self_check_ms
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DRAINED_FRAME_TAMPER: std::cell::RefCell<Option<Box<dyn FnOnce(&mut AuthorityFrame)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Mutate the next frame the production writer drains on this thread, after
+/// it is drained and before it is serialized and proven.
+///
+/// This is the fault hook that makes the writer's proof falsifiable: a frame
+/// tampered here decodes and applies cleanly, so only the proof can tell that
+/// it does not reproduce the successor.
+#[cfg(test)]
+pub(crate) fn tamper_with_next_drained_frame(tamper: impl FnOnce(&mut AuthorityFrame) + 'static) {
+    DRAINED_FRAME_TAMPER.with(|slot| *slot.borrow_mut() = Some(Box::new(tamper)));
+}
+
+#[cfg(test)]
+fn take_drained_frame_tamper() -> Option<Box<dyn FnOnce(&mut AuthorityFrame)>> {
+    DRAINED_FRAME_TAMPER.with(|slot| slot.borrow_mut().take())
+}
+
+/// Name the first `GraphSnapshot` collection in which `reconstructed` differs
+/// from `next`, or `None` when the two are the same state.
+///
+/// Both snapshots are destructured field by field with no rest pattern, so a
+/// collection added to `GraphSnapshot` later does not compile here until this
+/// comparison names it. Collections whose element types carry `PartialEq` are
+/// compared directly; the others are compared element by element through the
+/// MessagePack form a full snapshot would have persisted them in.
+fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Option<&'static str> {
+    let GraphSnapshot {
+        version,
+        entities,
+        relations,
+        outgoing,
+        incoming,
+        changes,
+        change_children,
+        work_items,
+        annotations,
+        work_links,
+        reviews,
+        review_decisions,
+        review_notes,
+        review_discussions,
+        review_assignments,
+        test_cases,
+        assertions,
+        verification_runs,
+        mock_hints,
+        contracts,
+        actors,
+        delegations,
+        approvals,
+        audit_events,
+        shallow_files,
+        file_layouts,
+        structured_artifacts,
+        opaque_artifacts,
+        resolved_tree,
+        sessions,
+        intents,
+        downstream_warnings,
+        entity_revisions,
+        repository_authority,
+        external_references,
+    } = reconstructed;
+    let GraphSnapshot {
+        version: next_version,
+        entities: next_entities,
+        relations: next_relations,
+        outgoing: next_outgoing,
+        incoming: next_incoming,
+        changes: next_changes,
+        change_children: next_change_children,
+        work_items: next_work_items,
+        annotations: next_annotations,
+        work_links: next_work_links,
+        reviews: next_reviews,
+        review_decisions: next_review_decisions,
+        review_notes: next_review_notes,
+        review_discussions: next_review_discussions,
+        review_assignments: next_review_assignments,
+        test_cases: next_test_cases,
+        assertions: next_assertions,
+        verification_runs: next_verification_runs,
+        mock_hints: next_mock_hints,
+        contracts: next_contracts,
+        actors: next_actors,
+        delegations: next_delegations,
+        approvals: next_approvals,
+        audit_events: next_audit_events,
+        shallow_files: next_shallow_files,
+        file_layouts: next_file_layouts,
+        structured_artifacts: next_structured_artifacts,
+        opaque_artifacts: next_opaque_artifacts,
+        resolved_tree: next_resolved_tree,
+        sessions: next_sessions,
+        intents: next_intents,
+        downstream_warnings: next_downstream_warnings,
+        entity_revisions: next_entity_revisions,
+        repository_authority: next_repository_authority,
+        external_references: next_external_references,
+    } = next;
+    let checks = [
+        ("versions", version == next_version),
+        ("entities", entities == next_entities),
+        ("relations", relations == next_relations),
+        ("outgoing adjacency", outgoing == next_outgoing),
+        ("incoming adjacency", incoming == next_incoming),
+        ("changes", changes == next_changes),
+        ("change children", change_children == next_change_children),
+        (
+            "work items",
+            same_serialized_map(work_items, next_work_items),
+        ),
+        (
+            "annotations",
+            same_serialized_map(annotations, next_annotations),
+        ),
+        ("work links", work_links == next_work_links),
+        ("reviews", same_serialized_map(reviews, next_reviews)),
+        (
+            "review decisions",
+            same_serialized_map(review_decisions, next_review_decisions),
+        ),
+        (
+            "review notes",
+            same_serialized_seq(review_notes, next_review_notes),
+        ),
+        (
+            "review discussions",
+            same_serialized_seq(review_discussions, next_review_discussions),
+        ),
+        (
+            "review assignments",
+            same_serialized_map(review_assignments, next_review_assignments),
+        ),
+        (
+            "test cases",
+            same_serialized_map(test_cases, next_test_cases),
+        ),
+        (
+            "assertions",
+            same_serialized_map(assertions, next_assertions),
+        ),
+        (
+            "verification runs",
+            same_serialized_map(verification_runs, next_verification_runs),
+        ),
+        (
+            "mock hints",
+            same_serialized_seq(mock_hints, next_mock_hints),
+        ),
+        ("contracts", same_serialized_map(contracts, next_contracts)),
+        ("actors", same_serialized_map(actors, next_actors)),
+        (
+            "delegations",
+            same_serialized_seq(delegations, next_delegations),
+        ),
+        ("approvals", same_serialized_seq(approvals, next_approvals)),
+        (
+            "audit events",
+            same_serialized_seq(audit_events, next_audit_events),
+        ),
+        (
+            "shallow files",
+            same_serialized_seq(shallow_files, next_shallow_files),
+        ),
+        (
+            "file layouts",
+            same_serialized_seq(file_layouts, next_file_layouts),
+        ),
+        (
+            "structured artifacts",
+            same_serialized_seq(structured_artifacts, next_structured_artifacts),
+        ),
+        (
+            "opaque artifacts",
+            same_serialized_seq(opaque_artifacts, next_opaque_artifacts),
+        ),
+        ("resolved trees", resolved_tree == next_resolved_tree),
+        ("sessions", same_serialized_map(sessions, next_sessions)),
+        ("intents", same_serialized_map(intents, next_intents)),
+        (
+            "downstream warnings",
+            downstream_warnings == next_downstream_warnings,
+        ),
+        (
+            "entity revisions",
+            same_serialized_map(entity_revisions, next_entity_revisions),
+        ),
+        (
+            "repository authority envelopes",
+            repository_authority == next_repository_authority,
+        ),
+        (
+            "external references",
+            external_references == next_external_references,
+        ),
+    ];
+    checks
+        .into_iter()
+        .find_map(|(collection, same)| (!same).then_some(collection))
+}
+
+fn same_serialized<T: Serialize>(left: &T, right: &T) -> bool {
+    match (rmp_serde::to_vec(left), rmp_serde::to_vec(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn same_serialized_seq<T: Serialize>(left: &[T], right: &[T]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| same_serialized(left, right))
+}
+
+fn same_serialized_map<K: Eq + Hash, V: Serialize>(
+    left: &HashMap<K, V>,
+    right: &HashMap<K, V>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, value)| {
+            right
+                .get(key)
+                .is_some_and(|other| same_serialized(value, other))
+        })
 }
 
 /// Successor entries whose key is absent from the sorted, unique base
@@ -707,6 +1012,37 @@ mod tests {
         assert!(
             error.to_string().contains("deserialization failed"),
             "{error}"
+        );
+    }
+
+    /// The removal patch exists because a nested `Option` cannot say
+    /// "cleared" on this wire: `Some(None)` and `None` are one nil byte each
+    /// and decode as `None`. The unit-shaped variants of the patch encode
+    /// distinctly and come back as themselves; the `Set` variant is exercised
+    /// with a real Git authority by the repository tests.
+    #[test]
+    fn a_nested_option_cannot_carry_a_removal_but_the_patch_can() {
+        let nested_removed = rmp_serde::to_vec(&Some(None::<u32>)).unwrap();
+        let nested_unchanged = rmp_serde::to_vec(&None::<Option<u32>>).unwrap();
+        assert_eq!(nested_removed, nested_unchanged, "both are one nil byte");
+        let decoded: Option<Option<u32>> = rmp_serde::from_slice(&nested_removed).unwrap();
+        assert_eq!(decoded, None, "the removal decodes as unchanged");
+
+        let unchanged = rmp_serde::to_vec(&GitExternalAuthorityPatch::Unchanged).unwrap();
+        let cleared = rmp_serde::to_vec(&GitExternalAuthorityPatch::Cleared).unwrap();
+        assert_ne!(unchanged, cleared);
+        assert_eq!(
+            rmp_serde::from_slice::<GitExternalAuthorityPatch>(&unchanged).unwrap(),
+            GitExternalAuthorityPatch::Unchanged
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<GitExternalAuthorityPatch>(&cleared).unwrap(),
+            GitExternalAuthorityPatch::Cleared
+        );
+
+        assert_eq!(
+            GitExternalAuthorityPatch::between(&None, &None),
+            GitExternalAuthorityPatch::Unchanged
         );
     }
 

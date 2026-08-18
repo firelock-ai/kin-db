@@ -1007,10 +1007,25 @@ struct PersistenceState {
     journal_frames: u64,
     /// Serialized length of those frames together.
     journal_bytes: u64,
-    /// The frame bytes of a candidate whose append returned indeterminate,
-    /// keyed by the successor generation, so reconciliation can compare the
-    /// exact bytes it tried to install rather than re-encode them.
-    pending_frame: Option<(Generation, Vec<u8>)>,
+    /// The frame of a candidate whose append returned indeterminate, retained
+    /// so reconciliation compares the exact bytes it tried to install rather
+    /// than re-encoding them.
+    pending_frame: Option<PendingFrame>,
+}
+
+/// A retained frame candidate, bound to the exact successor it was encoded
+/// for.
+///
+/// Reconciliation consults it only for the candidate whose roots these are.
+/// A generation alone would not do: after a reconciliation proves the frame
+/// was not committed the publication drops that candidate, and a later
+/// successor at the same generation is a different state whose own persist
+/// outcome must not be read through this frame.
+#[derive(Debug, Clone)]
+struct PendingFrame {
+    /// `roots_after` of the successor the frame produces.
+    roots: RootBundle,
+    bytes: Vec<u8>,
 }
 
 /// How many authority frames may follow one full snapshot before the next
@@ -1045,17 +1060,6 @@ fn authority_journal_max_frames() -> u64 {
     )
 }
 
-/// One encoded frame with the split of the writer-side work it cost.
-struct EncodedFrame {
-    bytes: Vec<u8>,
-    /// Draining the mutation into the frame.
-    encode_ms: u128,
-    /// Applying the frame to the base envelope and comparing with the successor.
-    self_check_ms: u128,
-    /// MessagePack plus header and checksum.
-    serialize_ms: u128,
-}
-
 /// Which durable shape one publication takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationShape {
@@ -1072,8 +1076,6 @@ struct RepositorySnapshotPersistence<B: StorageBackend + ?Sized> {
     /// Frame bound in force for this repository. Read once from the process
     /// environment at open; tests lower it to exercise the promotion.
     max_journal_frames: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    break_frame_encoder: std::sync::atomic::AtomicBool,
     /// Test-only replacement for the base byte length the journal may grow
     /// to, so a small fixture can exercise frames without a large base.
     #[cfg(test)]
@@ -1106,8 +1108,6 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                 pending_frame: None,
             }),
             max_journal_frames: std::sync::atomic::AtomicU64::new(authority_journal_max_frames()),
-            #[cfg(test)]
-            break_frame_encoder: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             journal_byte_bound_for_test: Mutex::new(None),
         }
@@ -1223,39 +1223,17 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
-    /// Encode the frame that carries `current` to `next`, or say why the
-    /// publication must be a full snapshot instead.
+    /// Encode the frame that carries `current` to `next`, proven from its own
+    /// wire bytes, or say why the publication must be a full snapshot instead.
     fn encode_frame(
         &self,
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
-    ) -> Result<EncodedFrame, KinDbError> {
-        #[cfg(test)]
-        if self
-            .break_frame_encoder
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(storage(
-                "injected authority frame encoder fault: the frame does not reproduce the successor"
-                    .to_string(),
-            ));
-        }
-        let mut timer = PublicationPhaseTimer::start();
-        let frame = crate::storage::authority_frame::AuthorityFrame::drain(
+    ) -> Result<crate::storage::authority_frame::ProvenFrame, KinDbError> {
+        crate::storage::authority_frame::AuthorityFrame::encode_proven(
             &current.snapshot,
             &next.snapshot,
-        )?;
-        let encode_ms = timer.lap_ms();
-        frame.prove_reproduces(&current.snapshot, &next.snapshot)?;
-        let self_check_ms = timer.lap_ms();
-        let bytes = frame.to_bytes()?;
-        let serialize_ms = timer.lap_ms();
-        Ok(EncodedFrame {
-            bytes,
-            encode_ms,
-            self_check_ms,
-            serialize_ms,
-        })
+        )
     }
 
     /// Append one validated authority frame at the current cursor.
@@ -1270,7 +1248,6 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         if matches!(outcome, PersistOutcome::Committed) {
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
-            state.pending_frame = None;
         }
         outcome
     }
@@ -1284,11 +1261,15 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     ) -> PersistOutcome {
         let mut timer = PublicationPhaseTimer::start();
         let mut state = self.state.lock();
+        // A persist call means the publication holds no retained candidate:
+        // an earlier one was either reconciled as committed or dropped, and a
+        // frame retained for it must not outlive that decision.
+        state.pending_frame = None;
         let frame = if self.frame_is_candidate(&state) {
             match self.encode_frame(current, next) {
                 Ok(frame) => Some(frame),
                 Err(error) => {
-                    // The encoder refusing its own frame is a kin-db defect,
+                    // The writer refusing its own frame is a kin-db defect,
                     // never a durability question: the successor is still
                     // fully validated, so it is persisted whole and the defect
                     // is reported where an operator will see it.
@@ -1305,22 +1286,22 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             None
         };
         let shape = match &frame {
-            Some(frame) => self.publication_shape(&state, frame.bytes.len() as u64),
+            Some(frame) => self.publication_shape(&state, frame.bytes().len() as u64),
             None => PublicationShape::FullSnapshot,
         };
         match (shape, frame) {
             (PublicationShape::Frame, Some(frame)) => {
-                let EncodedFrame {
-                    bytes: frame,
-                    encode_ms,
-                    self_check_ms,
-                    serialize_ms,
-                } = frame;
+                let encode_ms = frame.drain_ms();
+                let self_check_ms = frame.self_check_ms();
+                let serialize_ms = frame.serialize_ms();
                 timer.lap_ms();
-                let frame_bytes = frame.len();
-                let outcome = self.persist_frame_bytes(&frame, &mut state);
+                let frame_bytes = frame.bytes().len();
+                let outcome = self.persist_frame_bytes(frame.bytes(), &mut state);
                 if let PersistOutcome::Indeterminate(_) = &outcome {
-                    state.pending_frame = Some((next.generation(), frame));
+                    state.pending_frame = Some(PendingFrame {
+                        roots: next.roots().clone(),
+                        bytes: frame.bytes().to_vec(),
+                    });
                 }
                 let write_ms = timer.lap_ms();
                 record_frame_persistence_phases(
@@ -1390,7 +1371,6 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             state.cursor = installed_cursor;
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
-            state.pending_frame = None;
             return Ok(PersistOutcome::Committed);
         }
         Ok(PersistOutcome::NotCommitted(storage(format!(
@@ -1405,12 +1385,6 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     fn set_max_journal_frames_for_test(&self, max_frames: u64) {
         self.max_journal_frames
             .store(max_frames, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn break_frame_encoder_for_test(&self, broken: bool) {
-        self.break_frame_encoder
-            .store(broken, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1431,7 +1405,8 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
 struct PersistencePhases {
     /// Frame publications only: draining the mutation into a frame.
     encode_ms: u128,
-    /// Frame publications only: the writer's reproduction proof.
+    /// Frame publications only: decoding the frame bytes back, applying them
+    /// to a copy of the base, and comparing the result with the successor.
     self_check_ms: u128,
     serialize_ms: u128,
     write_ms: u128,
@@ -1484,8 +1459,8 @@ fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapsh
 /// Name the phases of one frame publication.
 ///
 /// The writer-side work is split so a slow frame publication can say whether
-/// draining the mutation, proving the frame reproduces the successor, or the
-/// durable write cost the time.
+/// draining the mutation, serializing the frame, proving that the decoded
+/// bytes reproduce the successor, or the durable write cost the time.
 fn record_frame_persistence_phases(
     encode_ms: u128,
     self_check_ms: u128,
@@ -1600,17 +1575,20 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
     ) -> PersistOutcome {
         let mut state = self.state.lock();
         // A retained frame candidate is reconciled against the exact bytes the
-        // append tried to install.
-        let pending_frame = state
-            .pending_frame
-            .as_ref()
-            .filter(|(generation, _)| *generation == next.generation())
-            .map(|(_, frame)| frame.clone());
-        if let Some(frame) = pending_frame {
-            return match self.reconcile_frame(&mut state, &frame) {
-                Ok(outcome) => outcome,
-                Err(error) => PersistOutcome::Indeterminate(error),
-            };
+        // append tried to install, and only for the successor it was encoded
+        // for. It stays retained only while its outcome is still unknown; a
+        // committed or refused frame is dropped with the candidate.
+        if let Some(pending) = state.pending_frame.take() {
+            if pending.roots == *next.roots() {
+                let outcome = match self.reconcile_frame(&mut state, &pending.bytes) {
+                    Ok(outcome) => outcome,
+                    Err(error) => PersistOutcome::Indeterminate(error),
+                };
+                if matches!(outcome, PersistOutcome::Indeterminate(_)) {
+                    state.pending_frame = Some(pending);
+                }
+                return outcome;
+            }
         }
         let _ = current;
         // A reconciled full-snapshot candidate is the exact retained `Arc` a
@@ -2558,18 +2536,18 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
 /// Each lap returns whole milliseconds since the previous lap, so the summary
 /// event carries one field per phase and the fields sum to the prepare wall
 /// clock within rounding.
-struct PublicationPhaseTimer {
+pub(crate) struct PublicationPhaseTimer {
     last: std::time::Instant,
 }
 
 impl PublicationPhaseTimer {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         Self {
             last: std::time::Instant::now(),
         }
     }
 
-    fn lap_ms(&mut self) -> u128 {
+    pub(crate) fn lap_ms(&mut self) -> u128 {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last).as_millis();
         self.last = now;
@@ -14915,8 +14893,8 @@ mod tests {
 
     /// One workspace-scoped publication that adds a fresh entity to the
     /// overlay; the shape every forced tree admission and ambient tick takes.
-    fn overlay_publication(
-        manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    fn overlay_publication<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
         operation: u128,
         fingerprint_seed: u8,
     ) -> RepositoryTransaction {
@@ -15033,15 +15011,65 @@ mod tests {
             );
         }
 
-        // Git import: external objects, aliases, and a Git authority delta.
-        let (import, _, _) = detached_tag_import_transaction(&manager);
-        manager.commit_repository_transaction(import).unwrap();
+        // Git authority lifecycle: an import initializes it (external objects,
+        // aliases, imported changes, and the authority itself), an update
+        // replaces it, and a removal clears it. The removal is the one shape
+        // whose envelope value is an absence, so a frame has to carry it as an
+        // explicit patch rather than as a missing value.
+        let fixture = git_authority_transaction_fixture(&manager, 0xf2_2347_2005);
+        manager
+            .commit_repository_transaction(fixture.transaction.clone())
+            .unwrap();
         expected_frames += 1;
         assert_eq!(acknowledged_frame_count(&directory), expected_frames);
         assert_same_authority(
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "git import",
+        );
+
+        let mut update = transaction_shell(&manager, 0xf2_2347_2006);
+        update.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            fixture.authority.clone(),
+            fixture.direct_authority.clone(),
+        ));
+        manager.commit_repository_transaction(update).unwrap();
+        expected_frames += 1;
+        assert_eq!(acknowledged_frame_count(&directory), expected_frames);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "git authority update",
+        );
+
+        let mut removal = transaction_shell(&manager, 0xf2_2347_2007);
+        removal.git_authority_delta = Some(GitExternalAuthorityDelta::remove(
+            fixture.direct_authority.clone(),
+        ));
+        manager.commit_repository_transaction(removal).unwrap();
+        expected_frames += 1;
+        assert_eq!(acknowledged_frame_count(&directory), expected_frames);
+        assert!(
+            manager
+                .read_authority()
+                .metadata()
+                .git_external_authority
+                .is_none(),
+            "the removal published"
+        );
+        let reopened = reopen(&directory);
+        assert!(
+            reopened
+                .read_authority()
+                .metadata()
+                .git_external_authority
+                .is_none(),
+            "a reopened store must not serve a Git authority the repository removed"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "git authority removal",
         );
 
         // Merge record open and drop: upsert then removal in the envelope.
@@ -15080,6 +15108,107 @@ mod tests {
             receipt.total_payload_bytes(),
             receipt.snapshot_bytes() + receipt.acknowledged_delta_bytes()
         );
+    }
+
+    /// The detached-tag import is the frame shape that carries a tag ref, a
+    /// detached workspace, a second local overlay, and an imported change
+    /// with its own admission policy delta in one publication.
+    #[test]
+    fn authority_frames_carry_a_detached_tag_import_and_reopen_exactly() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (import, change_id, tag) = detached_tag_import_transaction(&manager);
+        manager.commit_repository_transaction(import).unwrap();
+        assert_eq!(record_version(&directory), 4);
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        let frame = crate::storage::AuthorityFrame::from_bytes(
+            &std::fs::read(frame_path(&directory, 2)).unwrap(),
+        )
+        .unwrap();
+        assert!(frame.changes.iter().any(|change| change.id == change_id));
+        assert!(frame
+            .external_objects
+            .iter()
+            .any(|record| record.object == tag));
+        assert!(matches!(
+            frame.git_external_authority,
+            crate::storage::authority_frame::GitExternalAuthorityPatch::Set(_)
+        ));
+        assert_eq!(frame.local_overlays.len(), 2, "the import added an overlay");
+        let reopened = reopen(&directory);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "detached tag import",
+        );
+        assert!(reopened.opened_by_history_validation());
+    }
+
+    /// Every variant of the Git authority patch has its own wire shape and
+    /// comes back from the frame bytes as itself. Version 1 carried the patch
+    /// as `Option<Option<_>>`, whose removal shape encoded like an absence and
+    /// decoded as unchanged.
+    #[test]
+    fn every_git_authority_patch_variant_survives_the_frame_wire() {
+        use crate::storage::authority_frame::GitExternalAuthorityPatch;
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2101, 0x21))
+            .unwrap();
+        let fixture = git_authority_transaction_fixture(&manager, 0xf2_2347_2102);
+        manager
+            .commit_repository_transaction(fixture.transaction.clone())
+            .unwrap();
+        let mut removal = transaction_shell(&manager, 0xf2_2347_2103);
+        removal.git_authority_delta =
+            Some(GitExternalAuthorityDelta::remove(fixture.authority.clone()));
+        manager.commit_repository_transaction(removal).unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 3);
+
+        let persisted = |generation: Generation| {
+            let bytes = std::fs::read(frame_path(&directory, generation)).unwrap();
+            let frame = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                frame.to_bytes().unwrap(),
+                bytes,
+                "generation {generation}: re-encoding the decoded frame yields the persisted bytes"
+            );
+            frame
+        };
+        assert_eq!(
+            persisted(2).git_external_authority,
+            GitExternalAuthorityPatch::Unchanged
+        );
+        assert_eq!(
+            persisted(3).git_external_authority,
+            GitExternalAuthorityPatch::Set(fixture.authority.clone())
+        );
+        assert_eq!(
+            persisted(4).git_external_authority,
+            GitExternalAuthorityPatch::Cleared
+        );
+
+        // Each variant on the same frame round-trips as itself, and no two
+        // variants share bytes.
+        let template = persisted(2);
+        let mut encodings = Vec::new();
+        for patch in [
+            GitExternalAuthorityPatch::Unchanged,
+            GitExternalAuthorityPatch::Set(fixture.authority.clone()),
+            GitExternalAuthorityPatch::Cleared,
+        ] {
+            let mut frame = template.clone();
+            frame.git_external_authority = patch.clone();
+            let bytes = frame.to_bytes().unwrap();
+            let decoded = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, frame, "{patch:?} survives the wire");
+            assert_eq!(decoded.git_external_authority, patch);
+            encodings.push(bytes);
+        }
+        assert_ne!(encodings[0], encodings[1]);
+        assert_ne!(encodings[0], encodings[2]);
+        assert_ne!(encodings[1], encodings[2]);
     }
 
     #[test]
@@ -15270,8 +15399,20 @@ mod tests {
     fn a_frame_acknowledged_over_the_wrong_base_refuses_the_open() {
         let directory = TempDir::new().unwrap();
         let (_backend, manager) = framed_local_repository(&directory);
-        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2304);
-        manager.commit_repository_transaction(removal).unwrap();
+        // A workspace-only publication carries no change, so the duplicated
+        // frame below is not caught by the change re-add check and the open
+        // is decided by the roots binding alone.
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2304, 0x74))
+            .unwrap();
+        let frame = crate::storage::AuthorityFrame::from_bytes(
+            &std::fs::read(frame_path(&directory, 2)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            frame.changes.is_empty(),
+            "the fixture frame carries no change"
+        );
         drop(manager);
         // Acknowledge the same frame a second time at the next generation: its
         // bytes are intact and its digest binds, but it names the roots of the
@@ -15291,8 +15432,87 @@ mod tests {
         write_authority_json(directory.path(), &record);
         let error = reopen_error(&directory);
         assert!(
-            error.contains("does not extend the base") || error.contains("re-adds"),
-            "a frame over the wrong base must be named as such: {error}"
+            error.contains("does not extend the base"),
+            "a frame over the wrong base must be refused by the roots binding: {error}"
+        );
+    }
+
+    /// Recursively copy one store directory so a second writer can extend the
+    /// same base independently.
+    fn copy_store(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_store(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// The two digest-binding tests above corrupt frame bytes, which the
+    /// frame's own checksum also refuses. This one swaps in a frame that is
+    /// well formed, checksums, decodes, and would apply cleanly over the same
+    /// base, so the record's acknowledged digest is the only thing that can
+    /// refuse it.
+    #[test]
+    fn a_well_formed_frame_swapped_in_at_an_acknowledged_generation_is_refused_by_the_record_digest_alone(
+    ) {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        // Two writers extend the same base with different publications.
+        let sibling = TempDir::new().unwrap();
+        copy_store(directory.path(), sibling.path());
+        let manager = reopen(&directory);
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2307, 0x75))
+            .unwrap();
+        let other = reopen(&sibling);
+        other
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        other
+            .commit_repository_transaction(overlay_publication(&other, 0xf2_2347_2308, 0x76))
+            .unwrap();
+        drop(manager);
+        let acknowledged = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let swapped = std::fs::read(frame_path(&sibling, 2)).unwrap();
+        assert_ne!(
+            acknowledged, swapped,
+            "the two writers built different frames"
+        );
+        crate::storage::AuthorityFrame::from_bytes(&swapped)
+            .expect("the swapped frame is well formed and checksums");
+
+        // Swap the frame file without touching the record.
+        std::fs::write(frame_path(&directory, 2), &swapped).unwrap();
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("acknowledged delta digest mismatch"),
+            "a swapped well-formed frame must be refused by the record digest: {error}"
+        );
+
+        // The same bytes named by the record are served, which is what proves
+        // the digest was the only guard between the swapped frame and the
+        // reader: the frame extends this base, and only the record said no.
+        let mut record = read_authority_json(directory.path());
+        record["acknowledged_deltas"] = serde_json::json!([{
+            "generation": 2,
+            "sha256": hex::encode(Sha256::digest(&swapped)),
+        }]);
+        record.as_object_mut().unwrap().remove("history_validation");
+        write_authority_json(directory.path(), &record);
+        let reopened = reopen(&directory);
+        assert_same_authority(
+            &other.read_authority(),
+            &reopened.read_authority(),
+            "the swapped frame's own state",
         );
     }
 
@@ -15560,16 +15780,25 @@ mod tests {
         );
     }
 
+    /// The production writer's proof is what keeps a frame that decodes and
+    /// applies cleanly, but rebuilds a different head, out of the journal.
+    /// The fault here tampers with the drained frame inside the production
+    /// path, after the drain and before the bytes are proven, so a writer that
+    /// stopped proving would persist it as a frame and this test would see a
+    /// frame journal instead of a full snapshot.
     #[test]
-    fn a_frame_encoder_that_cannot_reproduce_the_successor_falls_back_to_a_full_snapshot() {
+    fn the_production_writer_refuses_a_frame_that_does_not_reproduce_the_successor() {
         let directory = TempDir::new().unwrap();
         let (_backend, manager) = framed_local_repository(&directory);
         manager
             .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2801, 0x50))
             .unwrap();
         assert_eq!(acknowledged_frame_count(&directory), 1);
+        let current = manager.read_authority().snapshot().clone();
 
-        manager.persistence().break_frame_encoder_for_test(true);
+        crate::storage::authority_frame::tamper_with_next_drained_frame(|frame| {
+            frame.workspaces.clear();
+        });
         manager
             .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2802, 0x51))
             .expect("a refused frame costs a full snapshot, never the publication");
@@ -15579,11 +15808,31 @@ mod tests {
             "the publication landed as a full snapshot"
         );
         assert_eq!(acknowledged_frame_count(&directory), 0);
-        manager.persistence().break_frame_encoder_for_test(false);
+        assert!(
+            !frame_path(&directory, 3).exists(),
+            "no frame was written for the refused publication"
+        );
+        let next = manager.read_authority().snapshot().clone();
         assert_same_authority(
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "fallback",
+        );
+
+        // Only the proof stood between the tampered frame and the journal: the
+        // same tampering produces bytes that verify, decode, and apply.
+        let mut tampered = crate::storage::AuthorityFrame::encode(&current, &next)
+            .expect("the honest frame proves");
+        tampered.workspaces.clear();
+        let decoded =
+            crate::storage::AuthorityFrame::from_bytes(&tampered.to_bytes().unwrap()).unwrap();
+        let mut applied = current.clone();
+        decoded
+            .apply(&mut applied)
+            .expect("the tampered frame applies without complaint");
+        assert_ne!(
+            applied.repository_authority, next.repository_authority,
+            "and rebuilds a head that is not the successor"
         );
     }
 
@@ -15677,9 +15926,9 @@ mod tests {
         let error = crate::storage::AuthorityFrame::encode(&current, &drifted)
             .expect_err("a frame that cannot reproduce the successor is refused by the writer");
         assert!(
-            error
-                .to_string()
-                .contains("does not reproduce the successor envelope"),
+            error.to_string().contains(
+                "does not reproduce the successor: repository authority envelopes differ"
+            ),
             "{error}"
         );
 
@@ -15693,8 +15942,25 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not account for the successor's changes")
-                || error.to_string().contains("does not reproduce"),
+                .contains("does not reproduce the successor: changes differ"),
+            "{error}"
+        );
+
+        // A mutation in a collection no frame patches is refused too, because
+        // the proof compares the whole snapshot, not the patched fields.
+        let mut annotated = next.clone();
+        annotated
+            .work_links
+            .push(kin_model::WorkLink::DecomposesTo {
+                parent: kin_model::WorkId::new(),
+                child: kin_model::WorkId::new(),
+            });
+        let error = crate::storage::AuthorityFrame::encode(&current, &annotated)
+            .expect_err("a successor that moved an unpatched collection is not a frame");
+        assert!(
+            error
+                .to_string()
+                .contains("does not reproduce the successor: work links differ"),
             "{error}"
         );
     }
@@ -15739,6 +16005,398 @@ mod tests {
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "reconciled",
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InjectedOutcome {
+        Indeterminate,
+        NotCommitted,
+    }
+
+    impl InjectedOutcome {
+        fn outcome(self, what: &str) -> SnapshotSaveOutcome {
+            match self {
+                Self::Indeterminate => SnapshotSaveOutcome::Indeterminate(
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "injected: the {what} outcome is unknown"
+                    )),
+                ),
+                Self::NotCommitted => {
+                    SnapshotSaveOutcome::NotCommitted(storage(format!("injected: the {what} lost")))
+                }
+            }
+        }
+    }
+
+    /// The local backend behind a fault script.
+    ///
+    /// The local backend's own indeterminacy always comes after its record
+    /// rename, so it can never report a frame append or a snapshot write as
+    /// indeterminate while nothing landed. A backend with real indeterminacy
+    /// can, and this wrapper answers the next scripted write with the scripted
+    /// outcome without touching storage; every other call is the real backend.
+    struct FaultScriptedBackend {
+        inner: Arc<LocalFileBackend>,
+        frame_faults: Mutex<std::collections::VecDeque<InjectedOutcome>>,
+        snapshot_faults: Mutex<std::collections::VecDeque<InjectedOutcome>>,
+    }
+
+    impl FaultScriptedBackend {
+        fn new(inner: Arc<LocalFileBackend>) -> Self {
+            Self {
+                inner,
+                frame_faults: Mutex::new(std::collections::VecDeque::new()),
+                snapshot_faults: Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+
+        fn script_frame_append(&self, outcome: InjectedOutcome) {
+            self.frame_faults.lock().push_back(outcome);
+        }
+
+        fn script_snapshot_write(&self, outcome: InjectedOutcome) {
+            self.snapshot_faults.lock().push_back(outcome);
+        }
+    }
+
+    impl StorageBackend for FaultScriptedBackend {
+        fn supports_incremental_deltas(&self) -> bool {
+            self.inner.supports_incremental_deltas()
+        }
+
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            self.inner.load_snapshot(repo_id)
+        }
+
+        fn save_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            data: &[u8],
+        ) -> Result<(), KinDbError> {
+            self.inner.save_source_blob(repo_id, digest, data)
+        }
+
+        fn with_source_blob_write_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(&dyn SourceBlobWriteBatch) -> Result<(), KinDbError>,
+        ) -> Result<(), KinDbError> {
+            self.inner.with_source_blob_write_batch(repo_id, operation)
+        }
+
+        fn load_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.inner.load_source_blob(repo_id, digest)
+        }
+
+        fn load_source_blob_bounded(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            max_bytes: u64,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.inner
+                .load_source_blob_bounded(repo_id, digest, max_bytes)
+        }
+
+        fn with_verified_source_blob_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+        ) -> Result<(), KinDbError> {
+            self.inner
+                .with_verified_source_blob_batch(repo_id, operation)
+        }
+
+        fn source_blob_len(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> Result<Option<u64>, KinDbError> {
+            self.inner.source_blob_len(repo_id, digest)
+        }
+
+        fn load_snapshot_authority(
+            &self,
+            repo_id: &str,
+        ) -> Result<Option<crate::storage::backend::SnapshotAuthority>, KinDbError> {
+            self.inner.load_snapshot_authority(repo_id)
+        }
+
+        fn load_recovery_state(
+            &self,
+            repo_id: &str,
+        ) -> Result<crate::storage::backend::SnapshotRecoveryState, KinDbError> {
+            self.inner.load_recovery_state(repo_id)
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_snapshot_classified(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_cursor: SnapshotCursor,
+        ) -> SnapshotSaveOutcome {
+            self.inner
+                .save_snapshot_classified(repo_id, data, expected_cursor)
+        }
+
+        fn save_snapshot_validated(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected: SnapshotCursor,
+            history_validator_version: Option<u32>,
+        ) -> SnapshotSaveOutcome {
+            if let Some(fault) = self.snapshot_faults.lock().pop_front() {
+                return fault.outcome("snapshot write");
+            }
+            self.inner
+                .save_snapshot_validated(repo_id, data, expected, history_validator_version)
+        }
+
+        fn record_history_validation(
+            &self,
+            repo_id: &str,
+            generation: Generation,
+            snapshot_sha256: &str,
+            validator_version: u32,
+        ) -> Result<bool, KinDbError> {
+            self.inner.record_history_validation(
+                repo_id,
+                generation,
+                snapshot_sha256,
+                validator_version,
+            )
+        }
+
+        fn supports_authority_frames(&self) -> bool {
+            self.inner.supports_authority_frames()
+        }
+
+        fn save_authority_frame(
+            &self,
+            repo_id: &str,
+            frame: &[u8],
+            expected: SnapshotCursor,
+            history_validator_version: Option<u32>,
+        ) -> SnapshotSaveOutcome {
+            if let Some(fault) = self.frame_faults.lock().pop_front() {
+                return fault.outcome("frame append");
+            }
+            self.inner
+                .save_authority_frame(repo_id, frame, expected, history_validator_version)
+        }
+
+        fn record_journal_history_validation(
+            &self,
+            repo_id: &str,
+            head_generation: Generation,
+            snapshot_sha256: &str,
+            journal_sha256: &str,
+            validator_version: u32,
+        ) -> Result<bool, KinDbError> {
+            self.inner.record_journal_history_validation(
+                repo_id,
+                head_generation,
+                snapshot_sha256,
+                journal_sha256,
+                validator_version,
+            )
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            self.inner.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            self.inner.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
+            self.inner.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> Result<(), KinDbError> {
+            self.inner.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.inner.load_overlay(repo_id, session_id)
+        }
+
+        fn load_prepared_workspace_graph(
+            &self,
+            repo_id: &str,
+            workspace_id: &str,
+        ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+            self.inner
+                .load_prepared_workspace_graph(repo_id, workspace_id)
+        }
+
+        fn record_prepared_workspace_graph(
+            &self,
+            repo_id: &str,
+            workspace_id: &str,
+            artifact: &PreparedWorkspaceGraphArtifact,
+        ) -> Result<bool, KinDbError> {
+            self.inner
+                .record_prepared_workspace_graph(repo_id, workspace_id, artifact)
+        }
+
+        fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
+            self.inner.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            self.inner.list_repos()
+        }
+    }
+
+    /// A frame retained after an indeterminate append belongs to exactly one
+    /// candidate. Once a reconciliation proves that candidate was not
+    /// committed, the publication drops it, and a later successor at the same
+    /// generation is a different state: its own indeterminate outcome must be
+    /// reconciled through its own bytes, never through the dropped frame.
+    ///
+    /// On the local backend this cannot happen today, because every
+    /// indeterminate outcome it reports comes after the record rename, so the
+    /// retry branch never runs after one; the scripted backend supplies the
+    /// indeterminacy a remote backend can produce before its commit point.
+    #[test]
+    fn a_dropped_frame_candidate_is_not_reconciled_against_a_later_successor() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(FaultScriptedBackend::new(Arc::new(LocalFileBackend::new(
+            directory.path(),
+        ))));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        assert_eq!(manager.read_authority().generation(), 1);
+
+        // Candidate A: a frame append whose outcome is unknown and which
+        // installed nothing.
+        backend.script_frame_append(InjectedOutcome::Indeterminate);
+        let error = manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2911, 0x81))
+            .expect_err("an indeterminate append fails the commit");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+
+        // The next commit reconciles A: nothing landed, the exact frame is
+        // retried, and the retry is refused. A is dropped for good.
+        backend.script_frame_append(InjectedOutcome::NotCommitted);
+        let error = manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2912, 0x82))
+            .expect_err("a refused reconciliation fails the commit that triggered it");
+        assert!(
+            error
+                .to_string()
+                .contains("injected: the frame append lost"),
+            "{error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+
+        // Candidate B at the same generation takes the full-snapshot path and
+        // is left indeterminate too, with nothing installed.
+        manager.persistence().set_max_journal_frames_for_test(0);
+        backend.script_snapshot_write(InjectedOutcome::Indeterminate);
+        let candidate_b = overlay_publication(&manager, 0xf2_2347_2913, 0x83);
+        let error = manager
+            .commit_repository_transaction(candidate_b.clone())
+            .expect_err("an indeterminate snapshot write fails the commit");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+
+        // The retry of B reconciles it through B's own bytes and then replays
+        // it idempotently. A writer that still held A's frame would retry that
+        // frame here instead, commit it, and publish B in memory over a store
+        // that says A.
+        let receipt = manager
+            .commit_repository_transaction(candidate_b)
+            .expect("B reconciles as committed and replays");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(manager.read_authority().generation(), 2);
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "B landed as the full snapshot it was persisted as, not as A's frame"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        assert!(
+            !frame_path(&directory, 2).exists(),
+            "A's frame was never installed"
+        );
+        let overlay_names = |state: &RepositoryAuthorityState| -> Vec<String> {
+            state.metadata().workspaces[0]
+                .semantic_overlay
+                .entity_deltas()
+                .iter()
+                .filter_map(|delta| match delta {
+                    EntityDelta::Added { new } => Some(new.name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let names = overlay_names(&manager.read_authority());
+        assert!(
+            names.iter().any(|name| name == "kin_131"),
+            "B (seed 0x83) is the published state at generation 2: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "kin_129"),
+            "A (seed 0x81) was dropped and never published: {names:?}"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "after the dropped candidate",
         );
     }
 
