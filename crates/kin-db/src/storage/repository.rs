@@ -985,19 +985,123 @@ impl VersionedAuthorityState for RepositoryAuthorityState {
     }
 }
 
-struct RepositorySnapshotPersistence<B: StorageBackend + ?Sized> {
-    backend: Arc<B>,
-    repository_id: RepositoryId,
+/// Journal shape of one repository's durable authority, as the writer sees it.
+///
+/// The three byte counts are what the frame-versus-full decision reads. They
+/// start from the payload receipt of the open that built the manager and move
+/// with every acknowledged write, so the writer never re-reads storage to
+/// decide, and they are reset by every full snapshot promotion because that is
+/// what a promotion does to the journal.
+#[derive(Debug, Clone)]
+struct PersistenceState {
     /// Backend CAS cursor, not the logical repository generation.
     ///
     /// GCS object generations are provider-assigned opaque versions (for
     /// example 100, 101, ...), while `RootBundle::generation` is Kin's
     /// contiguous logical sequence (0, 1, ...). They must never be compared
     /// or substituted for one another.
-    backend_cursor: Mutex<SnapshotCursor>,
+    cursor: SnapshotCursor,
+    /// Serialized length of the full snapshot the acknowledged journal extends.
+    base_bytes: u64,
+    /// Number of acknowledged authority frames since that snapshot.
+    journal_frames: u64,
+    /// Serialized length of those frames together.
+    journal_bytes: u64,
+    /// The frame bytes of a candidate whose append returned indeterminate,
+    /// keyed by the successor generation, so reconciliation can compare the
+    /// exact bytes it tried to install rather than re-encode them.
+    pending_frame: Option<(Generation, Vec<u8>)>,
+}
+
+/// How many authority frames may follow one full snapshot before the next
+/// publication rewrites the snapshot.
+///
+/// The bound is what keeps recovery time and disk bounded: an open decodes at
+/// most one full snapshot and applies at most this many frames, and the
+/// journal never exceeds the snapshot it extends because a frame that would
+/// carry it past that size forces the rewrite instead. `KINDB_AUTHORITY_JOURNAL_MAX_FRAMES`
+/// overrides the count for operators and benches; `0` makes every publication
+/// a full snapshot, which is also how a store is compacted back to a shape
+/// that readers predating frames can open.
+const AUTHORITY_JOURNAL_MAX_FRAMES: u64 = 32;
+
+fn authority_journal_max_frames() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(
+        || match std::env::var("KINDB_AUTHORITY_JOURNAL_MAX_FRAMES") {
+            Ok(value) => match value.trim().parse::<u64>() {
+                Ok(limit) => limit,
+                Err(error) => {
+                    tracing::warn!(
+                        value,
+                        error = %error,
+                        "ignoring KINDB_AUTHORITY_JOURNAL_MAX_FRAMES; using the default bound"
+                    );
+                    AUTHORITY_JOURNAL_MAX_FRAMES
+                }
+            },
+            Err(_) => AUTHORITY_JOURNAL_MAX_FRAMES,
+        },
+    )
+}
+
+/// Which durable shape one publication takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationShape {
+    /// Append one authority frame to the acknowledged journal.
+    Frame,
+    /// Rewrite the full snapshot, which also retires the journal.
+    FullSnapshot,
+}
+
+struct RepositorySnapshotPersistence<B: StorageBackend + ?Sized> {
+    backend: Arc<B>,
+    repository_id: RepositoryId,
+    state: Mutex<PersistenceState>,
+    /// Frame bound in force for this repository. Read once from the process
+    /// environment at open; tests lower it to exercise the promotion.
+    max_journal_frames: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    break_frame_encoder: std::sync::atomic::AtomicBool,
+    /// Test-only replacement for the base byte length the journal may grow
+    /// to, so a small fixture can exercise frames without a large base.
+    #[cfg(test)]
+    journal_byte_bound_for_test: Mutex<Option<u64>>,
 }
 
 impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
+    fn new(
+        backend: Arc<B>,
+        repository_id: RepositoryId,
+        cursor: SnapshotCursor,
+        payload_stats: Option<AuthorityPayloadStats>,
+    ) -> Self {
+        let (base_bytes, journal_frames, journal_bytes) =
+            payload_stats.map_or((0, 0, 0), |stats| {
+                (
+                    stats.snapshot_bytes(),
+                    stats.acknowledged_delta_count(),
+                    stats.acknowledged_delta_bytes(),
+                )
+            });
+        Self {
+            backend,
+            repository_id,
+            state: Mutex::new(PersistenceState {
+                cursor,
+                base_bytes,
+                journal_frames,
+                journal_bytes,
+                pending_frame: None,
+            }),
+            max_journal_frames: std::sync::atomic::AtomicU64::new(authority_journal_max_frames()),
+            #[cfg(test)]
+            break_frame_encoder: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            journal_byte_bound_for_test: Mutex::new(None),
+        }
+    }
+
     fn record_save_outcome(
         cursor: &mut SnapshotCursor,
         outcome: SnapshotSaveOutcome,
@@ -1024,14 +1128,258 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     /// complete history validity, and carries its own new changes through
     /// `validate_history_replay` in `prepare_successor`. So the bytes being
     /// written are validated bytes, and the durable record says exactly that.
-    fn persist_bytes(&self, bytes: &[u8], cursor: &mut SnapshotCursor) -> PersistOutcome {
+    fn persist_bytes(&self, bytes: &[u8], state: &mut PersistenceState) -> PersistOutcome {
         let outcome = self.backend.save_snapshot_validated(
             self.repository_id.as_str(),
             bytes,
-            *cursor,
+            state.cursor,
             Some(HISTORY_VALIDATION_VERSION),
         );
-        Self::record_save_outcome(cursor, outcome)
+        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        if matches!(outcome, PersistOutcome::Committed) {
+            let retired = self.note_full_snapshot_committed(state, bytes.len());
+            self.clear_retired_frames(retired);
+        }
+        outcome
+    }
+
+    /// A full snapshot is durable at `state.cursor`: the journal it retired is
+    /// gone from the writer's view. Returns how many frames it retired, so the
+    /// caller can ask storage to drop their bytes in whichever way its lock
+    /// discipline allows.
+    fn note_full_snapshot_committed(
+        &self,
+        state: &mut PersistenceState,
+        snapshot_bytes: usize,
+    ) -> u64 {
+        let retired_frames = state.journal_frames;
+        state.base_bytes = snapshot_bytes as u64;
+        state.journal_frames = 0;
+        state.journal_bytes = 0;
+        state.pending_frame = None;
+        retired_frames
+    }
+
+    /// Ask storage to drop the bytes of frames a promotion retired.
+    ///
+    /// The promotion already retired every acknowledged frame in the same
+    /// record write that installed the snapshot; only their bytes remain, and
+    /// recovery ignores retired bytes by name. Cleanup is therefore best
+    /// effort, and a failure here costs disk until the next open finalizes it,
+    /// never correctness.
+    fn clear_retired_frames(&self, retired_frames: u64) {
+        if retired_frames == 0 {
+            return;
+        }
+        if let Err(error) = self.backend.clear_deltas(self.repository_id.as_str()) {
+            tracing::warn!(
+                repository = %self.repository_id,
+                retired_frames,
+                error = %error,
+                "full snapshot committed; deferred retired authority frame cleanup"
+            );
+        }
+    }
+
+    /// Choose the durable shape of one publication under the journal bound.
+    fn publication_shape(&self, state: &PersistenceState, frame_bytes: u64) -> PublicationShape {
+        if !self.backend.supports_authority_frames() {
+            return PublicationShape::FullSnapshot;
+        }
+        let max_frames = self
+            .max_journal_frames
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if state.journal_frames >= max_frames {
+            return PublicationShape::FullSnapshot;
+        }
+        #[allow(unused_mut)]
+        let mut byte_bound = state.base_bytes;
+        #[cfg(test)]
+        if let Some(bound) = *self.journal_byte_bound_for_test.lock() {
+            byte_bound = bound;
+        }
+        match state.journal_bytes.checked_add(frame_bytes) {
+            Some(total) if total <= byte_bound => PublicationShape::Frame,
+            _ => PublicationShape::FullSnapshot,
+        }
+    }
+
+    /// Encode the frame that carries `current` to `next`, or say why the
+    /// publication must be a full snapshot instead.
+    fn encode_frame(
+        &self,
+        current: &RepositoryAuthorityState,
+        next: &RepositoryAuthorityState,
+    ) -> Result<Vec<u8>, KinDbError> {
+        #[cfg(test)]
+        if self
+            .break_frame_encoder
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(storage(
+                "injected authority frame encoder fault: the frame does not reproduce the successor"
+                    .to_string(),
+            ));
+        }
+        let frame = crate::storage::authority_frame::AuthorityFrame::encode(
+            &current.snapshot,
+            &next.snapshot,
+        )?;
+        frame.to_bytes()
+    }
+
+    /// Append one validated authority frame at the current cursor.
+    fn persist_frame_bytes(&self, frame: &[u8], state: &mut PersistenceState) -> PersistOutcome {
+        let outcome = self.backend.save_authority_frame(
+            self.repository_id.as_str(),
+            frame,
+            state.cursor,
+            Some(HISTORY_VALIDATION_VERSION),
+        );
+        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        if matches!(outcome, PersistOutcome::Committed) {
+            state.journal_frames = state.journal_frames.saturating_add(1);
+            state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
+            state.pending_frame = None;
+        }
+        outcome
+    }
+
+    /// Persist `next` as the successor of `current` in whichever shape the
+    /// bound allows, recording the phase split either way.
+    fn persist_successor(
+        &self,
+        current: &RepositoryAuthorityState,
+        next: &RepositoryAuthorityState,
+    ) -> PersistOutcome {
+        let mut timer = PublicationPhaseTimer::start();
+        let mut state = self.state.lock();
+        let frame = if self.backend.supports_authority_frames() {
+            match self.encode_frame(current, next) {
+                Ok(frame) => Some(frame),
+                Err(error) => {
+                    // The encoder refusing its own frame is a kin-db defect,
+                    // never a durability question: the successor is still
+                    // fully validated, so it is persisted whole and the defect
+                    // is reported where an operator will see it.
+                    tracing::error!(
+                        repository = %self.repository_id,
+                        generation = next.generation(),
+                        error = %error,
+                        "authority frame encoding refused; persisting this publication as a full snapshot"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let shape = match &frame {
+            Some(frame) => self.publication_shape(&state, frame.len() as u64),
+            None => PublicationShape::FullSnapshot,
+        };
+        match (shape, frame) {
+            (PublicationShape::Frame, Some(frame)) => {
+                let serialize_ms = timer.lap_ms();
+                let frame_bytes = frame.len();
+                let outcome = self.persist_frame_bytes(&frame, &mut state);
+                if let PersistOutcome::Indeterminate(_) = &outcome {
+                    state.pending_frame = Some((next.generation(), frame));
+                }
+                let write_ms = timer.lap_ms();
+                record_frame_persistence_phases(serialize_ms, write_ms, frame_bytes);
+                outcome
+            }
+            _ => {
+                // `next` passed the successor's own storage-admission gate under
+                // the single writer permit and is immutable from that gate to
+                // this write.
+                let bytes = match next.snapshot.to_bytes_pre_validated() {
+                    Ok(bytes) => bytes,
+                    Err(error) => return PersistOutcome::NotCommitted(error),
+                };
+                let serialize_ms = timer.lap_ms();
+                let snapshot_bytes = bytes.len();
+                let outcome = self.persist_bytes(&bytes, &mut state);
+                let write_ms = timer.lap_ms();
+                record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+                outcome
+            }
+        }
+    }
+
+    /// Reconcile a retained frame candidate whose append was indeterminate.
+    ///
+    /// The record and the acknowledged frame bytes are read under the backend
+    /// lock; the frame either is the head, is not there, or was displaced.
+    fn reconcile_frame(
+        &self,
+        state: &mut PersistenceState,
+        frame: &[u8],
+    ) -> Result<PersistOutcome, KinDbError> {
+        let (installed, journal) = self
+            .backend
+            .load_recovery_state(self.repository_id.as_str())?;
+        let Some(installed) = installed else {
+            return Ok(PersistOutcome::Indeterminate(storage(format!(
+                "repository {} backend authority disappeared while reconciling cursor {}",
+                self.repository_id,
+                state.cursor.backend_generation()
+            ))));
+        };
+        let installed_cursor = installed.cursor();
+        let expected_next = SnapshotCursor::from_backend_generation(
+            state.cursor.backend_generation().saturating_add(1),
+        );
+        if installed_cursor == state.cursor {
+            // Nothing landed, so the writer's journal counts are still what
+            // they were when the frame shape was chosen; the exact candidate
+            // is retried at the same cursor.
+            return Ok(self.persist_frame_bytes(frame, state));
+        }
+        let head_frame = journal
+            .iter()
+            .filter(|(_, generation)| *generation <= installed.head_generation)
+            .max_by_key(|(_, generation)| *generation);
+        if installed_cursor == expected_next
+            && installed.snapshot_generation < installed.head_generation
+            && head_frame.is_some_and(|(bytes, _)| bytes.as_slice() == frame)
+        {
+            state.cursor = installed_cursor;
+            state.journal_frames = state.journal_frames.saturating_add(1);
+            state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
+            state.pending_frame = None;
+            return Ok(PersistOutcome::Committed);
+        }
+        Ok(PersistOutcome::NotCommitted(storage(format!(
+            "repository {} backend authority advanced from cursor {} to {} without installing the pending authority frame",
+            self.repository_id,
+            state.cursor.backend_generation(),
+            installed_cursor.backend_generation()
+        ))))
+    }
+
+    #[cfg(test)]
+    fn set_max_journal_frames_for_test(&self, max_frames: u64) {
+        self.max_journal_frames
+            .store(max_frames, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn break_frame_encoder_for_test(&self, broken: bool) {
+        self.break_frame_encoder
+            .store(broken, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn set_journal_byte_bound_for_test(&self, bound: Option<u64>) {
+        *self.journal_byte_bound_for_test.lock() = bound;
+    }
+
+    #[cfg(test)]
+    fn journal_state_for_test(&self) -> (u64, u64, u64) {
+        let state = self.state.lock();
+        (state.base_bytes, state.journal_frames, state.journal_bytes)
     }
 }
 
@@ -1085,7 +1433,39 @@ fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapsh
     }
 }
 
+/// Name the two persistence phases of one frame publication.
+fn record_frame_persistence_phases(serialize_ms: u128, write_ms: u128, frame_bytes: usize) {
+    #[cfg(test)]
+    LAST_PERSISTENCE_PHASES.with(|phases| {
+        phases.set(Some(PersistencePhases {
+            serialize_ms,
+            write_ms,
+            payload_bytes: frame_bytes,
+        }))
+    });
+    if serialize_ms + write_ms >= SLOW_PUBLICATION_PHASE.as_millis() {
+        tracing::info!(
+            serialize_ms,
+            write_ms,
+            frame_bytes,
+            "slow repository authority frame persistence"
+        );
+    } else {
+        tracing::debug!(
+            serialize_ms,
+            write_ms,
+            frame_bytes,
+            "repository authority frame persistence"
+        );
+    }
+}
+
 impl RepositorySnapshotPersistence<LocalFileBackend> {
+    /// Persist a full snapshot and keep the backend lock that committed it.
+    ///
+    /// The freezing publication is the branch, tag, stash, merge-state, and
+    /// replay-recovery path; it stays a full snapshot in this revision, which
+    /// also compacts whatever journal the commit path built up.
     fn persist_and_freeze(
         &self,
         next: &RepositoryAuthorityState,
@@ -1099,15 +1479,28 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
         };
         let serialize_ms = timer.lap_ms();
         let snapshot_bytes = bytes.len();
-        let mut cursor = self.backend_cursor.lock();
+        let mut state = self.state.lock();
         let outcome = match self.backend.save_snapshot_and_freeze(
             self.repository_id.as_str(),
             &bytes,
-            *cursor,
+            state.cursor,
             Some(HISTORY_VALIDATION_VERSION),
         ) {
-            Ok((committed_cursor, retained)) if committed_cursor != *cursor => {
-                *cursor = committed_cursor;
+            Ok((committed_cursor, retained)) if committed_cursor != state.cursor => {
+                state.cursor = committed_cursor;
+                let retired = self.note_full_snapshot_committed(&mut state, snapshot_bytes);
+                // The lock stays with the caller, so cleanup goes through it
+                // rather than through a second acquisition of the same lock.
+                if retired != 0 {
+                    if let Err(error) = self.backend.clear_retired_deltas_while_frozen(&retained) {
+                        tracing::warn!(
+                            repository = %self.repository_id,
+                            retired_frames = retired,
+                            error = %error,
+                            "full snapshot committed under freeze; deferred retired authority frame cleanup"
+                        );
+                    }
+                }
                 RetainedPersistOutcome::Committed { retained }
             }
             Ok((committed_cursor, _)) => RetainedPersistOutcome::Indeterminate(storage(format!(
@@ -1130,37 +1523,39 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
 {
     fn persist(
         &self,
-        _expected_logical_generation: Generation,
+        current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        let mut timer = PublicationPhaseTimer::start();
-        // `next` passed the successor's own storage-admission gate under the
-        // single writer permit and is immutable from that gate to this write.
-        let bytes = match next.snapshot.to_bytes_pre_validated() {
-            Ok(bytes) => bytes,
-            Err(error) => return PersistOutcome::NotCommitted(error),
-        };
-        let serialize_ms = timer.lap_ms();
-        let snapshot_bytes = bytes.len();
-        let mut cursor = self.backend_cursor.lock();
-        let outcome = self.persist_bytes(&bytes, &mut cursor);
-        let write_ms = timer.lap_ms();
-        record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
-        outcome
+        self.persist_successor(current, next)
     }
 
     fn reconcile(
         &self,
-        _expected_logical_generation: Generation,
+        current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        // A reconciled candidate is the exact retained `Arc` a persist attempt
-        // already serialized, so its admission gate still stands.
+        let mut state = self.state.lock();
+        // A retained frame candidate is reconciled against the exact bytes the
+        // append tried to install.
+        let pending_frame = state
+            .pending_frame
+            .as_ref()
+            .filter(|(generation, _)| *generation == next.generation())
+            .map(|(_, frame)| frame.clone());
+        if let Some(frame) = pending_frame {
+            return match self.reconcile_frame(&mut state, &frame) {
+                Ok(outcome) => outcome,
+                Err(error) => PersistOutcome::Indeterminate(error),
+            };
+        }
+        let _ = current;
+        // A reconciled full-snapshot candidate is the exact retained `Arc` a
+        // persist attempt already serialized, so its admission gate still
+        // stands.
         let bytes = match next.snapshot.to_bytes_pre_validated() {
             Ok(bytes) => bytes,
             Err(error) => return PersistOutcome::NotCommitted(error),
         };
-        let mut cursor = self.backend_cursor.lock();
         let installed = match self
             .backend
             .load_snapshot_authority(self.repository_id.as_str())
@@ -1180,30 +1575,34 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
             }
             Some(authority) if authority.snapshot_bytes == bytes => {
                 let installed_cursor = authority.cursor();
-                if installed_cursor == *cursor {
+                if installed_cursor == state.cursor {
                     return PersistOutcome::Indeterminate(storage(format!(
                         "repository {} exposes the pending successor bytes without advancing backend cursor {}",
                         self.repository_id,
-                        cursor.backend_generation()
+                        state.cursor.backend_generation()
                     )));
                 }
-                *cursor = installed_cursor;
+                state.cursor = installed_cursor;
+                let retired = self.note_full_snapshot_committed(&mut state, bytes.len());
+                self.clear_retired_frames(retired);
                 PersistOutcome::Committed
             }
-            Some(authority) if authority.cursor() != *cursor => {
+            Some(authority) if authority.cursor() != state.cursor => {
                 PersistOutcome::NotCommitted(storage(format!(
                     "repository {} backend authority advanced from cursor {} to {} with different snapshot bytes while a commit was indeterminate",
                     self.repository_id,
-                    cursor.backend_generation(),
+                    state.cursor.backend_generation(),
                     authority.cursor().backend_generation()
                 )))
             }
-            Some(_) => self.persist_bytes(&bytes, &mut cursor),
-            None if *cursor == SnapshotCursor::INITIAL => self.persist_bytes(&bytes, &mut cursor),
+            Some(_) => self.persist_bytes(&bytes, &mut state),
+            None if state.cursor == SnapshotCursor::INITIAL => {
+                self.persist_bytes(&bytes, &mut state)
+            }
             None => PersistOutcome::Indeterminate(storage(format!(
                 "repository {} backend authority disappeared while reconciling cursor {}",
                 self.repository_id,
-                cursor.backend_generation()
+                state.cursor.backend_generation()
             ))),
         }
     }
@@ -1391,21 +1790,32 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .and_then(|recovered| {
                 verified_history_validation(&repository_id, &recovered.recovered)
             });
-        // The digest of the bytes that were actually loaded. Binding a record
-        // must never re-serialize the snapshot to obtain one: the persist path
-        // deliberately writes the original bytes rather than re-serialized ones,
-        // so a round-trip digest is not guaranteed to be the persisted digest.
-        let loaded_digest = recovered
-            .as_ref()
-            .filter(|recovered| recovered.recovered.deltas_applied == 0)
-            .map(|recovered| recovered.recovered.snapshot_sha256.clone());
+        // The digest of the durable authority that was actually loaded: the
+        // base bytes for journal-free authority, the base plus the acknowledged
+        // frame chain otherwise. Binding a record must never re-serialize the
+        // snapshot to obtain one: the persist path deliberately writes the
+        // original bytes rather than re-serialized ones, so a round-trip digest
+        // is not guaranteed to be the persisted digest.
+        let loaded_digest = recovered.as_ref().map(|recovered| {
+            (
+                recovered.recovered.snapshot_sha256.clone(),
+                recovered.recovered.journal_sha256.clone(),
+            )
+        });
         let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
             let recovered = recovered.recovered;
-            if recovered.deltas_seen != 0 {
-                return Err(storage(format!(
-                    "repository {} has an incremental graph journal; repository authority requires full-snapshot CAS only",
-                    repository_id
-                )));
+            // Recovery already refused an incremental graph delta over an
+            // authority base and applied every acknowledged authority frame.
+            // What can remain is a frame staged past the head by a writer that
+            // died before its record rename; recovery reported it and the next
+            // writer replaces or discards it, so it does not refuse the open.
+            if recovered.deltas_seen != recovered.deltas_applied {
+                tracing::warn!(
+                    repository = %repository_id,
+                    seen = recovered.deltas_seen,
+                    applied = recovered.deltas_applied,
+                    "repository authority opened past unacknowledged journal entries"
+                );
             }
             let metadata = recovered
                 .snapshot
@@ -1479,28 +1889,33 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         );
 
         let mut initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
-        // Prepared state binds to the digest of the bytes this open actually
-        // loaded, so a repository with no persisted authority yet has nothing
-        // to bind to and gets no cache at all.
-        let prepared = loaded_digest.as_ref().map(|digest| {
-            Arc::new(PreparedWorkspaceGraphCache::new(
-                Arc::new(BackendPreparedWorkspaceGraphStore {
-                    backend: Arc::clone(&backend),
-                    repository_id: repository_id.clone(),
-                }),
-                repository_id.clone(),
-                initial.generation(),
-                digest.clone(),
-            ))
-        });
+        // Prepared state binds to the digest of the durable authority this open
+        // actually loaded, so a repository with no persisted authority yet has
+        // nothing to bind to and gets no cache at all.
+        let prepared = loaded_digest
+            .as_ref()
+            .map(|(snapshot_sha256, journal_sha256)| {
+                Arc::new(PreparedWorkspaceGraphCache::new(
+                    Arc::new(BackendPreparedWorkspaceGraphStore {
+                        backend: Arc::clone(&backend),
+                        repository_id: repository_id.clone(),
+                    }),
+                    repository_id.clone(),
+                    initial.generation(),
+                    journal_sha256
+                        .clone()
+                        .unwrap_or_else(|| snapshot_sha256.clone()),
+                ))
+            });
         if let Some(prepared) = &prepared {
             initial = initial.with_prepared_workspace_graphs(Arc::clone(prepared));
         }
-        let persistence = RepositorySnapshotPersistence {
-            backend: Arc::clone(&backend),
-            repository_id: repository_id.clone(),
-            backend_cursor: Mutex::new(backend_cursor),
-        };
+        let persistence = RepositorySnapshotPersistence::new(
+            Arc::clone(&backend),
+            repository_id.clone(),
+            backend_cursor,
+            payload_stats,
+        );
         let manager = Self {
             repository_id,
             backend,
@@ -1514,8 +1929,12 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 generation,
                 "repository authority reopened against a durable history validation"
             );
-        } else if let Some(digest) = loaded_digest {
-            manager.bind_history_validation(backend_cursor, &digest);
+        } else if let Some((snapshot_sha256, journal_sha256)) = loaded_digest {
+            manager.bind_history_validation(
+                backend_cursor,
+                &snapshot_sha256,
+                journal_sha256.as_deref(),
+            );
         }
         Ok((manager, payload_stats))
     }
@@ -1527,6 +1946,11 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// directly, rather than inferring it from how long an open took.
     pub const fn opened_by_history_validation(&self) -> bool {
         self.opened_by_history_validation
+    }
+
+    #[cfg(test)]
+    fn persistence(&self) -> &RepositorySnapshotPersistence<B> {
+        self.publication.persistence()
     }
 
     /// What prepared workspace query-graph state did since this open.
@@ -1555,17 +1979,32 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// still correct, it is only slow again next time. Failing an open that
     /// passed complete validation because a cache write lost a race would be
     /// strictly worse than revalidating.
-    fn bind_history_validation(&self, backend_cursor: SnapshotCursor, digest: &str) {
+    fn bind_history_validation(
+        &self,
+        backend_cursor: SnapshotCursor,
+        snapshot_sha256: &str,
+        journal_sha256: Option<&str>,
+    ) {
         let generation = backend_cursor.backend_generation();
         if generation == SnapshotCursor::INITIAL.backend_generation() {
             return;
         }
-        match self.backend.record_history_validation(
-            self.repository_id.as_str(),
-            generation,
-            digest,
-            HISTORY_VALIDATION_VERSION,
-        ) {
+        let bound = match journal_sha256 {
+            Some(journal_sha256) => self.backend.record_journal_history_validation(
+                self.repository_id.as_str(),
+                generation,
+                snapshot_sha256,
+                journal_sha256,
+                HISTORY_VALIDATION_VERSION,
+            ),
+            None => self.backend.record_history_validation(
+                self.repository_id.as_str(),
+                generation,
+                snapshot_sha256,
+                HISTORY_VALIDATION_VERSION,
+            ),
+        };
+        match bound {
             Ok(true) => tracing::debug!(
                 repository = %self.repository_id,
                 generation,
@@ -1853,7 +2292,18 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
-        let snapshot = GraphSnapshot::from_bytes(&locked.authority().snapshot_bytes)?;
+        // The frozen head is the base plus every acknowledged frame the lock
+        // captured, put back together by the same recovery core an open uses,
+        // and validated in full here regardless of any durable proof: a freeze
+        // is the gate a namespace transition trusts.
+        let snapshot = crate::storage::backend::recover_snapshot_from_state(
+            self.repository_id.as_str(),
+            locked.authority(),
+            locked.frames(),
+            None,
+        )?
+        .recovered
+        .snapshot;
         let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
             storage(format!(
                 "repository {} frozen snapshot has no v13 authority envelope",
@@ -2307,16 +2757,7 @@ fn admit_changes(
     // Rebuild the inverse index from canonical history. Ordered and repeated
     // parent identity stays in each change; this derived lookup needs each
     // parent→child edge only once.
-    let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in snapshot.changes.values() {
-        for parent in &change.parents {
-            children.entry(*parent).or_default().insert(change.id);
-        }
-    }
-    snapshot.change_children = children
-        .into_iter()
-        .map(|(parent, children)| (parent, children.into_iter().collect()))
-        .collect();
+    snapshot.change_children = derive_change_children(&snapshot.changes);
 
     // A repository with multiple refs has no single current entity/relation
     // revision view. Exact target replay derives revisions from the immutable
@@ -2324,6 +2765,25 @@ fn admit_changes(
     // ordering across divergent histories.
     snapshot.entity_revisions.clear();
     Ok(())
+}
+
+/// The parent-to-children index exactly as immutable history implies it.
+///
+/// Successor preparation and authority-frame recovery both derive it from the
+/// same function, so a reconstructed head carries the index its writer carried.
+pub(crate) fn derive_change_children(
+    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
+) -> HashMap<SemanticChangeId, Vec<SemanticChangeId>> {
+    let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
+    for change in changes.values() {
+        for parent in &change.parents {
+            children.entry(*parent).or_default().insert(change.id);
+        }
+    }
+    children
+        .into_iter()
+        .map(|(parent, children)| (parent, children.into_iter().collect()))
+        .collect()
 }
 
 fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
@@ -3970,11 +4430,19 @@ fn verified_history_validation(
     recovered: &RecoveredSnapshot,
 ) -> Option<Generation> {
     let proof = recovered.history_validation.as_ref()?;
+    // A journal-free proof describes exactly the base bytes; a proof that also
+    // names an acknowledged frame chain describes exactly the base plus that
+    // chain, and neither describes the other.
+    let journal_matches = match (&proof.journal_sha256, &recovered.journal_sha256) {
+        (None, None) => recovered.deltas_applied == 0,
+        (Some(claimed), Some(applied)) => recovered.deltas_applied != 0 && claimed == applied,
+        _ => false,
+    };
     let matches = proof.validator_version == HISTORY_VALIDATION_VERSION
         && proof.repository_id == repository_id.as_str()
         && proof.generation == recovered.generation
         && proof.snapshot_sha256 == recovered.snapshot_sha256
-        && recovered.deltas_applied == 0;
+        && journal_matches;
     matches.then_some(recovered.generation)
 }
 
@@ -7746,8 +8214,8 @@ mod tests {
         (transaction, change_id, target)
     }
 
-    fn detached_tag_import_transaction(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn detached_tag_import_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
     ) -> (RepositoryTransaction, SemanticChangeId, ExternalObjectId) {
         let fixture = git_authority_transaction_fixture(manager, 0xa00a);
         let mut transaction = fixture.transaction;
@@ -7858,8 +8326,8 @@ mod tests {
         (transaction, change_id, outer.object)
     }
 
-    fn remove_compose_transaction(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn remove_compose_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
         operation: u128,
     ) -> (RepositoryTransaction, Hash256) {
         let lease = manager.read_authority();
@@ -12631,6 +13099,7 @@ mod tests {
             deltas_seen: 0,
             snapshot_sha256: hex::encode(Sha256::digest(&authority.snapshot_bytes)),
             history_validation: Some(proof),
+            journal_sha256: None,
         };
         let honest = authority.history_validation.clone().unwrap();
         assert!(
@@ -12659,11 +13128,34 @@ mod tests {
 
         let replayed_delta = RecoveredSnapshot {
             deltas_applied: 1,
-            ..recovered(honest)
+            journal_sha256: Some(hex::encode(Sha256::digest(b"some frame chain"))),
+            ..recovered(honest.clone())
         };
         assert!(
             verified_history_validation(&repository_id(), &replayed_delta).is_none(),
-            "a record about base bytes cannot describe a delta-replayed state"
+            "a record about base bytes cannot describe a frame-replayed state"
+        );
+        let journal_proof = HistoryValidationProof {
+            journal_sha256: Some(hex::encode(Sha256::digest(b"some frame chain"))),
+            ..honest
+        };
+        let replayed_frames = RecoveredSnapshot {
+            deltas_applied: 1,
+            journal_sha256: Some(hex::encode(Sha256::digest(b"some frame chain"))),
+            ..recovered(journal_proof.clone())
+        };
+        assert!(
+            verified_history_validation(&repository_id(), &replayed_frames).is_some(),
+            "a record naming exactly this base and this chain describes the replayed state"
+        );
+        let other_chain = RecoveredSnapshot {
+            deltas_applied: 1,
+            journal_sha256: Some(hex::encode(Sha256::digest(b"another chain"))),
+            ..recovered(journal_proof)
+        };
+        assert!(
+            verified_history_validation(&repository_id(), &other_chain).is_none(),
+            "a record naming another chain must not be honored"
         );
     }
 
@@ -14298,6 +14790,835 @@ mod tests {
             reopen_started.elapsed().as_secs_f64() * 1000.0,
             reopened.read_authority().generation(),
             reopened.opened_by_history_validation()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Authority frames: the O(change) publication shape.
+    // ---------------------------------------------------------------------
+
+    /// One local store past its first full snapshot, with the journal byte
+    /// bound lifted so the small fixture exercises frames the way a large
+    /// store does under the production rule.
+    fn framed_local_repository(
+        directory: &TempDir,
+    ) -> (
+        Arc<LocalFileBackend>,
+        RepositoryAuthorityManager<LocalFileBackend>,
+    ) {
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        (backend, manager)
+    }
+
+    fn deltas_dir(directory: &TempDir) -> std::path::PathBuf {
+        directory
+            .path()
+            .join(repository_id().as_str())
+            .join("deltas")
+    }
+
+    fn frame_path(directory: &TempDir, generation: Generation) -> std::path::PathBuf {
+        deltas_dir(directory).join(format!("{generation:020}.kndd"))
+    }
+
+    fn acknowledged_frame_count(directory: &TempDir) -> usize {
+        read_authority_json(directory.path())["acknowledged_deltas"]
+            .as_array()
+            .map_or(0, Vec::len)
+    }
+
+    fn record_version(directory: &TempDir) -> u64 {
+        read_authority_json(directory.path())["version"]
+            .as_u64()
+            .expect("the record carries a version")
+    }
+
+    /// One workspace-scoped publication that adds a fresh entity to the
+    /// overlay; the shape every forced tree admission and ambient tick takes.
+    fn overlay_publication(
+        manager: &RepositoryAuthorityManager<LocalFileBackend>,
+        operation: u128,
+        salt: u8,
+    ) -> RepositoryTransaction {
+        semantic_workspace_transaction(
+            manager,
+            operation,
+            WorkspaceSemanticDelta::new_with_external_references(
+                vec![EntityDelta::Added {
+                    new: semantic_test_entity(
+                        "src/lib.rs",
+                        &format!("kin_{salt}"),
+                        LanguageId::Rust,
+                        salt,
+                    ),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_same_authority(
+        left: &RepositoryAuthorityState,
+        right: &RepositoryAuthorityState,
+        context: &str,
+    ) {
+        assert_eq!(left.metadata(), right.metadata(), "{context}: envelope");
+        assert_eq!(
+            left.snapshot().changes,
+            right.snapshot().changes,
+            "{context}: changes"
+        );
+        assert_eq!(
+            left.snapshot().change_children,
+            right.snapshot().change_children,
+            "{context}: change children"
+        );
+        assert!(
+            right.snapshot().entity_revisions.is_empty(),
+            "{context}: authority never persists entity revisions"
+        );
+    }
+
+    /// Publish one of every mutation shape the envelope knows, and check
+    /// after each that the frame journal grew and that a fresh open puts the
+    /// exact published state back together.
+    #[test]
+    fn authority_frames_carry_every_mutation_shape_and_reopen_exactly() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "the first publication is a full snapshot"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+
+        // Each transaction is built against the lease it extends, so they are
+        // constructed one publication at a time.
+        let publications: Vec<(
+            &str,
+            Box<dyn Fn(&RepositoryAuthorityManager<LocalFileBackend>) -> RepositoryTransaction>,
+        )> = vec![
+            (
+                "workspace overlay",
+                Box::new(|manager| {
+                    semantic_workspace_transaction(
+                        manager,
+                        0xf2_2347_2001,
+                        WorkspaceSemanticDelta::new_with_external_references(
+                            vec![EntityDelta::Added {
+                                new: semantic_test_entity(
+                                    "src/lib.rs",
+                                    "kin",
+                                    LanguageId::Rust,
+                                    0x21,
+                                ),
+                            }],
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    )
+                }),
+            ),
+            (
+                "change and ref move",
+                Box::new(|manager| remove_compose_transaction(manager, 0xf2_2347_2002).0),
+            ),
+        ];
+
+        let mut expected_frames = 0;
+        for (label, build) in publications {
+            manager
+                .commit_repository_transaction(build(&manager))
+                .unwrap();
+            expected_frames += 1;
+            assert_eq!(
+                record_version(&directory),
+                4,
+                "{label}: frame journal record"
+            );
+            assert_eq!(
+                acknowledged_frame_count(&directory),
+                expected_frames,
+                "{label}: acknowledged frames"
+            );
+            let reopened = reopen(&directory);
+            assert_same_authority(&manager.read_authority(), &reopened.read_authority(), label);
+            assert!(
+                reopened.opened_by_history_validation(),
+                "{label}: a frame publication binds a journal-aware proof, so the reopen is fast"
+            );
+        }
+
+        // Git import: external objects, aliases, and a Git authority delta.
+        let (import, _, _) = detached_tag_import_transaction(&manager);
+        manager.commit_repository_transaction(import).unwrap();
+        expected_frames += 1;
+        assert_eq!(acknowledged_frame_count(&directory), expected_frames);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "git import",
+        );
+
+        // Merge record open and drop: upsert then removal in the envelope.
+        let record = open_merge_record(&manager, 0xf2_2347_2003);
+        let mut opening = transaction_shell(&manager, 0xf2_2347_2003);
+        opening.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        manager.commit_repository_transaction(opening).unwrap();
+        let mut dropping = transaction_shell(&manager, 0xf2_2347_2004);
+        dropping.merge_transaction_delta = Some(MergeTransactionDelta::drop_record(record));
+        manager.commit_repository_transaction(dropping).unwrap();
+        expected_frames += 2;
+        assert_eq!(acknowledged_frame_count(&directory), expected_frames);
+        assert!(manager
+            .read_authority()
+            .metadata()
+            .merge_transactions
+            .is_empty());
+        let (reopened, receipt) = RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "merge",
+        );
+        let receipt = receipt.expect("a persisted store receipts its payload");
+        assert_eq!(receipt.acknowledged_delta_count(), expected_frames as u64);
+        assert_eq!(
+            receipt.head_generation() - receipt.snapshot_generation(),
+            expected_frames as u64
+        );
+        assert!(receipt.acknowledged_delta_bytes() > 0);
+        assert_eq!(
+            receipt.total_payload_bytes(),
+            receipt.snapshot_bytes() + receipt.acknowledged_delta_bytes()
+        );
+    }
+
+    #[test]
+    fn a_frame_publication_writes_only_the_frame() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let full = last_persistence_phases().expect("the full snapshot recorded its phases");
+
+        manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &manager,
+                0xf2_2347_2101,
+                WorkspaceSemanticDelta::new_with_external_references(
+                    vec![EntityDelta::Added {
+                        new: semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x21),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let frame = last_persistence_phases().expect("the frame recorded its phases");
+        assert!(
+            frame.payload_bytes < full.payload_bytes,
+            "a frame publication must persist fewer bytes than the full snapshot: {} against {}",
+            frame.payload_bytes,
+            full.payload_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(frame_path(&directory, 2)).unwrap().len(),
+            frame.payload_bytes as u64,
+            "the recorded payload is the frame file"
+        );
+        let (base_bytes, frames, journal_bytes) = manager.persistence().journal_state_for_test();
+        assert_eq!(base_bytes as usize, full.payload_bytes);
+        assert_eq!(frames, 1);
+        assert_eq!(journal_bytes as usize, frame.payload_bytes);
+    }
+
+    #[test]
+    fn a_journal_head_without_a_proof_validates_in_full_and_rebinds_a_journal_proof() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2201);
+        manager.commit_repository_transaction(removal).unwrap();
+        let bound = read_authority_json(directory.path());
+        assert!(
+            bound["history_validation"]["journal_sha256"].is_string(),
+            "a frame append binds a proof naming the journal: {bound}"
+        );
+
+        let mut record = bound.clone();
+        record.as_object_mut().unwrap().remove("history_validation");
+        write_authority_json(directory.path(), &record);
+
+        let reopened = reopen(&directory);
+        assert!(
+            !reopened.opened_by_history_validation(),
+            "with no proof the head validates in full"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "unproven",
+        );
+        let rebound = read_authority_json(directory.path());
+        assert_eq!(
+            rebound["history_validation"], bound["history_validation"],
+            "the full validation rebinds exactly the proof the writer minted"
+        );
+        assert!(reopen(&directory).opened_by_history_validation());
+    }
+
+    #[test]
+    fn a_proof_naming_another_journal_is_not_honored() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2251);
+        manager.commit_repository_transaction(removal).unwrap();
+        let mut record = read_authority_json(directory.path());
+        record["history_validation"]["journal_sha256"] =
+            serde_json::json!(hex::encode(Sha256::digest(b"another chain")));
+        write_authority_json(directory.path(), &record);
+        let reopened = reopen(&directory);
+        assert!(!reopened.opened_by_history_validation());
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "forged",
+        );
+    }
+
+    fn corrupt_frame(
+        directory: &TempDir,
+        generation: Generation,
+        corrupt: impl FnOnce(&mut Vec<u8>),
+    ) {
+        let path = frame_path(directory, generation);
+        let mut bytes = std::fs::read(&path).unwrap();
+        corrupt(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+    }
+
+    fn reopen_error(directory: &TempDir) -> String {
+        match RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        ) {
+            Ok(_) => panic!("a corrupted journal must refuse to open"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_flipped_byte_in_an_acknowledged_frame_refuses_the_open() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2301);
+        manager.commit_repository_transaction(removal).unwrap();
+        drop(manager);
+        corrupt_frame(&directory, 2, |bytes| {
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0x01;
+        });
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("digest mismatch"),
+            "a changed acknowledged frame must be named as such: {error}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_acknowledged_frame_refuses_the_open() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2302);
+        manager.commit_repository_transaction(removal).unwrap();
+        drop(manager);
+        corrupt_frame(&directory, 2, |bytes| {
+            let keep = bytes.len() / 2;
+            bytes.truncate(keep);
+        });
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("digest mismatch"),
+            "a torn acknowledged frame must be named as such: {error}"
+        );
+        // The frame decoder itself refuses the torn bytes independently of the
+        // record binding.
+        let torn = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let decode = crate::storage::AuthorityFrame::from_bytes(&torn)
+            .expect_err("a torn frame must not decode");
+        assert!(decode.to_string().contains("truncated"), "{decode}");
+    }
+
+    #[test]
+    fn a_missing_acknowledged_frame_refuses_the_open() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2303);
+        manager.commit_repository_transaction(removal).unwrap();
+        drop(manager);
+        std::fs::remove_file(frame_path(&directory, 2)).unwrap();
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("delta chain ended") || error.contains("delta chain is incomplete"),
+            "a missing acknowledged frame must be named as such: {error}"
+        );
+    }
+
+    #[test]
+    fn a_frame_acknowledged_over_the_wrong_base_refuses_the_open() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2304);
+        manager.commit_repository_transaction(removal).unwrap();
+        drop(manager);
+        // Acknowledge the same frame a second time at the next generation: its
+        // bytes are intact and its digest binds, but it names the roots of the
+        // state before it, not after it, so it does not extend the head.
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        std::fs::write(frame_path(&directory, 3), &bytes).unwrap();
+        let mut record = read_authority_json(directory.path());
+        record["head_generation"] = serde_json::json!(3);
+        record["acknowledged_deltas"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "generation": 3,
+                "sha256": hex::encode(Sha256::digest(&bytes)),
+            }));
+        record.as_object_mut().unwrap().remove("history_validation");
+        write_authority_json(directory.path(), &record);
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("does not extend the base") || error.contains("re-adds"),
+            "a frame over the wrong base must be named as such: {error}"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_another_repository_refuses_to_apply() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let mut base = manager.read_authority().snapshot().clone();
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2305);
+        manager.commit_repository_transaction(removal).unwrap();
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let mut frame = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
+        frame.repository_id = RepositoryId::new("some-other-repository").unwrap();
+        frame.operation.repository_id = frame.repository_id.clone();
+        let error = frame
+            .apply(&mut base)
+            .expect_err("a frame of another repository must not apply");
+        assert!(
+            error.to_string().contains("belongs to repository"),
+            "{error}"
+        );
+        assert!(
+            base.repository_authority.as_ref().unwrap().roots.generation == 1,
+            "nothing is applied when a frame is refused"
+        );
+    }
+
+    #[test]
+    fn an_incremental_graph_delta_in_an_authority_journal_refuses_the_open() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(1)
+            .to_bytes()
+            .unwrap();
+        std::fs::create_dir_all(deltas_dir(&directory)).unwrap();
+        std::fs::write(frame_path(&directory, 2), &delta).unwrap();
+        let mut record = read_authority_json(directory.path());
+        record["head_generation"] = serde_json::json!(2);
+        record["acknowledged_deltas"] = serde_json::json!([{
+            "generation": 2,
+            "sha256": hex::encode(Sha256::digest(&delta)),
+        }]);
+        record.as_object_mut().unwrap().remove("history_validation");
+        write_authority_json(directory.path(), &record);
+        let error = reopen_error(&directory);
+        assert!(
+            error.contains("followed by an incremental graph delta"),
+            "a graph delta over authority must be refused by name: {error}"
+        );
+    }
+
+    #[test]
+    fn an_authority_frame_over_a_plain_graph_journal_is_refused() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("plain-graph", &base, crate::storage::GENERATION_INIT)
+            .unwrap();
+        // Any well-formed frame bytes will do: the base is a plain graph, so
+        // the journal kind is wrong before the frame body matters.
+        let (frames_dir, frame_bytes) = {
+            let framed = TempDir::new().unwrap();
+            let (_backend, manager) = framed_local_repository(&framed);
+            let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2306);
+            manager.commit_repository_transaction(removal).unwrap();
+            (
+                directory.path().join("plain-graph").join("deltas"),
+                std::fs::read(frame_path(&framed, 2)).unwrap(),
+            )
+        };
+        std::fs::create_dir_all(&frames_dir).unwrap();
+        std::fs::write(
+            frames_dir.join(format!("{:020}.kndd", generation + 1)),
+            &frame_bytes,
+        )
+        .unwrap();
+        let record_path = directory.path().join("plain-graph").join("authority.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["version"] = serde_json::json!(4);
+        record["head_generation"] = serde_json::json!(generation + 1);
+        record["acknowledged_deltas"] = serde_json::json!([{
+            "generation": generation + 1,
+            "sha256": hex::encode(Sha256::digest(&frame_bytes)),
+        }]);
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = crate::storage::load_recovered_snapshot(&backend, "plain-graph")
+            .expect_err("a frame over a plain graph base must refuse");
+        assert!(
+            error.to_string().contains("followed by an authority frame"),
+            "{error}"
+        );
+    }
+
+    /// The reader that predates frames is still in this tree: the graph delta
+    /// decoder refuses the frame magic, and the record version it accepts is
+    /// exactly the one a frame journal moves away from.
+    #[test]
+    fn readers_that_predate_frames_refuse_a_frame_journal_and_accept_a_compacted_one() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2401, 0x21))
+            .unwrap();
+        assert_eq!(
+            record_version(&directory),
+            4,
+            "an acknowledged frame journal is recorded at a version older readers do not accept"
+        );
+        assert_eq!(
+            crate::storage::backend::LOCAL_AUTHORITY_VERSION,
+            3,
+            "the version every reader before frames requires is the journal-free one"
+        );
+        assert_eq!(
+            crate::storage::backend::LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION,
+            u32::try_from(record_version(&directory)).unwrap()
+        );
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let old_decoder = crate::storage::delta::GraphSnapshotDelta::from_bytes(&bytes)
+            .expect_err("the incremental delta decoder must refuse a frame");
+        assert!(
+            old_decoder
+                .to_string()
+                .contains("invalid delta magic bytes"),
+            "{old_decoder}"
+        );
+
+        // Compaction: the count bound at zero makes the next publication a
+        // full snapshot, which retires the journal and restores the record
+        // version older readers accept.
+        manager.persistence().set_max_journal_frames_for_test(0);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2402, 0x22))
+            .unwrap();
+        assert_eq!(record_version(&directory), 3);
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        let record = read_authority_json(directory.path());
+        assert_eq!(record["snapshot_generation"], record["head_generation"]);
+        assert!(
+            record["history_validation"]["journal_sha256"].is_null(),
+            "a compacted head is journal-free again: {record}"
+        );
+        let (_, frames, journal_bytes) = manager.persistence().journal_state_for_test();
+        assert_eq!((frames, journal_bytes), (0, 0));
+        assert!(
+            !frame_path(&directory, 2).exists(),
+            "the retired frame is cleared after the promotion"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "compacted",
+        );
+    }
+
+    #[test]
+    fn the_frame_count_bound_forces_a_full_snapshot_that_retires_the_journal() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager.persistence().set_max_journal_frames_for_test(2);
+        for round in 0..5u32 {
+            manager
+                .commit_repository_transaction(overlay_publication(
+                    &manager,
+                    0xf2_2347_2500 + u128::from(round),
+                    0x30 + round as u8,
+                ))
+                .unwrap();
+            let expected_frames = match round {
+                0 => 1,
+                1 => 2,
+                2 => 0,
+                3 => 1,
+                4 => 2,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                acknowledged_frame_count(&directory),
+                expected_frames,
+                "round {round}: the third publication after a snapshot rewrites it"
+            );
+            let reopened = reopen(&directory);
+            assert_same_authority(
+                &manager.read_authority(),
+                &reopened.read_authority(),
+                &format!("round {round}"),
+            );
+            assert!(reopened.opened_by_history_validation(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_journal_byte_bound_forces_a_full_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(1));
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2601);
+        manager.commit_repository_transaction(removal).unwrap();
+        assert_eq!(record_version(&directory), 3);
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        let phases = last_persistence_phases().unwrap();
+        let (base_bytes, frames, _) = manager.persistence().journal_state_for_test();
+        assert_eq!(base_bytes as usize, phases.payload_bytes);
+        assert_eq!(frames, 0);
+    }
+
+    #[test]
+    fn a_frame_staged_past_head_is_ignored_replaced_and_discarded() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2701, 0x40))
+            .unwrap();
+        // A writer that died between installing its frame and renaming its
+        // record leaves exactly this behind.
+        let orphan = std::fs::read(frame_path(&directory, 2)).unwrap();
+        std::fs::write(frame_path(&directory, 3), &orphan).unwrap();
+
+        let (reopened, receipt) = RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.read_authority().generation(),
+            2,
+            "the orphan is not authority"
+        );
+        assert_eq!(receipt.unwrap().acknowledged_delta_count(), 1);
+        drop(reopened);
+
+        // The next append lands at the orphan's generation and replaces it.
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2702, 0x41))
+            .unwrap();
+        assert_ne!(std::fs::read(frame_path(&directory, 3)).unwrap(), orphan);
+        assert_eq!(acknowledged_frame_count(&directory), 2);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "replaced orphan",
+        );
+
+        // A full promotion with an orphan past head discards it rather than
+        // refusing forever.
+        std::fs::write(frame_path(&directory, 4), &orphan).unwrap();
+        manager.persistence().set_max_journal_frames_for_test(0);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2703, 0x42))
+            .expect("a stale frame past head must not wedge a full promotion");
+        assert_eq!(record_version(&directory), 3);
+        assert!(
+            !frame_path(&directory, 4).exists(),
+            "the orphan is discarded"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "promoted past orphan",
+        );
+    }
+
+    #[test]
+    fn a_frame_encoder_that_cannot_reproduce_the_successor_falls_back_to_a_full_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2801, 0x50))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+
+        manager.persistence().break_frame_encoder_for_test(true);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2802, 0x51))
+            .expect("a refused frame costs a full snapshot, never the publication");
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "the publication landed as a full snapshot"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        manager.persistence().break_frame_encoder_for_test(false);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "fallback",
+        );
+    }
+
+    #[test]
+    fn a_frame_that_misses_a_field_is_refused_by_the_writer_before_it_is_persisted() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let current = manager.read_authority().snapshot().clone();
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2851);
+        manager.commit_repository_transaction(removal).unwrap();
+        let next = manager.read_authority().snapshot().clone();
+
+        let honest = crate::storage::AuthorityFrame::encode(&current, &next)
+            .expect("the writer's frame reproduces the successor");
+        let mut applied = current.clone();
+        honest.apply(&mut applied).unwrap();
+        assert_eq!(applied.repository_authority, next.repository_authority);
+        assert_eq!(applied.changes, next.changes);
+
+        // A frame that dropped its new change still applies as a patch, and
+        // the head it builds is not the successor. Two things keep that from
+        // ever being served: the writer proves reproduction before persisting
+        // (which is why `encode` and not a hand-built frame is the only path
+        // to a durable frame), and a head that does not recompute to the roots
+        // the frame acknowledged fails admission on any open that has no
+        // proof for it.
+        let mut without_change = honest.clone();
+        without_change.changes.clear();
+        without_change.admission_policies.clear();
+        let mut crippled = current.clone();
+        without_change.apply(&mut crippled).unwrap();
+        assert_ne!(crippled.changes, next.changes);
+        let error = crippled
+            .validate_storage_admission()
+            .expect_err("a head that lost a change cannot pass admission");
+        assert!(
+            error.to_string().contains("change not found")
+                || error.to_string().contains("root bundle")
+                || error.to_string().contains("policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_indeterminate_frame_append_is_reconciled_by_the_next_commit() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2901);
+
+        backend.set_delta_before_authority_commit_hook(|| {
+            // The record write claims and promotes its candidate through two
+            // parent syncs; failing the third leaves the record installed but
+            // its durability unconfirmed.
+            crate::storage::mmap::fail_parent_sync_after(2);
+        });
+        let error = manager
+            .commit_repository_transaction(removal.clone())
+            .expect_err("an installed frame with a lost durability acknowledgement must fail");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            1,
+            "the frame was installed"
+        );
+
+        let receipt = manager
+            .commit_repository_transaction(removal)
+            .expect("the retained frame candidate reconciles as committed");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(manager.read_authority().generation(), 2);
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            1,
+            "no second frame was appended"
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "reconciled",
+        );
+    }
+
+    #[test]
+    fn freezes_reconstruct_a_journal_head_and_a_freezing_commit_compacts_it() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3001, 0x60))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+
+        let expected_roots = manager.read_authority().roots().clone();
+        let frozen = manager
+            .freeze_current_authority(&expected_roots)
+            .expect("a journal head freezes");
+        assert_eq!(frozen.roots(), &expected_roots);
+        assert_same_authority(&manager.read_authority(), frozen.authority(), "frozen");
+        drop(frozen);
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(overlay_publication(
+                &manager,
+                0xf2_2347_3002,
+                0x61,
+            ))
+            .unwrap();
+        assert_eq!(receipt.generation, 3);
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "a freezing commit writes a full snapshot"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        drop(freeze);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "after freezing commit",
         );
     }
 }
