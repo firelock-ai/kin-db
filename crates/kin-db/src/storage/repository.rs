@@ -1035,11 +1035,39 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     }
 }
 
+/// The phase split of the most recent publication persisted on this thread.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistencePhases {
+    serialize_ms: u128,
+    write_ms: u128,
+    payload_bytes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_PERSISTENCE_PHASES: std::cell::Cell<Option<PersistencePhases>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn last_persistence_phases() -> Option<PersistencePhases> {
+    LAST_PERSISTENCE_PHASES.with(std::cell::Cell::get)
+}
+
 /// Name the two persistence phases of one snapshot publication.
 ///
 /// Serialization and the durable backend write live behind one persist call,
 /// so a slow publication could not previously say which side cost the time.
 fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapshot_bytes: usize) {
+    #[cfg(test)]
+    LAST_PERSISTENCE_PHASES.with(|phases| {
+        phases.set(Some(PersistencePhases {
+            serialize_ms,
+            write_ms,
+            payload_bytes: snapshot_bytes,
+        }))
+    });
     if serialize_ms + write_ms >= SLOW_PUBLICATION_PHASE.as_millis() {
         tracing::info!(
             serialize_ms,
@@ -14130,6 +14158,146 @@ mod tests {
             samples[samples.len() / 2],
             samples[0],
             samples[samples.len() - 1]
+        );
+    }
+
+    fn directory_bytes(path: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() {
+                    total += directory_bytes(&entry.path());
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+        total
+    }
+
+    fn encoded_len<T: Serialize>(value: &T) -> usize {
+        rmp_serde::to_vec(value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0)
+    }
+
+    /// Local, non-citable persistence probe for FIR-2347: what one
+    /// workspace-scoped publication writes through the real local backend, and
+    /// how long the durable write takes, on the same synthetic 20k-entity store
+    /// the preparation bench uses. Run explicitly in release mode:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     repository_authority_publication_write_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn repository_authority_publication_write_bench() {
+        let build_started = std::time::Instant::now();
+        let store = build_synthetic_history_store(40, 500, 20, 100);
+        let (seed_bytes, _) = store
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic store persisted its head");
+        eprintln!(
+            "store: {} entities, {} relations, {} changes, {} snapshot bytes, built in {:.1}s",
+            store.entity_count,
+            store.relation_count,
+            store.change_count,
+            seed_bytes.len(),
+            build_started.elapsed().as_secs_f64()
+        );
+        {
+            let head = GraphSnapshot::from_bytes(&seed_bytes).unwrap();
+            let envelope = head.repository_authority.as_ref().unwrap();
+            eprintln!(
+                "composition: changes {} bytes, envelope {} bytes (workspaces {} bytes, operation_log {} bytes, receipts {} bytes, admission_policies {} bytes)",
+                encoded_len(&head.changes),
+                encoded_len(envelope),
+                encoded_len(&envelope.workspaces),
+                encoded_len(&envelope.operation_log),
+                encoded_len(&envelope.receipts),
+                encoded_len(&envelope.admission_policies),
+            );
+        }
+
+        let dir = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(dir.path()));
+        backend
+            .save_snapshot(
+                repository_id().as_str(),
+                &seed_bytes,
+                crate::storage::GENERATION_INIT,
+            )
+            .unwrap();
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let namespace = dir.path().join(repository_id().as_str());
+
+        let rounds = 8usize;
+        let mut wall = Vec::with_capacity(rounds);
+        let mut write = Vec::with_capacity(rounds);
+        let mut serialize = Vec::with_capacity(rounds);
+        let mut payload = Vec::with_capacity(rounds);
+        let mut disk = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let relation = indexed_overlay_relation(&store, round);
+            let transaction = semantic_workspace_transaction(
+                &manager,
+                0xf2_2347_1000 + round as u128,
+                WorkspaceSemanticDelta::new_with_external_references(
+                    Vec::new(),
+                    vec![RelationDelta::Added { new: relation }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let before = directory_bytes(&namespace);
+            let started = std::time::Instant::now();
+            manager.commit_repository_transaction(transaction).unwrap();
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let phases = last_persistence_phases().expect("the publication recorded its phases");
+            let after = directory_bytes(&namespace);
+            eprintln!(
+                "round {round}: commit {elapsed_ms:.1} ms, serialize {} ms, write {} ms, payload {} bytes, namespace grew {} bytes",
+                phases.serialize_ms,
+                phases.write_ms,
+                phases.payload_bytes,
+                after.saturating_sub(before)
+            );
+            wall.push(elapsed_ms);
+            write.push(phases.write_ms as f64);
+            serialize.push(phases.serialize_ms as f64);
+            payload.push(phases.payload_bytes as f64);
+            disk.push(after.saturating_sub(before) as f64);
+        }
+        let median = |samples: &mut Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        eprintln!(
+            "medians over {rounds} publications: commit {:.1} ms, serialize {:.1} ms, write {:.1} ms, payload {:.0} bytes, namespace growth {:.0} bytes",
+            median(&mut wall),
+            median(&mut serialize),
+            median(&mut write),
+            median(&mut payload),
+            median(&mut disk),
+        );
+
+        let reopen_started = std::time::Instant::now();
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        eprintln!(
+            "reopen after {rounds} publications: {:.1} ms, generation {}, by history validation {}",
+            reopen_started.elapsed().as_secs_f64() * 1000.0,
+            reopened.read_authority().generation(),
+            reopened.opened_by_history_validation()
         );
     }
 }
