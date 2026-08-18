@@ -14854,7 +14854,7 @@ mod tests {
     fn overlay_publication(
         manager: &RepositoryAuthorityManager<LocalFileBackend>,
         operation: u128,
-        salt: u8,
+        fingerprint_seed: u8,
     ) -> RepositoryTransaction {
         semantic_workspace_transaction(
             manager,
@@ -14863,9 +14863,9 @@ mod tests {
                 vec![EntityDelta::Added {
                     new: semantic_test_entity(
                         "src/lib.rs",
-                        &format!("kin_{salt}"),
+                        &format!("kin_{fingerprint_seed}"),
                         LanguageId::Rust,
-                        salt,
+                        fingerprint_seed,
                     ),
                 }],
                 Vec::new(),
