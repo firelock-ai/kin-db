@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Windows Authority (nightly)
+
+# The Windows leg used to ride the `Check & Test` matrix on every pull request
+# and every merge-queue build. It is not a required status context on either
+# protection surface here, classic branch protection or the rulesets, so it
+# gated nothing while costing the longest job in the fleet, around 13.6 minutes,
+# three times per landing. PR 202 shows the ordering directly: the required
+# `Check & Test (ubuntu-latest)` completed at 01:40:49Z, the PR merged at
+# 01:42:13Z, and this Windows leg finished at 01:43:06Z, 53 seconds after the
+# commit had already landed.
+#
+# Moving it to a schedule keeps the coverage and stops paying for it three
+# times per landing. What that trades away is stated plainly: a Windows-only
+# breakage is now found within a day rather than on the pull request that
+# introduced it. That is the right trade for a leg nothing was waiting on, and
+# it is only safe because the failure now reaches a person. See
+# `scheduled-failure-alarm.yml` beside this file: a failing run here opens and
+# escalates one issue, and a later green run closes it.
+#
+# Kept identical to the pull-request legs on purpose, and that is enforced
+# rather than asked for: `scripts/check-windows-nightly-parity.sh` runs from
+# the required CI job and fails the pull request if these steps drift from the
+# matrix they came out of.
+
+on:
+  schedule:
+    # 07:17 UTC. Off the hour deliberately: GitHub delays scheduled runs
+    # queued on the hour, when everyone else's crons fire.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  windows:
+    name: Check & Test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy, rustfmt
+
+      # Key on the manifests, not on Cargo.lock. kin-db is a library workspace
+      # and gitignores its lockfile, so no Cargo.lock exists when this step
+      # runs and `hashFiles` returns an empty string. That left the key frozen
+      # at `<os>-cargo-`, and a cache key is immutable, so every later run hit
+      # the primary key and skipped the save. The 2026-08-12 main run says so
+      # in its own log: "Cache hit occurred on the primary key Linux-cargo-,
+      # not saving cache." The cache had stopped tracking the dependency set
+      # entirely while still reading as a hit.
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        shell: bash
+        # CLIPPY BURN-DOWN ALLOW-LIST (kin-db).
+        # kin-db is the retrieval stack; during the freeze, behavior-adjacent code
+        # edits on main are FORBIDDEN, so these pre-existing lints are temporarily
+        # ALLOW-LISTED here (CI-config only) instead of fixed in code. -D warnings
+        # still applies to everything else, so no NEW lint can slip in. Burn these
+        # down one at a time post-freeze (smallest blast radius first); delete each
+        # -A line as its lint reaches zero.
+        # PRIORITY REVIEW: clippy::suspicious_open_options belongs to the
+        # truncate-cousin class (cf. kin-vector .truncate(false) fix); verify
+        # open-options intent before clearing, do NOT blindly accept a clippy
+        # autofix here.
+        # NOTE: the rustc `deprecated` lint is no longer allow-listed:
+        # all kin-db call sites were migrated to the graph-assigned ArtifactId via
+        # the `artifact_index` lookup, so -D warnings now denies it here too.
+        run: |
+          cargo clippy --all-targets -- -D warnings \
+            -A clippy::assertions_on_constants \
+            -A clippy::blocks_in_conditions \
+            -A clippy::cloned_ref_to_slice_refs \
+            -A clippy::field_reassign_with_default \
+            -A clippy::items_after_test_module \
+            -A clippy::large_enum_variant \
+            -A clippy::let_and_return \
+            -A clippy::let_unit_value \
+            -A clippy::manual_checked_ops \
+            -A clippy::needless_borrows_for_generic_args \
+            -A clippy::needless_return \
+            -A clippy::redundant_pattern_matching \
+            -A clippy::suspicious_open_options \
+            -A clippy::type_complexity \
+            -A clippy::unnecessary_sort_by \
+            -A clippy::useless_conversion
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        # HF_HUB_OFFLINE keeps the run deterministic/offline. These three tests
+        # construct a real embedder and need HF network plus nomic weights, which
+        # CI cannot fetch, so they are skipped here (CI-config, no test code
+        # touched) until an offline stub-weights fixture exists. Everything else
+        # (graph/storage/search/vector/text) is pure-Rust and runs.
+        #
+        # many_vectors_search_quality is no longer skipped. It was, because its
+        # fixture inserted 100 vectors with only 8 distinct patterns and then
+        # asserted which of the identical-distance duplicates won the tie, which
+        # flipped when kin-vector moved to a key-hash tie-break. The fixture was
+        # fixed on 2026-06-12 to assert what approximate kNN actually promises,
+        # that the top hit's stored vector equals the query vector, and it has
+        # passed since. A skip outliving its cause hides a real vector-search
+        # regression, so the reason has to expire with the defect.
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --
+          --skip process_embedding_queue_without_embeddings_is_noop
+          --skip default_dimensions_match_default_model
+          --skip test_vector_index_dimension_mismatch_auto_recovery
+
+      - name: 100K hydration smoke guard
+        # This is a wall-clock guard, so run it outside the parallel suite.
+        # `--exact` preserves the macOS/Linux coverage while one test thread
+        # prevents the long save/reload test from competing for the runner.
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --test scale_and_failure scale_100k_entities --
+          --ignored
+          --exact
+          --test-threads=1
+
+      # Runs from a required context on purpose. The nightly Windows workflow
+      # only carries the coverage this matrix gave up if it keeps running the
+      # same steps, and two files holding one step list drift the first time
+      # somebody edits either of them. The same step is present in the nightly,
+      # where it skips, which is what keeps the two lists identical.
+      - name: Check the nightly Windows job still runs these steps
+        if: runner.os == 'Linux'
+        run: ./scripts/check-windows-nightly-parity.sh
