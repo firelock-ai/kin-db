@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Scheduled Failure Alarm
+
+# `windows-nightly.yml` runs on a cron, so nothing turns red where anyone is
+# looking when it breaks. Without this, moving the Windows leg to a schedule
+# would not make it cheaper, it would retire it: a red scheduled run only
+# reaches somebody who was already looking for it.
+#
+# The shared implementation opens one issue per failing scheduled workflow,
+# escalates the consecutive count in that same issue rather than filing another,
+# and closes it on the next scheduled success.
+#
+# This watches only the nightly workflow, whose sole trigger is the schedule, so
+# there is no event filter here to get wrong. The shared workflow filters on the
+# run event as well, which is belt and braces rather than the only guard.
+
+on:
+  workflow_run:
+    workflows: ["Windows Authority (nightly)"]
+    types: [completed]
+
+permissions:
+  issues: write
+
+jobs:
+  alarm:
+    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.32

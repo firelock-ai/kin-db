@@ -85,8 +85,17 @@ jobs:
     name: Check & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      # windows-latest left this matrix for `windows-nightly.yml`. It was not a
+      # required status context on either protection surface, classic branch
+      # protection or the rulesets, so it gated nothing here while running on
+      # the pull request, the merge-queue build, and the push to main. PR 202
+      # shows the ordering directly: the required ubuntu context completed at
+      # 01:40:49Z, the PR merged at 01:42:13Z, and the Windows leg finished at
+      # 01:43:06Z, 53 seconds after the commit had already landed. The coverage
+      # is unchanged and moved to a daily schedule with a failure alarm; only
+      # the three-times-per-landing cost of the fleet's longest job is gone.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -189,6 +198,15 @@ jobs:
           --ignored
           --exact
           --test-threads=1
+
+      # Runs from a required context on purpose. The nightly Windows workflow
+      # only carries the coverage this matrix gave up if it keeps running the
+      # same steps, and two files holding one step list drift the first time
+      # somebody edits either of them. The same step is present in the nightly,
+      # where it skips, which is what keeps the two lists identical.
+      - name: Check the nightly Windows job still runs these steps
+        if: runner.os == 'Linux'
+        run: ./scripts/check-windows-nightly-parity.sh
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
