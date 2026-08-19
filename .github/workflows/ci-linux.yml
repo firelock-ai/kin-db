@@ -42,6 +42,11 @@ jobs:
   linux-build-test:
     name: Linux Build & Test (no Metal)
     runs-on: ubuntu-latest
+    # This job produces a required status context, so a hang here does not fail
+    # a pull request, it blocks one, and on a merge-queue build it ejects the PR
+    # with nothing on the PR saying why. Without this the ceiling is GitHub's
+    # six-hour default. Normal runtime is around nine minutes.
+    timeout-minutes: 30
     steps:
       # kin-db's committed .cargo/config.toml resolves kin-model, kin-infer,
       # kin-vector, and kin-search through the Kin sparse registry. No sibling
@@ -113,7 +118,29 @@ jobs:
       # compiler; musl-tools provides musl-gcc. The same install carries the
       # downstream release build.
       - name: Install musl C toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # Unbounded, this hung for 27 minutes and counting on 2026-08-19,
+        # stalled inside `apt-get` on an Ubuntu mirror while Build, Test and the
+        # storage-backend leg had all already passed. It is a known shape in
+        # this fleet: a stalled mirror holds an apt call open until the job
+        # budget runs out.
+        #
+        # Each call is bounded and the sequence is retried, because a stalled
+        # mirror is transient and a genuinely missing package is not, and an
+        # unbounded call makes those two indistinguishable. `-k` escalates to
+        # KILL, since a child that ignores TERM would otherwise keep `timeout`
+        # waiting on it.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout -k 30 180 sudo apt-get update -o Acquire::Retries=3 \
+               && timeout -k 30 300 sudo apt-get install -y --no-install-recommends musl-tools; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+            sleep $(( attempt * 10 ))
+          done
+          echo "::error::musl toolchain install failed after 3 bounded attempts" >&2
+          exit 1
 
       # Every downstream release links this crate statically against musl, so a
       # musl-only compile error reaches a release build before it reaches any
