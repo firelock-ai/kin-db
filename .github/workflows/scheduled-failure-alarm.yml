@@ -22,6 +22,12 @@ on:
     types: [completed]
 
 permissions:
+  # Both scopes, not just `issues: write`. Declaring a `permissions:` block
+  # sets every unlisted scope to `none`, and a called workflow never holds more
+  # than its caller granted, so omitting `contents: read` leaves the shared
+  # alarm unable to check out the helper it runs. GitHub reports that when it
+  # loads the workflow, before any job starts and with no job log to read.
+  contents: read
   issues: write
 
 jobs:
