@@ -30,6 +30,15 @@ permissions:
   contents: read
   issues: write
 
+# Pinned past v0.1.32 on purpose. The alarm first shipped in v0.1.32 declaring
+# `permissions: issues: write` alone, which sets every other scope to `none` and
+# leaves it unable to check out its own helper. Confirm the pin actually carries
+# the fix before merging, rather than trusting this number:
+#
+#   gh api repos/firelock-ai/kin-actions/contents/.github/workflows/scheduled-failure-alarm.yml \
+#     --ref v0.1.33 --jq '.content' | base64 -d | grep -A2 '^permissions:'
+#
+# If that does not print `contents: read`, the pin is wrong.
 jobs:
   alarm:
-    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.32
+    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.33
