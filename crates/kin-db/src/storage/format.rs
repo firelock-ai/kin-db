@@ -577,11 +577,15 @@ impl GraphSnapshot {
         &self,
         replay: GitProjectionTreeReplay,
     ) -> Result<(), crate::error::KinDbError> {
+        let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
         validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
+        let changes_ms = timer.lap_ms();
         for (id, reference) in &self.external_references {
             validate_external_reference_entry(id, reference, "snapshot")?;
         }
+        let external_references_ms = timer.lap_ms();
         self.validate_enrichment_admission()?;
+        let enrichment_ms = timer.lap_ms();
         let entity_ids: HashSet<_> = self.entities.keys().copied().collect();
         let artifact_ids: HashSet<_> = self
             .resolved_tree
@@ -602,6 +606,7 @@ impl GraphSnapshot {
             verification_runs: &run_ids,
             external_references: &external_reference_ids,
         };
+        let node_id_sets_ms = timer.lap_ms();
         for relation in self.relations.values() {
             for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
                 if !graph_node_ids.contains(node) {
@@ -612,9 +617,37 @@ impl GraphSnapshot {
                 }
             }
         }
+        let relation_endpoints_ms = timer.lap_ms();
         if let Some(authority) = &self.repository_authority {
             authority.validate_against_snapshot_with(self, replay)?;
         }
+        let repository_authority_ms = timer.lap_ms();
+        tracing::debug!(
+            target: "kin_db::admission",
+            changes_ms,
+            external_references_ms,
+            enrichment_ms,
+            node_id_sets_ms,
+            relation_endpoints_ms,
+            repository_authority_ms,
+            changes = self.changes.len(),
+            entities = self.entities.len(),
+            relations = self.relations.len(),
+            shallow_files = self.shallow_files.len(),
+            "snapshot storage admission validation"
+        );
+        #[cfg(test)]
+        crate::storage::repository::record_preparation_phase(
+            "storage_admission",
+            vec![
+                ("changes_ms", changes_ms),
+                ("external_references_ms", external_references_ms),
+                ("enrichment_ms", enrichment_ms),
+                ("node_id_sets_ms", node_id_sets_ms),
+                ("relation_endpoints_ms", relation_endpoints_ms),
+                ("repository_authority_ms", repository_authority_ms),
+            ],
+        );
         Ok(())
     }
 

@@ -582,6 +582,7 @@ impl PersistedRepositoryAuthority {
         snapshot: &GraphSnapshot,
         replay: GitProjectionTreeReplay,
     ) -> Result<(), KinDbError> {
+        let mut timer = PublicationPhaseTimer::start();
         if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
             return Err(storage(format!(
                 "unsupported repository authority schema {}; expected {}",
@@ -644,7 +645,9 @@ impl PersistedRepositoryAuthority {
                 )));
             }
         }
+        let shape_ms = timer.lap_ms();
         validate_git_authority_shape_and_projection(snapshot, self, replay)?;
+        let git_projection_ms = timer.lap_ms();
         for workspace in &self.workspaces {
             workspace.validate()?;
             if workspace.repository_id != self.repository_id {
@@ -734,15 +737,20 @@ impl PersistedRepositoryAuthority {
             ));
         }
 
+        let operation_log_ms = timer.lap_ms();
         let derived_policies = derive_admission_policies(&snapshot.changes)?;
         if derived_policies != self.admission_policies {
             return Err(storage(
                 "persisted per-change admission state does not match semantic history".to_string(),
             ));
         }
+        let admission_policies_ms = timer.lap_ms();
         validate_unscoped_history_caches(snapshot)?;
+        let history_caches_ms = timer.lap_ms();
         validate_ref_targets(snapshot, self)?;
+        let ref_targets_ms = timer.lap_ms();
         validate_workspace_authority(snapshot, self)?;
+        let workspace_authority_ms = timer.lap_ms();
 
         let computed = compute_roots(snapshot, self, self.roots.generation)?;
         if computed != self.roots {
@@ -750,6 +758,33 @@ impl PersistedRepositoryAuthority {
                 "repository root bundle does not recompute from the persisted envelope".to_string(),
             ));
         }
+        let compute_roots_ms = timer.lap_ms();
+        tracing::debug!(
+            target: "kin_db::admission",
+            shape_ms,
+            git_projection_ms,
+            operation_log_ms,
+            admission_policies_ms,
+            history_caches_ms,
+            ref_targets_ms,
+            workspace_authority_ms,
+            compute_roots_ms,
+            "repository authority validated against snapshot"
+        );
+        #[cfg(test)]
+        record_preparation_phase(
+            "authority_against_snapshot",
+            vec![
+                ("shape_ms", shape_ms),
+                ("git_projection_ms", git_projection_ms),
+                ("operation_log_ms", operation_log_ms),
+                ("admission_policies_ms", admission_policies_ms),
+                ("history_caches_ms", history_caches_ms),
+                ("ref_targets_ms", ref_targets_ms),
+                ("workspace_authority_ms", workspace_authority_ms),
+                ("compute_roots_ms", compute_roots_ms),
+            ],
+        );
         Ok(())
     }
 }
@@ -2529,6 +2564,23 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
         next,
         output: receipt,
     })
+}
+
+// Per-phase lap record collected during one preparation, for attribution.
+// Production reads these numbers off the `tracing` events the same call sites
+// emit; a test harness cannot install a subscriber without a new dependency,
+// so the same laps are also appended here in call order.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREPARATION_PHASE_LOG: std::cell::RefCell<
+        Vec<(&'static str, Vec<(&'static str, u128)>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Append one phase breakdown to the attribution log.
+#[cfg(test)]
+pub(crate) fn record_preparation_phase(name: &'static str, laps: Vec<(&'static str, u128)>) {
+    PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().push((name, laps)));
 }
 
 /// Lap timer for the publication phase breakdown.
@@ -4761,9 +4813,13 @@ fn materialize_workspace_graph_snapshot_from_base(
     // Materialization consumes this graph as a snapshot and drops it. Building a
     // text index for it would index every entity to answer no query: the caller
     // holding the workspace open builds its own against the persistent index.
+    let mut timer = PublicationPhaseTimer::start();
     let graph = InMemoryGraph::from_snapshot_without_text_index(base)?;
+    let build_graph_ms = timer.lap_ms();
     graph.apply_transaction_delta(&delta)?;
+    let apply_delta_ms = timer.lap_ms();
     let materialized = graph.to_snapshot();
+    let to_snapshot_ms = timer.lap_ms();
     if materialized.resolved_tree != workspace.tree {
         return Err(storage(format!(
             "workspace {} semantic overlay did not resolve its exact persisted tree",
@@ -4771,6 +4827,28 @@ fn materialize_workspace_graph_snapshot_from_base(
         )));
     }
     materialized.validate_storage_admission()?;
+    let admission_ms = timer.lap_ms();
+    tracing::debug!(
+        target: "kin_db::admission",
+        build_graph_ms,
+        apply_delta_ms,
+        to_snapshot_ms,
+        admission_ms,
+        entity_deltas = delta.entity_deltas.len(),
+        relation_deltas = delta.relation_deltas.len(),
+        tree_deltas = delta.tree_deltas.len(),
+        "workspace graph materialization"
+    );
+    #[cfg(test)]
+    record_preparation_phase(
+        "workspace_materialization",
+        vec![
+            ("build_graph_ms", build_graph_ms),
+            ("apply_delta_ms", apply_delta_ms),
+            ("to_snapshot_ms", to_snapshot_ms),
+            ("admission_ms", admission_ms),
+        ],
+    );
     Ok(materialized)
 }
 
@@ -4880,6 +4958,7 @@ fn resolve_workspace_base_graph_snapshot(
     // them, and fed a second full clone into a throwaway `InMemoryGraph`
     // whose admission pass, relation and entity indexes, and Merkle cache
     // were discarded after one history replay.
+    let mut timer = PublicationPhaseTimer::start();
     let resolved = match base_target {
         Some(target) => {
             let change_id = target_change_id(metadata, target)?;
@@ -4890,6 +4969,7 @@ fn resolve_workspace_base_graph_snapshot(
         }
         None => None,
     };
+    let history_resolve_ms = timer.lap_ms();
     let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
     {
         Some(state) => (
@@ -4949,8 +5029,29 @@ fn resolve_workspace_base_graph_snapshot(
         repository_authority: None,
         external_references,
     };
+    let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
+    let adjacency_ms = timer.lap_ms();
     base.validate_storage_admission()?;
+    let admission_ms = timer.lap_ms();
+    tracing::debug!(
+        target: "kin_db::admission",
+        history_resolve_ms,
+        domain_clone_ms,
+        adjacency_ms,
+        admission_ms,
+        "workspace base graph resolution"
+    );
+    #[cfg(test)]
+    record_preparation_phase(
+        "workspace_base_resolution",
+        vec![
+            ("history_resolve_ms", history_resolve_ms),
+            ("domain_clone_ms", domain_clone_ms),
+            ("adjacency_ms", adjacency_ms),
+            ("admission_ms", admission_ms),
+        ],
+    );
     Ok(base)
 }
 
@@ -16549,6 +16650,148 @@ mod tests {
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "after freezing commit",
+        );
+    }
+}
+
+/// FIR-2334 attribution harness.
+///
+/// Runs the two dominant successor-preparation phases against a real
+/// on-disk repository authority and prints the per-function breakdown. It is
+/// ignored by default and needs `KIN_FIR2334_STORE` naming a `kindb`
+/// directory, so the default suite never opens a multi-gigabyte store.
+#[cfg(test)]
+mod fir2334_attribution {
+    use super::*;
+
+    fn print_phase_log(label: &str) {
+        PREPARATION_PHASE_LOG.with(|log| {
+            for (name, laps) in log.borrow().iter() {
+                let total: u128 = laps.iter().map(|(_, ms)| *ms).sum();
+                let detail = laps
+                    .iter()
+                    .map(|(field, ms)| format!("{field}={ms}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("[{label}] {name} total_ms={total} {detail}");
+            }
+            log.borrow_mut().clear();
+        });
+    }
+
+    #[test]
+    #[ignore = "needs KIN_FIR2334_STORE naming a real kindb directory"]
+    fn attribute_one_successor_preparation() {
+        let store = std::env::var("KIN_FIR2334_STORE")
+            .expect("set KIN_FIR2334_STORE to a <repo>/.kin/kindb directory");
+        let repo = std::env::var("KIN_FIR2334_REPO")
+            .expect("set KIN_FIR2334_REPO to the repository id under that directory");
+        let repository_id = RepositoryId::new(&repo).expect("repository id");
+        let backend = Arc::new(crate::storage::backend::LocalFileBackend::new(&store));
+
+        let open_started = std::time::Instant::now();
+        let manager = RepositoryAuthorityManager::open(repository_id.clone(), backend)
+            .expect("open repository authority");
+        println!(
+            "[open] authority_open_ms={}",
+            open_started.elapsed().as_millis()
+        );
+
+        let lease = manager.read_authority();
+        let snapshot = lease.snapshot();
+        let metadata = lease.metadata();
+        println!(
+            "[store] changes={} entities={} relations={} shallow_files={} artifacts={} workspaces={} operations={} receipts={}",
+            snapshot.changes.len(),
+            snapshot.entities.len(),
+            snapshot.relations.len(),
+            snapshot.shallow_files.len(),
+            snapshot.resolved_tree.artifacts().count(),
+            metadata.workspaces.len(),
+            metadata.operation_log.len(),
+            metadata.receipts.len(),
+        );
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+
+        let started = std::time::Instant::now();
+        snapshot
+            .validate_storage_admission_with(GitProjectionTreeReplay::Proven)
+            .expect("top-level storage admission");
+        println!(
+            "[TERM] storage_admission_ms={}",
+            started.elapsed().as_millis()
+        );
+        print_phase_log("storage_admission");
+
+        let Some(workspace) = metadata.workspaces.first().cloned() else {
+            println!("[TERM] workspace_ms=0 (no workspace on this authority)");
+            return;
+        };
+
+        let started = std::time::Instant::now();
+        let base = resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            workspace.base_target.as_ref(),
+        )
+        .expect("resolve workspace base");
+        println!(
+            "[TERM] resolve_workspace_base_ms={}",
+            started.elapsed().as_millis()
+        );
+        println!(
+            "[base] changes={} entities={} relations={} artifacts={}",
+            base.changes.len(),
+            base.entities.len(),
+            base.relations.len(),
+            base.resolved_tree.artifacts().count(),
+        );
+        print_phase_log("resolve_base");
+
+        let started = std::time::Instant::now();
+        let materialized = materialize_workspace_graph_snapshot_from_base(base.clone(), &workspace)
+            .expect("materialize workspace graph");
+        println!(
+            "[TERM] materialize_workspace_ms={}",
+            started.elapsed().as_millis()
+        );
+        println!(
+            "[materialized] changes={} entities={} relations={} artifacts={}",
+            materialized.changes.len(),
+            materialized.entities.len(),
+            materialized.relations.len(),
+            materialized.resolved_tree.artifacts().count(),
+        );
+        print_phase_log("materialize");
+
+        let started = std::time::Instant::now();
+        let overlay =
+            derive_workspace_semantic_overlay(&base, &materialized).expect("derive overlay");
+        println!(
+            "[TERM] derive_overlay_ms={} entity_deltas={} relation_deltas={}",
+            started.elapsed().as_millis(),
+            overlay.entity_deltas().len(),
+            overlay.relation_deltas().len(),
+        );
+
+        let started = std::time::Instant::now();
+        let graph = InMemoryGraph::from_snapshot_without_text_index(materialized.clone())
+            .expect("build in-memory graph");
+        println!(
+            "[TERM] in_memory_graph_build_ms={}",
+            started.elapsed().as_millis()
+        );
+        let started = std::time::Instant::now();
+        let round_tripped = graph.to_snapshot();
+        println!("[TERM] to_snapshot_ms={}", started.elapsed().as_millis());
+        assert_eq!(round_tripped.entities.len(), materialized.entities.len());
+
+        let started = std::time::Instant::now();
+        let mut adjacency = materialized.clone();
+        rebuild_snapshot_adjacency(&mut adjacency);
+        println!(
+            "[TERM] rebuild_adjacency_ms={}",
+            started.elapsed().as_millis()
         );
     }
 }
