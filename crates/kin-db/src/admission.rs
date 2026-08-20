@@ -574,7 +574,7 @@ fn sensitive_finding(path: &RepoPath, contents: &[u8]) -> Option<SensitiveFindin
     {
         return Some(SensitiveFindingKind::CloudCredential);
     }
-    credential_assignment(contents).then_some(SensitiveFindingKind::CredentialAssignment)
+    credential_assignment(path, contents).then_some(SensitiveFindingKind::CredentialAssignment)
 }
 
 fn sensitive_path(path: &RepoPath) -> bool {
@@ -626,10 +626,11 @@ fn contains_prefixed_credential(haystack: &[u8], prefix: &[u8], minimum_tail: us
         })
 }
 
-fn credential_assignment(contents: &[u8]) -> bool {
+fn credential_assignment(path: &RepoPath, contents: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(contents) else {
         return false;
     };
+    let bare_values_can_be_secrets = !is_program_source_path(path);
     text.lines().any(|line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
@@ -666,11 +667,69 @@ fn credential_assignment(contents: &[u8]) -> bool {
         }) {
             return false;
         }
-        let value = line[split + 1..]
-            .trim()
-            .trim_matches(|character| matches!(character, '"' | '\''));
+        let Some(value) = credential_literal(&line[split + 1..], bare_values_can_be_secrets)
+        else {
+            return false;
+        };
         value.len() >= 8 && !is_placeholder_secret(value)
     })
+}
+
+/// The literal a right-hand side carries, or `None` when it carries none.
+///
+/// A credential is a literal. `token = term.strip()` is a call on a local and
+/// `token = next_token` is a reference to one, and neither can leak a secret
+/// this scanner could name. Bare unquoted values stay in scope for env, ini,
+/// yaml and shell style files, where an unquoted run really is the secret, and
+/// are refused in program source, where a bare word is always an identifier.
+fn credential_literal(right_hand_side: &str, bare_values_can_be_secrets: bool) -> Option<&str> {
+    let value = right_hand_side
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim_end();
+    let quote = value.chars().next()?;
+    if !matches!(quote, '"' | '\'') {
+        let opaque = value.bytes().all(is_opaque_secret_byte);
+        return (bare_values_can_be_secrets && opaque).then_some(value);
+    }
+    let body = &value[quote.len_utf8()..];
+    let end = body.find(quote)?;
+    let remainder = body[end + quote.len_utf8()..].trim_start();
+    let closes_the_line =
+        remainder.is_empty() || remainder.starts_with('#') || remainder.starts_with("//");
+    closes_the_line.then(|| &body[..end])
+}
+
+fn is_opaque_secret_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b':' | b'~'
+        )
+}
+
+/// Whether a bare word on the right of an assignment is necessarily an identifier.
+fn is_program_source_path(path: &RepoPath) -> bool {
+    let name = path
+        .as_bytes()
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default();
+    let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+        return false;
+    };
+    let extension = name[dot + 1..]
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    [
+        "rs", "py", "pyi", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java",
+        "kt", "kts", "scala", "rb", "php", "swift", "c", "h", "cc", "cpp", "cxx", "hpp", "hxx",
+        "hh", "cs", "m", "mm", "dart", "ex", "exs", "erl", "hrl", "hs", "lua", "pl", "pm", "zig",
+        "nim", "jl", "groovy", "clj", "cljs", "cljc", "fs", "fsx", "ml", "mli", "vue", "svelte",
+    ]
+    .iter()
+    .any(|candidate| extension.as_slice() == candidate.as_bytes())
 }
 
 fn is_placeholder_secret(value: &str) -> bool {
