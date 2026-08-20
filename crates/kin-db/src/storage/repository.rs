@@ -50,6 +50,7 @@ use crate::storage::backend::{
     SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
     MAX_SOURCE_BLOB_BYTES,
 };
+use crate::storage::change_validation::AdmittedChangeMap;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 
@@ -574,13 +575,15 @@ impl PersistedRepositoryAuthority {
 
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
-        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required)
+        let admitted = AdmittedChangeMap::admit(&snapshot.changes, "snapshot")?;
+        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required, &admitted)
     }
 
     pub(crate) fn validate_against_snapshot_with(
         &self,
         snapshot: &GraphSnapshot,
         replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
         if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
@@ -749,7 +752,7 @@ impl PersistedRepositoryAuthority {
         let history_caches_ms = timer.lap_ms();
         validate_ref_targets(snapshot, self)?;
         let ref_targets_ms = timer.lap_ms();
-        validate_workspace_authority(snapshot, self)?;
+        validate_workspace_authority(snapshot, self, Some(admitted))?;
         let workspace_authority_ms = timer.lap_ms();
 
         let computed = compute_roots(snapshot, self, self.roots.generation)?;
@@ -957,8 +960,12 @@ impl RepositoryAuthorityState {
                 return Ok(Some(snapshot));
             }
         }
-        let materialized =
-            materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace)?;
+        let materialized = materialize_workspace_graph_snapshot(
+            self.snapshot(),
+            self.metadata(),
+            workspace,
+            None,
+        )?;
         if let Some(prepared) = prepared {
             prepared.record(self.generation(), workspace, &materialized);
         }
@@ -3857,6 +3864,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         snapshot,
         metadata,
         mutation.new_base_target.as_ref(),
+        None,
     )?;
 
     let current_base_target = current.and_then(|workspace| workspace.base_target.as_ref());
@@ -3864,10 +3872,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
             next_base.clone()
         } else {
-            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target)?
+            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target, None)?
         };
     let current_graph = match current {
-        Some(workspace) => materialize_workspace_graph_snapshot_from_base(current_base, workspace)?,
+        Some(workspace) => {
+            materialize_workspace_graph_snapshot_from_base(current_base, workspace, None)?
+        }
         None => current_base,
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
@@ -3896,7 +3906,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
             next.workspace_id
         )));
     }
-    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next)?;
+    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?;
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
@@ -4461,16 +4471,31 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 /// payload and derives every entity revision timeline, exactly as each
 /// discarded rebuild did. Every later use is a read-only query against that
 /// validated decode.
+/// CARRY SITE 1 of 4. See `carry_sites_stay_enumerated`.
 struct SharedReplayGraph<'a> {
     snapshot: &'a GraphSnapshot,
+    admitted: Option<AdmittedChangeMap<'a>>,
     graph: std::cell::OnceCell<InMemoryGraph>,
     build_ms: std::cell::Cell<u128>,
 }
 
 impl<'a> SharedReplayGraph<'a> {
     fn new(snapshot: &'a GraphSnapshot) -> Self {
+        Self::new_with_admission(snapshot, None)
+    }
+
+    /// Build a replay view whose decode may carry an existing admission of
+    /// `snapshot`'s change map instead of repeating the pass.
+    ///
+    /// `None` validates exactly as `new` does, so a caller without a witness
+    /// is slower and never less safe.
+    fn new_with_admission(
+        snapshot: &'a GraphSnapshot,
+        admitted: Option<&AdmittedChangeMap<'a>>,
+    ) -> Self {
         Self {
             snapshot,
+            admitted: admitted.copied(),
             graph: std::cell::OnceCell::new(),
             build_ms: std::cell::Cell::new(0),
         }
@@ -4482,7 +4507,14 @@ impl<'a> SharedReplayGraph<'a> {
             let started = std::time::Instant::now();
             let mut replay = self.snapshot.clone();
             replay.repository_authority = None;
-            let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
+            // CARRY SITE: `replay.changes` is the clone made on the line above,
+            // of the map `self.admitted` witnesses.
+            let graph = match self.admitted.as_ref() {
+                Some(admitted) => {
+                    InMemoryGraph::from_admitted_snapshot_without_text_index(replay, admitted)?
+                }
+                None => InMemoryGraph::from_snapshot_without_text_index(replay)?,
+            };
             self.build_ms.set(started.elapsed().as_millis());
             let _ = self.graph.set(graph);
         }
@@ -4765,13 +4797,15 @@ fn materialize_workspace_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     let base = resolve_workspace_base_graph_snapshot(
         authority_snapshot,
         metadata,
         workspace.base_target.as_ref(),
+        admitted,
     )?;
-    materialize_workspace_graph_snapshot_from_base(base, workspace)
+    materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)
 }
 
 /// Materialize a workspace over a base graph the caller already resolved.
@@ -4784,6 +4818,7 @@ fn materialize_workspace_graph_snapshot(
 fn materialize_workspace_graph_snapshot_from_base(
     base: GraphSnapshot,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     let mut delta = workspace.semantic_overlay.transaction_delta();
     delta.tree_deltas = exact_tree_transition(&base.resolved_tree, &workspace.tree);
@@ -4814,7 +4849,12 @@ fn materialize_workspace_graph_snapshot_from_base(
     // text index for it would index every entity to answer no query: the caller
     // holding the workspace open builds its own against the persistent index.
     let mut timer = PublicationPhaseTimer::start();
-    let graph = InMemoryGraph::from_snapshot_without_text_index(base)?;
+    // CARRY SITE: `base.changes` came from `resolve_workspace_base_graph_snapshot`,
+    // which clones it from the map `admitted` witnesses.
+    let graph = match admitted {
+        Some(admitted) => InMemoryGraph::from_admitted_snapshot_without_text_index(base, admitted)?,
+        None => InMemoryGraph::from_snapshot_without_text_index(base)?,
+    };
     let build_graph_ms = timer.lap_ms();
     graph.apply_transaction_delta(&delta)?;
     let apply_delta_ms = timer.lap_ms();
@@ -4826,7 +4866,17 @@ fn materialize_workspace_graph_snapshot_from_base(
             workspace.workspace_id
         )));
     }
-    materialized.validate_storage_admission()?;
+    // CARRY SITE: the graph took its change map from `base` and a workspace
+    // transaction delta carries entity, relation, tree and external-reference
+    // deltas only, so `materialized.changes` is that same map.
+    match admitted {
+        Some(admitted) => {
+            let carried = AdmittedChangeMap::carried_from_clone(&materialized.changes, admitted);
+            materialized
+                .validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
+        }
+        None => materialized.validate_storage_admission()?,
+    }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
         target: "kin_db::admission",
@@ -4950,6 +5000,7 @@ fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     #[cfg(test)]
     WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
@@ -5032,7 +5083,15 @@ fn resolve_workspace_base_graph_snapshot(
     let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
     let adjacency_ms = timer.lap_ms();
-    base.validate_storage_admission()?;
+    // CARRY SITE: `base.changes` is `authority_snapshot.changes.clone()`, made
+    // in the struct literal above, and `admitted` witnesses that same map.
+    match admitted {
+        Some(admitted) => {
+            let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
+            base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
+        }
+        None => base.validate_storage_admission()?,
+    }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
         target: "kin_db::admission",
@@ -5228,12 +5287,13 @@ fn rebuild_snapshot_adjacency(snapshot: &mut GraphSnapshot) {
 fn validate_workspace_authority(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     // One decode serves every workspace's base-tree check instead of one
     // rebuild per workspace.
-    let replay = SharedReplayGraph::new(snapshot);
+    let replay = SharedReplayGraph::new_with_admission(snapshot, admitted);
     for workspace in &metadata.workspaces {
-        validate_workspace_state(&replay, snapshot, metadata, workspace)?;
+        validate_workspace_state(&replay, snapshot, metadata, workspace, admitted)?;
         for artifact in workspace.tree.artifacts() {
             workspace_artifact_projection_mtime(metadata, workspace, artifact.artifact_id)?;
         }
@@ -5253,9 +5313,10 @@ fn validate_workspace_state(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     validate_workspace_state_without_materialization(replay, snapshot, metadata, workspace)?;
-    materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?;
+    materialize_workspace_graph_snapshot(snapshot, metadata, workspace, admitted)?;
     Ok(())
 }
 
@@ -16733,6 +16794,7 @@ mod fir2334_attribution {
             snapshot,
             metadata,
             workspace.base_target.as_ref(),
+            None,
         )
         .expect("resolve workspace base");
         println!(
@@ -16749,8 +16811,9 @@ mod fir2334_attribution {
         print_phase_log("resolve_base");
 
         let started = std::time::Instant::now();
-        let materialized = materialize_workspace_graph_snapshot_from_base(base.clone(), &workspace)
-            .expect("materialize workspace graph");
+        let materialized =
+            materialize_workspace_graph_snapshot_from_base(base.clone(), &workspace, None)
+                .expect("materialize workspace graph");
         println!(
             "[TERM] materialize_workspace_ms={}",
             started.elapsed().as_millis()

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::storage::change_validation::validate_semantic_change_entries;
+use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{GitProjectionTreeReplay, PersistedRepositoryAuthority};
 use crate::types::*;
 
@@ -578,8 +578,39 @@ impl GraphSnapshot {
         replay: GitProjectionTreeReplay,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
-        validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
+        let admitted = AdmittedChangeMap::admit(&self.changes, "snapshot")?;
         let changes_ms = timer.lap_ms();
+        self.validate_storage_admission_after_changes(replay, &admitted, changes_ms, timer)
+    }
+
+    /// The same storage admission, minus the change-map pass `admitted`
+    /// already ran over this snapshot's own map.
+    ///
+    /// The witness cannot be forged and cannot be built from a map nobody
+    /// admitted, and the correspondence check below is by pointer identity, so
+    /// a witness for some other map refuses rather than licensing a skip. Every
+    /// other check runs exactly as it does above.
+    pub(crate) fn validate_storage_admission_carrying(
+        &self,
+        replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
+    ) -> Result<(), crate::error::KinDbError> {
+        if !admitted.describes(&self.changes) {
+            return Err(crate::error::KinDbError::StorageError(
+                "admitted change map does not describe this snapshot's change map".to_string(),
+            ));
+        }
+        let timer = crate::storage::repository::PublicationPhaseTimer::start();
+        self.validate_storage_admission_after_changes(replay, admitted, 0, timer)
+    }
+
+    fn validate_storage_admission_after_changes(
+        &self,
+        replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
+        changes_ms: u128,
+        mut timer: crate::storage::repository::PublicationPhaseTimer,
+    ) -> Result<(), crate::error::KinDbError> {
         for (id, reference) in &self.external_references {
             validate_external_reference_entry(id, reference, "snapshot")?;
         }
@@ -619,7 +650,7 @@ impl GraphSnapshot {
         }
         let relation_endpoints_ms = timer.lap_ms();
         if let Some(authority) = &self.repository_authority {
-            authority.validate_against_snapshot_with(self, replay)?;
+            authority.validate_against_snapshot_with(self, replay, admitted)?;
         }
         let repository_authority_ms = timer.lap_ms();
         tracing::debug!(
