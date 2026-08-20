@@ -17062,7 +17062,10 @@ mod replaywall_measurements {
         let mut parent: Option<SemanticChangeId> = None;
         let mut cumulative: u128 = 0;
         for index in 0..commits {
-            let mut change = synthetic_change_with_payload(index as u128, 4);
+            // No tree deltas: a native change that introduces artifacts needs a
+            // bound workspace admission context, and what this measures is
+            // whether cost grows with HISTORY DEPTH, not with payload.
+            let mut change = synthetic_change(index as u128);
             change.parents = parent.into_iter().collect();
             change.id = compute_semantic_change_id(&change).expect("change id computes");
             let change_id = change.id;
