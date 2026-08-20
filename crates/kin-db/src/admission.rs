@@ -797,11 +797,13 @@ def build_match_query(term):
             "api_key = os.environ[\"API_KEY\"]\n",
             "token = prefix + suffix\n",
         ] {
-            assert_eq!(
-                finding("lexer/scan.py", line),
-                None,
-                "expression right-hand side must not be a credential: {line:?}"
-            );
+            for path in ["lexer/scan.py", "deploy/app.conf"] {
+                assert_eq!(
+                    finding(path, line),
+                    None,
+                    "expression right-hand side must not be a credential: {path} {line:?}"
+                );
+            }
         }
     }
 
