@@ -667,8 +667,7 @@ fn credential_assignment(path: &RepoPath, contents: &[u8]) -> bool {
         }) {
             return false;
         }
-        let Some(value) = credential_literal(&line[split + 1..], bare_values_can_be_secrets)
-        else {
+        let Some(value) = credential_literal(&line[split + 1..], bare_values_can_be_secrets) else {
             return false;
         };
         value.len() >= 8 && !is_placeholder_secret(value)
@@ -702,10 +701,7 @@ fn credential_literal(right_hand_side: &str, bare_values_can_be_secrets: bool) -
 
 fn is_opaque_secret_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b':' | b'~'
-        )
+        || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b':' | b'~')
 }
 
 /// Whether a bare word on the right of an assignment is necessarily an identifier.
