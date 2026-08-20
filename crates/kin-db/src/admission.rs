@@ -685,3 +685,154 @@ fn is_placeholder_secret(value: &str) -> bool {
             .chars()
             .all(|character| matches!(character, '*' | 'x' | 'X'))
 }
+
+#[cfg(test)]
+mod sensitive_finding_tests {
+    use super::*;
+
+    const STRANGER_SEARCH_PY: &str = r#"FIELDS = ("title", "body", "tags")
+
+
+def build_match_query(term):
+    token = term.strip()
+    if not token:
+        return ""
+    return " OR ".join("{}:{}".format(field, token) for field in FIELDS)
+"#;
+
+    fn finding(path: &str, contents: &str) -> Option<SensitiveFindingKind> {
+        sensitive_finding(&RepoPath::from_utf8(path).unwrap(), contents.as_bytes())
+    }
+
+    fn admit(path: &str, contents: &str) -> Result<(), SensitiveAdmissionError> {
+        let contents = contents.as_bytes();
+        enforce_sensitive_admission(
+            &RepoPath::from_utf8(path).unwrap(),
+            sha256(contents),
+            SensitiveArtifactKind::Blob { executable: false },
+            contents,
+            false,
+            &[],
+        )
+    }
+
+    #[test]
+    fn the_query_builder_that_blocked_the_stranger_is_not_a_credential() {
+        assert_eq!(
+            finding("notekeeper/search.py", STRANGER_SEARCH_PY),
+            None,
+            "`token = term.strip()` is a call on a local, not a leaked credential"
+        );
+        admit("notekeeper/search.py", STRANGER_SEARCH_PY)
+            .expect("a tokenizer must be publishable without an explicit allowance");
+    }
+
+    #[test]
+    fn a_secretish_name_bound_to_an_expression_is_not_a_credential() {
+        for line in [
+            "token = term.strip()\n",
+            "token = x.strip()\n",
+            "token = tokens[index]\n",
+            "secret = derive_secret(seed)\n",
+            "password = input(\"password: \")\n",
+            "api_key = os.environ[\"API_KEY\"]\n",
+            "token = prefix + suffix\n",
+        ] {
+            assert_eq!(
+                finding("lexer/scan.py", line),
+                None,
+                "expression right-hand side must not be a credential: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secretish_name_bound_to_an_identifier_in_source_is_not_a_credential() {
+        for line in [
+            "token = next_token\n",
+            "token = self.buffer\n",
+            "token = abcdefgh\n",
+            "let token = current_token;\n",
+        ] {
+            assert_eq!(
+                finding("lexer/scan.py", line),
+                None,
+                "identifier reference must not be a credential: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_key_literal_in_source_is_still_a_credential() {
+        assert_eq!(
+            finding(
+                "notekeeper/client.py",
+                "api_key = \"9f8a7b6c5d4e3f2a1b0c4d5e\"\n"
+            ),
+            Some(SensitiveFindingKind::CredentialAssignment),
+            "a hardcoded key literal must still block publication"
+        );
+        let error = admit(
+            "notekeeper/client.py",
+            "api_key = \"9f8a7b6c5d4e3f2a1b0c4d5e\"\n",
+        )
+        .expect_err("a hardcoded key literal must still block publication");
+        assert!(
+            error.to_string().contains("untracked sensitive content"),
+            "unexpected error for a hardcoded key literal: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unquoted_secret_in_a_config_file_is_still_a_credential() {
+        for (path, line) in [
+            (
+                "deploy/app.conf",
+                "SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY\n",
+            ),
+            ("deploy/values.yaml", "db_password: 7Hs9-Kq2-Lm4-Pv8x\n"),
+            ("scripts/publish.sh", "TOKEN=a1b2c3d4e5f6a7b8\n"),
+        ] {
+            assert_eq!(
+                finding(path, line),
+                Some(SensitiveFindingKind::CredentialAssignment),
+                "an unquoted secret must still block publication: {path} {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sibling_sensitive_rules_are_unchanged() {
+        assert_eq!(
+            finding(".env", "TOKEN=supersecret123\n"),
+            Some(SensitiveFindingKind::SensitivePath)
+        );
+        assert_eq!(finding(".env.example", "TOKEN=your_token_here\n"), None);
+        let pem = format!("{}{}\nMIIB\n", "-----BE", "GIN PRIVATE KEY-----");
+        assert_eq!(
+            finding("notes.txt", &pem),
+            Some(SensitiveFindingKind::PrivateKey)
+        );
+        let aws = format!("id = {}{}\n", "AK", "IAIOSFODNN7ABCDEFGH");
+        assert_eq!(
+            finding("notes.txt", &aws),
+            Some(SensitiveFindingKind::CloudCredential)
+        );
+    }
+
+    #[test]
+    fn placeholders_and_short_values_stay_admissible() {
+        for line in [
+            "password = \"${DB_PASSWORD}\"\n",
+            "api_key = \"your_api_key_here\"\n",
+            "token = \"abc\"\n",
+            "token = 5\n",
+        ] {
+            assert_eq!(
+                finding("deploy/app.conf", line),
+                None,
+                "placeholder or short value must stay admissible: {line:?}"
+            );
+        }
+    }
+}
