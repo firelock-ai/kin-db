@@ -17535,7 +17535,11 @@ mod clockhalf_git_origin {
                     })
                     .collect()
             } else {
-                let from = (index % 2) as u8;
+                // The tree is in state 0 after the root, then alternates. So
+                // commit i starts from the state commit i-1 left, which is
+                // (i+1) % 2, not i % 2. Getting this backwards makes every
+                // `Updated` name an `old` the tree does not hold.
+                let from = ((index + 1) % 2) as u8;
                 let to = 1 - from;
                 (0..churn.min(files))
                     .map(|file| TreeDelta::Updated {
