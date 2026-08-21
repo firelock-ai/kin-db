@@ -50,6 +50,7 @@ use crate::storage::backend::{
     SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
     MAX_SOURCE_BLOB_BYTES,
 };
+use crate::storage::change_validation::AdmittedChangeMap;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 
@@ -574,14 +575,17 @@ impl PersistedRepositoryAuthority {
 
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
-        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required)
+        let admitted = AdmittedChangeMap::admit(&snapshot.changes, "snapshot")?;
+        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required, &admitted)
     }
 
     pub(crate) fn validate_against_snapshot_with(
         &self,
         snapshot: &GraphSnapshot,
         replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
+        let mut timer = PublicationPhaseTimer::start();
         if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
             return Err(storage(format!(
                 "unsupported repository authority schema {}; expected {}",
@@ -644,7 +648,9 @@ impl PersistedRepositoryAuthority {
                 )));
             }
         }
+        let shape_ms = timer.lap_ms();
         validate_git_authority_shape_and_projection(snapshot, self, replay)?;
+        let git_projection_ms = timer.lap_ms();
         for workspace in &self.workspaces {
             workspace.validate()?;
             if workspace.repository_id != self.repository_id {
@@ -734,15 +740,20 @@ impl PersistedRepositoryAuthority {
             ));
         }
 
+        let operation_log_ms = timer.lap_ms();
         let derived_policies = derive_admission_policies(&snapshot.changes)?;
         if derived_policies != self.admission_policies {
             return Err(storage(
                 "persisted per-change admission state does not match semantic history".to_string(),
             ));
         }
+        let admission_policies_ms = timer.lap_ms();
         validate_unscoped_history_caches(snapshot)?;
+        let history_caches_ms = timer.lap_ms();
         validate_ref_targets(snapshot, self)?;
-        validate_workspace_authority(snapshot, self)?;
+        let ref_targets_ms = timer.lap_ms();
+        validate_workspace_authority(snapshot, self, Some(admitted))?;
+        let workspace_authority_ms = timer.lap_ms();
 
         let computed = compute_roots(snapshot, self, self.roots.generation)?;
         if computed != self.roots {
@@ -750,6 +761,33 @@ impl PersistedRepositoryAuthority {
                 "repository root bundle does not recompute from the persisted envelope".to_string(),
             ));
         }
+        let compute_roots_ms = timer.lap_ms();
+        tracing::debug!(
+            target: "kin_db::admission",
+            shape_ms,
+            git_projection_ms,
+            operation_log_ms,
+            admission_policies_ms,
+            history_caches_ms,
+            ref_targets_ms,
+            workspace_authority_ms,
+            compute_roots_ms,
+            "repository authority validated against snapshot"
+        );
+        #[cfg(test)]
+        record_preparation_phase(
+            "authority_against_snapshot",
+            vec![
+                ("shape_ms", shape_ms),
+                ("git_projection_ms", git_projection_ms),
+                ("operation_log_ms", operation_log_ms),
+                ("admission_policies_ms", admission_policies_ms),
+                ("history_caches_ms", history_caches_ms),
+                ("ref_targets_ms", ref_targets_ms),
+                ("workspace_authority_ms", workspace_authority_ms),
+                ("compute_roots_ms", compute_roots_ms),
+            ],
+        );
         Ok(())
     }
 }
@@ -922,8 +960,12 @@ impl RepositoryAuthorityState {
                 return Ok(Some(snapshot));
             }
         }
-        let materialized =
-            materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace)?;
+        let materialized = materialize_workspace_graph_snapshot(
+            self.snapshot(),
+            self.metadata(),
+            workspace,
+            None,
+        )?;
         if let Some(prepared) = prepared {
             prepared.record(self.generation(), workspace, &materialized);
         }
@@ -2237,7 +2279,11 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         &self,
         transaction: RepositoryTransaction,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
-        transaction.validate()?;
+        // `transaction_hash` opens with `self.validate()` as part of its
+        // contract, so validating here first proved nothing and walked every
+        // change and every delta a second time. A bootstrap commit carries the
+        // whole converted history in one transaction, which is where that
+        // second walk stops being free.
         let transaction_hash = transaction.transaction_hash()?;
         let repository_id = self.repository_id.clone();
         let backend = Arc::clone(&self.backend);
@@ -2267,7 +2313,11 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         &self,
         transaction: RepositoryTransaction,
     ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
-        transaction.validate()?;
+        // `transaction_hash` opens with `self.validate()` as part of its
+        // contract, so validating here first proved nothing and walked every
+        // change and every delta a second time. A bootstrap commit carries the
+        // whole converted history in one transaction, which is where that
+        // second walk stops being free.
         let transaction_hash = transaction.transaction_hash()?;
         let repository_id = self.repository_id.clone();
         let backend = Arc::clone(&self.backend);
@@ -2529,6 +2579,23 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
         next,
         output: receipt,
     })
+}
+
+// Per-phase lap record collected during one preparation, for attribution.
+// Production reads these numbers off the `tracing` events the same call sites
+// emit; a test harness cannot install a subscriber without a new dependency,
+// so the same laps are also appended here in call order.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREPARATION_PHASE_LOG: std::cell::RefCell<
+        Vec<(&'static str, Vec<(&'static str, u128)>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Append one phase breakdown to the attribution log.
+#[cfg(test)]
+pub(crate) fn record_preparation_phase(name: &'static str, laps: Vec<(&'static str, u128)>) {
+    PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().push((name, laps)));
 }
 
 /// Lap timer for the publication phase breakdown.
@@ -3805,6 +3872,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         snapshot,
         metadata,
         mutation.new_base_target.as_ref(),
+        None,
     )?;
 
     let current_base_target = current.and_then(|workspace| workspace.base_target.as_ref());
@@ -3812,10 +3880,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
             next_base.clone()
         } else {
-            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target)?
+            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target, None)?
         };
     let current_graph = match current {
-        Some(workspace) => materialize_workspace_graph_snapshot_from_base(current_base, workspace)?,
+        Some(workspace) => {
+            materialize_workspace_graph_snapshot_from_base(current_base, workspace, None)?
+        }
         None => current_base,
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
@@ -3844,7 +3914,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
             next.workspace_id
         )));
     }
-    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next)?;
+    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?;
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
@@ -4409,16 +4479,31 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 /// payload and derives every entity revision timeline, exactly as each
 /// discarded rebuild did. Every later use is a read-only query against that
 /// validated decode.
+/// CARRY SITE 1 of 4. See `carry_sites_stay_enumerated`.
 struct SharedReplayGraph<'a> {
     snapshot: &'a GraphSnapshot,
+    admitted: Option<AdmittedChangeMap<'a>>,
     graph: std::cell::OnceCell<InMemoryGraph>,
     build_ms: std::cell::Cell<u128>,
 }
 
 impl<'a> SharedReplayGraph<'a> {
     fn new(snapshot: &'a GraphSnapshot) -> Self {
+        Self::new_with_admission(snapshot, None)
+    }
+
+    /// Build a replay view whose decode may carry an existing admission of
+    /// `snapshot`'s change map instead of repeating the pass.
+    ///
+    /// `None` validates exactly as `new` does, so a caller without a witness
+    /// is slower and never less safe.
+    fn new_with_admission(
+        snapshot: &'a GraphSnapshot,
+        admitted: Option<&AdmittedChangeMap<'a>>,
+    ) -> Self {
         Self {
             snapshot,
+            admitted: admitted.copied(),
             graph: std::cell::OnceCell::new(),
             build_ms: std::cell::Cell::new(0),
         }
@@ -4430,7 +4515,14 @@ impl<'a> SharedReplayGraph<'a> {
             let started = std::time::Instant::now();
             let mut replay = self.snapshot.clone();
             replay.repository_authority = None;
-            let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
+            // CARRY SITE: `replay.changes` is the clone made on the line above,
+            // of the map `self.admitted` witnesses.
+            let graph = match self.admitted.as_ref() {
+                Some(admitted) => {
+                    InMemoryGraph::from_admitted_snapshot_without_text_index(replay, admitted)?
+                }
+                None => InMemoryGraph::from_snapshot_without_text_index(replay)?,
+            };
             self.build_ms.set(started.elapsed().as_millis());
             let _ = self.graph.set(graph);
         }
@@ -4713,13 +4805,15 @@ fn materialize_workspace_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     let base = resolve_workspace_base_graph_snapshot(
         authority_snapshot,
         metadata,
         workspace.base_target.as_ref(),
+        admitted,
     )?;
-    materialize_workspace_graph_snapshot_from_base(base, workspace)
+    materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)
 }
 
 /// Materialize a workspace over a base graph the caller already resolved.
@@ -4732,6 +4826,7 @@ fn materialize_workspace_graph_snapshot(
 fn materialize_workspace_graph_snapshot_from_base(
     base: GraphSnapshot,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     let mut delta = workspace.semantic_overlay.transaction_delta();
     delta.tree_deltas = exact_tree_transition(&base.resolved_tree, &workspace.tree);
@@ -4761,16 +4856,57 @@ fn materialize_workspace_graph_snapshot_from_base(
     // Materialization consumes this graph as a snapshot and drops it. Building a
     // text index for it would index every entity to answer no query: the caller
     // holding the workspace open builds its own against the persistent index.
-    let graph = InMemoryGraph::from_snapshot_without_text_index(base)?;
+    let mut timer = PublicationPhaseTimer::start();
+    // CARRY SITE: `base.changes` came from `resolve_workspace_base_graph_snapshot`,
+    // which clones it from the map `admitted` witnesses.
+    let graph = match admitted {
+        Some(admitted) => InMemoryGraph::from_admitted_snapshot_without_text_index(base, admitted)?,
+        None => InMemoryGraph::from_snapshot_without_text_index(base)?,
+    };
+    let build_graph_ms = timer.lap_ms();
     graph.apply_transaction_delta(&delta)?;
+    let apply_delta_ms = timer.lap_ms();
     let materialized = graph.to_snapshot();
+    let to_snapshot_ms = timer.lap_ms();
     if materialized.resolved_tree != workspace.tree {
         return Err(storage(format!(
             "workspace {} semantic overlay did not resolve its exact persisted tree",
             workspace.workspace_id
         )));
     }
-    materialized.validate_storage_admission()?;
+    // CARRY SITE: the graph took its change map from `base` and a workspace
+    // transaction delta carries entity, relation, tree and external-reference
+    // deltas only, so `materialized.changes` is that same map.
+    match admitted {
+        Some(admitted) => {
+            let carried = AdmittedChangeMap::carried_from_clone(&materialized.changes, admitted);
+            materialized
+                .validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
+        }
+        None => materialized.validate_storage_admission()?,
+    }
+    let admission_ms = timer.lap_ms();
+    tracing::debug!(
+        target: "kin_db::admission",
+        build_graph_ms,
+        apply_delta_ms,
+        to_snapshot_ms,
+        admission_ms,
+        entity_deltas = delta.entity_deltas.len(),
+        relation_deltas = delta.relation_deltas.len(),
+        tree_deltas = delta.tree_deltas.len(),
+        "workspace graph materialization"
+    );
+    #[cfg(test)]
+    record_preparation_phase(
+        "workspace_materialization",
+        vec![
+            ("build_graph_ms", build_graph_ms),
+            ("apply_delta_ms", apply_delta_ms),
+            ("to_snapshot_ms", to_snapshot_ms),
+            ("admission_ms", admission_ms),
+        ],
+    );
     Ok(materialized)
 }
 
@@ -4872,6 +5008,7 @@ fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
     #[cfg(test)]
     WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
@@ -4880,6 +5017,7 @@ fn resolve_workspace_base_graph_snapshot(
     // them, and fed a second full clone into a throwaway `InMemoryGraph`
     // whose admission pass, relation and entity indexes, and Merkle cache
     // were discarded after one history replay.
+    let mut timer = PublicationPhaseTimer::start();
     let resolved = match base_target {
         Some(target) => {
             let change_id = target_change_id(metadata, target)?;
@@ -4890,6 +5028,7 @@ fn resolve_workspace_base_graph_snapshot(
         }
         None => None,
     };
+    let history_resolve_ms = timer.lap_ms();
     let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
     {
         Some(state) => (
@@ -4949,8 +5088,37 @@ fn resolve_workspace_base_graph_snapshot(
         repository_authority: None,
         external_references,
     };
+    let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
-    base.validate_storage_admission()?;
+    let adjacency_ms = timer.lap_ms();
+    // CARRY SITE: `base.changes` is `authority_snapshot.changes.clone()`, made
+    // in the struct literal above, and `admitted` witnesses that same map.
+    match admitted {
+        Some(admitted) => {
+            let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
+            base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
+        }
+        None => base.validate_storage_admission()?,
+    }
+    let admission_ms = timer.lap_ms();
+    tracing::debug!(
+        target: "kin_db::admission",
+        history_resolve_ms,
+        domain_clone_ms,
+        adjacency_ms,
+        admission_ms,
+        "workspace base graph resolution"
+    );
+    #[cfg(test)]
+    record_preparation_phase(
+        "workspace_base_resolution",
+        vec![
+            ("history_resolve_ms", history_resolve_ms),
+            ("domain_clone_ms", domain_clone_ms),
+            ("adjacency_ms", adjacency_ms),
+            ("admission_ms", admission_ms),
+        ],
+    );
     Ok(base)
 }
 
@@ -5127,12 +5295,13 @@ fn rebuild_snapshot_adjacency(snapshot: &mut GraphSnapshot) {
 fn validate_workspace_authority(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     // One decode serves every workspace's base-tree check instead of one
     // rebuild per workspace.
-    let replay = SharedReplayGraph::new(snapshot);
+    let replay = SharedReplayGraph::new_with_admission(snapshot, admitted);
     for workspace in &metadata.workspaces {
-        validate_workspace_state(&replay, snapshot, metadata, workspace)?;
+        validate_workspace_state(&replay, snapshot, metadata, workspace, admitted)?;
         for artifact in workspace.tree.artifacts() {
             workspace_artifact_projection_mtime(metadata, workspace, artifact.artifact_id)?;
         }
@@ -5152,9 +5321,10 @@ fn validate_workspace_state(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
+    admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     validate_workspace_state_without_materialization(replay, snapshot, metadata, workspace)?;
-    materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?;
+    materialize_workspace_graph_snapshot(snapshot, metadata, workspace, admitted)?;
     Ok(())
 }
 
@@ -16550,5 +16720,423 @@ mod tests {
             &reopen(&directory).read_authority(),
             "after freezing commit",
         );
+    }
+}
+
+/// FIR-2334 attribution harness.
+///
+/// Runs the two dominant successor-preparation phases against a real
+/// on-disk repository authority and prints the per-function breakdown. It is
+/// ignored by default and needs `KIN_FIR2334_STORE` naming a `kindb`
+/// directory, so the default suite never opens a multi-gigabyte store.
+#[cfg(test)]
+mod fir2334_attribution {
+    use super::*;
+
+    fn print_phase_log(label: &str) {
+        PREPARATION_PHASE_LOG.with(|log| {
+            for (name, laps) in log.borrow().iter() {
+                let total: u128 = laps.iter().map(|(_, ms)| *ms).sum();
+                let detail = laps
+                    .iter()
+                    .map(|(field, ms)| format!("{field}={ms}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("[{label}] {name} total_ms={total} {detail}");
+            }
+            log.borrow_mut().clear();
+        });
+    }
+
+    #[test]
+    #[ignore = "needs KIN_FIR2334_STORE naming a real kindb directory"]
+    fn attribute_one_successor_preparation() {
+        let store = std::env::var("KIN_FIR2334_STORE")
+            .expect("set KIN_FIR2334_STORE to a <repo>/.kin/kindb directory");
+        let repo = std::env::var("KIN_FIR2334_REPO")
+            .expect("set KIN_FIR2334_REPO to the repository id under that directory");
+        let repository_id = RepositoryId::new(&repo).expect("repository id");
+        let backend = Arc::new(crate::storage::backend::LocalFileBackend::new(&store));
+
+        let open_started = std::time::Instant::now();
+        let manager = RepositoryAuthorityManager::open(repository_id.clone(), backend)
+            .expect("open repository authority");
+        println!(
+            "[open] authority_open_ms={}",
+            open_started.elapsed().as_millis()
+        );
+
+        let lease = manager.read_authority();
+        let snapshot = lease.snapshot();
+        let metadata = lease.metadata();
+        println!(
+            "[store] changes={} entities={} relations={} shallow_files={} artifacts={} workspaces={} operations={} receipts={}",
+            snapshot.changes.len(),
+            snapshot.entities.len(),
+            snapshot.relations.len(),
+            snapshot.shallow_files.len(),
+            snapshot.resolved_tree.artifacts().count(),
+            metadata.workspaces.len(),
+            metadata.operation_log.len(),
+            metadata.receipts.len(),
+        );
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+
+        let started = std::time::Instant::now();
+        snapshot
+            .validate_storage_admission_with(GitProjectionTreeReplay::Proven)
+            .expect("top-level storage admission");
+        println!(
+            "[TERM] storage_admission_ms={}",
+            started.elapsed().as_millis()
+        );
+        print_phase_log("storage_admission");
+
+        let Some(workspace) = metadata.workspaces.first().cloned() else {
+            println!("[TERM] workspace_ms=0 (no workspace on this authority)");
+            return;
+        };
+
+        let started = std::time::Instant::now();
+        let base = resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            workspace.base_target.as_ref(),
+            None,
+        )
+        .expect("resolve workspace base");
+        println!(
+            "[TERM] resolve_workspace_base_ms={}",
+            started.elapsed().as_millis()
+        );
+        println!(
+            "[base] changes={} entities={} relations={} artifacts={}",
+            base.changes.len(),
+            base.entities.len(),
+            base.relations.len(),
+            base.resolved_tree.artifacts().count(),
+        );
+        print_phase_log("resolve_base");
+
+        let started = std::time::Instant::now();
+        let materialized =
+            materialize_workspace_graph_snapshot_from_base(base.clone(), &workspace, None)
+                .expect("materialize workspace graph");
+        println!(
+            "[TERM] materialize_workspace_ms={}",
+            started.elapsed().as_millis()
+        );
+        println!(
+            "[materialized] changes={} entities={} relations={} artifacts={}",
+            materialized.changes.len(),
+            materialized.entities.len(),
+            materialized.relations.len(),
+            materialized.resolved_tree.artifacts().count(),
+        );
+        print_phase_log("materialize");
+
+        let started = std::time::Instant::now();
+        let overlay =
+            derive_workspace_semantic_overlay(&base, &materialized).expect("derive overlay");
+        println!(
+            "[TERM] derive_overlay_ms={} entity_deltas={} relation_deltas={}",
+            started.elapsed().as_millis(),
+            overlay.entity_deltas().len(),
+            overlay.relation_deltas().len(),
+        );
+
+        let started = std::time::Instant::now();
+        let graph = InMemoryGraph::from_snapshot_without_text_index(materialized.clone())
+            .expect("build in-memory graph");
+        println!(
+            "[TERM] in_memory_graph_build_ms={}",
+            started.elapsed().as_millis()
+        );
+        let started = std::time::Instant::now();
+        let round_tripped = graph.to_snapshot();
+        println!("[TERM] to_snapshot_ms={}", started.elapsed().as_millis());
+        assert_eq!(round_tripped.entities.len(), materialized.entities.len());
+
+        let started = std::time::Instant::now();
+        let mut adjacency = materialized.clone();
+        rebuild_snapshot_adjacency(&mut adjacency);
+        println!(
+            "[TERM] rebuild_adjacency_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+/// Step-13 replay wall measurements.
+///
+/// A bootstrap commit carries the whole converted history in one transaction,
+/// so every per-change body in `commit_repository_transaction` runs at history
+/// scale rather than at delta scale. This measures the entry point's own
+/// per-change bodies against transaction size, so the scaling law is visible
+/// before anything is changed. Ignored by default because the larger sizes are
+/// deliberately slow.
+#[cfg(test)]
+mod replaywall_measurements {
+    use super::*;
+    use kin_model::{
+        compute_semantic_change_id, ChangeOrigin, LocatedEntry,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
+
+    /// One synthetic native change carrying `files` tree deltas.
+    ///
+    /// A converted change is not empty: it carries the tree deltas for the
+    /// files that commit touched, and those deltas are what every per-change
+    /// body actually walks. Measuring with empty changes measures the floor.
+    fn synthetic_change_with_payload(index: u128, files: usize) -> kin_model::SemanticChange {
+        let tree_deltas: Vec<TreeDelta> = (0..files)
+            .map(|file| {
+                let artifact = (index + 1) * 1_000 + file as u128;
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(uuid::Uuid::from_u128(artifact)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(
+                            format!("src/generated/module_{artifact}.rs").into_bytes(),
+                        )
+                        .expect("synthetic path is valid"),
+                        TreeEntry::Blob {
+                            hash: Hash256::from_bytes([(artifact % 251) as u8; 32]),
+                            executable: false,
+                        },
+                    ),
+                }
+            })
+            .collect();
+        let mut change = synthetic_change(index);
+        change.tree_deltas = tree_deltas;
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        change
+    }
+
+    /// One synthetic native change, content-addressed like a real one.
+    fn synthetic_change(index: u128) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z")
+                    .expect("fixed timestamp parses")
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("replaywall-measurement"),
+            message: format!("synthetic bootstrap change {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        change
+    }
+
+    fn bootstrap_transaction_with_payload(changes: usize, files: usize) -> RepositoryTransaction {
+        let mut transaction = bootstrap_transaction(0);
+        transaction.changes = (0..changes as u128)
+            .map(|index| synthetic_change_with_payload(index, files))
+            .collect();
+        transaction
+    }
+
+    fn bootstrap_transaction(changes: usize) -> RepositoryTransaction {
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(1)),
+            repository_id: RepositoryId::new("replaywall-measurement").expect("repository id"),
+            expected_generation: 0,
+            expected_roots: placeholder_roots(0),
+            actor: AuthorId::new("replaywall-measurement"),
+            reason: "synthetic bootstrap".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: (0..changes as u128).map(synthetic_change).collect(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: scales the commit entry point's per-change bodies"]
+    fn entry_point_bodies_scale_with_transaction_size() {
+        println!("changes  validate_ms  hash_ms  hash_minus_validate_ms");
+        for size in [100usize, 400, 1600, 6400] {
+            let transaction = bootstrap_transaction(size);
+
+            // Warm any lazy allocation so the first timed call is not the outlier.
+            transaction
+                .validate()
+                .expect("synthetic transaction validates");
+
+            let started = std::time::Instant::now();
+            transaction.validate().expect("validates");
+            let validate_ms = started.elapsed().as_millis();
+
+            let started = std::time::Instant::now();
+            let _hash = transaction.transaction_hash().expect("hashes");
+            let hash_ms = started.elapsed().as_millis();
+
+            println!(
+                "{size:>7}  {validate_ms:>11}  {hash_ms:>7}  {:>22}",
+                hash_ms.saturating_sub(validate_ms)
+            );
+        }
+    }
+
+    /// An invalid transaction must refuse at the commit entry point with the
+    /// same error surface whether the external `validate()` is present or not.
+    ///
+    /// This is the falsification for removing kin-db's external
+    /// `transaction.validate()`, which sat one line above
+    /// `transaction_hash()`, whose own contract opens with `self.validate()`.
+    /// The internal check is deliberately kept, so the refusal has to survive
+    /// the removal unchanged. Run before the cut and after it: the same error
+    /// text either way means the external call was proving nothing the
+    /// internal one did not already prove.
+    #[test]
+    fn an_invalid_transaction_still_refuses_at_the_commit_entry_point() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let repository = RepositoryId::new("replaywall-refusal").expect("repository id");
+        let manager = RepositoryAuthorityManager::open(repository.clone(), backend)
+            .expect("open fresh authority");
+
+        let mut transaction = bootstrap_transaction(1);
+        transaction.repository_id = repository;
+        transaction.schema_version = REPOSITORY_TRANSACTION_SCHEMA_VERSION + 1;
+
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("an unsupported transaction schema must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported repository transaction version"),
+            "the refusal must keep naming the unsupported schema version, got: {error}"
+        );
+    }
+
+    /// Does the cost of ONE commit grow with how much history the store
+    /// already holds?
+    ///
+    /// A conversion commits its history one change at a time. If a single
+    /// commit's preparation walks the whole store, then converting N changes
+    /// costs O(N^2) rather than O(N), and nothing in a per-call measurement
+    /// would ever show it, because every individual call looks linear and
+    /// cheap. This times each successive commit into the same store and prints
+    /// the per-commit wall against the history already present, so the shape
+    /// is read off the trend rather than assumed.
+    #[test]
+    #[ignore = "measurement: commits one change at a time and times each"]
+    fn one_commit_cost_against_history_already_present() {
+        let commits: usize = std::env::var("KIN_REPLAYWALL_COMMITS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let repository = RepositoryId::new("replaywall-growth").expect("repository id");
+        let manager = RepositoryAuthorityManager::open(repository.clone(), backend)
+            .expect("open fresh authority");
+
+        println!("history_before  commit_ms  cumulative_ms");
+        let mut parent: Option<SemanticChangeId> = None;
+        let mut cumulative: u128 = 0;
+        for index in 0..commits {
+            // No tree deltas: a native change that introduces artifacts needs a
+            // bound workspace admission context, and what this measures is
+            // whether cost grows with HISTORY DEPTH, not with payload.
+            let mut change = synthetic_change(index as u128);
+            change.parents = parent.into_iter().collect();
+            change.id = compute_semantic_change_id(&change).expect("change id computes");
+            let change_id = change.id;
+
+            let lease = manager.read_authority();
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(index as u128 + 1)),
+                repository_id: repository.clone(),
+                expected_generation: lease.generation(),
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("replaywall-growth"),
+                reason: format!("synthetic commit {index}"),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes: vec![change],
+                aliases: Vec::new(),
+                ref_mutations: Vec::new(),
+                default_ref_mutation: None,
+                workspace_mutation: None,
+                local_overlay_delta: None,
+                merge_transaction_delta: None,
+                sealed_observation: None,
+            };
+            drop(lease);
+
+            let started = std::time::Instant::now();
+            manager
+                .commit_repository_transaction(transaction)
+                .unwrap_or_else(|error| panic!("commit {index} failed: {error}"));
+            let commit_ms = started.elapsed().as_millis();
+            cumulative += commit_ms;
+            if index % 10 == 0 || index + 1 == commits {
+                println!("{index:>14}  {commit_ms:>9}  {cumulative:>13}");
+            }
+            parent = Some(change_id);
+        }
+        println!("total_ms={cumulative} for {commits} commits");
+    }
+
+    /// The same bodies against payload per change, which is what a converted
+    /// change actually carries and what the empty-change run above excludes.
+    #[test]
+    #[ignore = "measurement: scales the commit entry point against payload per change"]
+    fn entry_point_bodies_scale_with_payload_per_change() {
+        println!("changes  files/chg  deltas  validate_ms  hash_ms  hash_minus_validate_ms");
+        for (size, files) in [
+            (1200usize, 1usize),
+            (1200, 8),
+            (1200, 32),
+            (1200, 128),
+            (6400, 8),
+        ] {
+            let transaction = bootstrap_transaction_with_payload(size, files);
+            transaction
+                .validate()
+                .expect("synthetic transaction validates");
+
+            let started = std::time::Instant::now();
+            transaction.validate().expect("validates");
+            let validate_ms = started.elapsed().as_millis();
+
+            let started = std::time::Instant::now();
+            let _hash = transaction.transaction_hash().expect("hashes");
+            let hash_ms = started.elapsed().as_millis();
+
+            println!(
+                "{size:>7}  {files:>9}  {:>6}  {validate_ms:>11}  {hash_ms:>7}  {:>22}",
+                size * files,
+                hash_ms.saturating_sub(validate_ms)
+            );
+        }
     }
 }
