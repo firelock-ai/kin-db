@@ -17455,3 +17455,219 @@ mod clockhalf_whole_history {
         }
     }
 }
+
+/// Step 13's per-change bodies at Git origin, which is the origin a conversion
+/// actually uses.
+///
+/// The bootstrap-transaction measurement beside this one cannot give every
+/// change a tree delta: the v3 Native admission contract lets only the change
+/// the successor workspace bases on introduce artifacts. A conversion's changes
+/// are `ChangeOrigin::GitCommit`, which that rule does not reach, so every one
+/// of them carries its own tree deltas. These bodies are callable directly
+/// against a synthetic snapshot, with no transaction and no admission contract
+/// in the way, so they can be priced at the payload a converted commit really
+/// has.
+#[cfg(test)]
+mod clockhalf_git_origin {
+    use super::*;
+    use kin_model::{compute_semantic_change_id, ChangeOrigin, LocatedEntry};
+    use uuid::Uuid;
+
+    fn oid(seed: u64) -> GitObjectId {
+        let mut bytes = [0_u8; 20];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        GitObjectId::sha1(bytes)
+    }
+
+    fn artifact(index: usize) -> ArtifactId {
+        ArtifactId(Uuid::from_u128(index as u128 + 1))
+    }
+
+    fn path_of(index: usize) -> RepoPath {
+        RepoPath::from_utf8(format!("src/file_{index}.rs")).expect("synthetic path is valid")
+    }
+
+    /// Two blob states per artifact, so the whole tree alternates between two
+    /// shapes and the raw-tree fixture stays O(tree) instead of O(commits x
+    /// tree). The replay still applies every delta of every commit.
+    fn entry_of(index: usize, state: u8) -> TreeEntry {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = state;
+        bytes[1] = (index % 251) as u8;
+        bytes[2] = ((index / 251) % 251) as u8;
+        TreeEntry::blob(Hash256::from_bytes(bytes), false)
+    }
+
+    struct GitHistory {
+        snapshot: GraphSnapshot,
+        targets: BTreeMap<SemanticChangeId, GitProjectionTreeTarget>,
+        raw_trees: BTreeMap<GitObjectId, BTreeMap<RepoPath, TreeEntry>>,
+        order: Vec<SemanticChangeId>,
+    }
+
+    /// `commits` chained Git-origin changes over a `files`-artifact tree, where
+    /// the root adds every artifact and each later commit updates `churn` of
+    /// them.
+    fn git_history(commits: usize, files: usize, churn: usize) -> GitHistory {
+        let tree_a: BTreeMap<RepoPath, TreeEntry> = (0..files)
+            .map(|index| (path_of(index), entry_of(index, 0)))
+            .collect();
+        let mut tree_b = tree_a.clone();
+        for index in 0..churn.min(files) {
+            tree_b.insert(path_of(index), entry_of(index, 1));
+        }
+        let oid_a = oid(900_001);
+        let oid_b = oid(900_002);
+        let mut raw_trees = BTreeMap::new();
+        raw_trees.insert(oid_a, tree_a);
+        raw_trees.insert(oid_b, tree_b);
+
+        let mut snapshot = GraphSnapshot::empty();
+        let mut targets = BTreeMap::new();
+        let mut order = Vec::with_capacity(commits);
+        let mut parent: Option<SemanticChangeId> = None;
+        for index in 0..commits {
+            let tree_deltas: Vec<TreeDelta> = if index == 0 {
+                (0..files)
+                    .map(|file| TreeDelta::Added {
+                        artifact_id: artifact(file),
+                        new: LocatedEntry::new(path_of(file), entry_of(file, 0)),
+                    })
+                    .collect()
+            } else {
+                let from = (index % 2) as u8;
+                let to = 1 - from;
+                (0..churn.min(files))
+                    .map(|file| TreeDelta::Updated {
+                        artifact_id: artifact(file),
+                        old: LocatedEntry::new(path_of(file), entry_of(file, from)),
+                        new: LocatedEntry::new(path_of(file), entry_of(file, to)),
+                    })
+                    .collect()
+            };
+            let commit_oid = oid(index as u64 + 1);
+            let mut change = kin_model::SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::GitCommit { oid: commit_oid },
+                parents: parent.into_iter().collect(),
+                timestamp: Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z")
+                        .expect("fixed timestamp parses")
+                        .with_timezone(&chrono::Utc),
+                ),
+                author: AuthorId::new("clockhalf-git-measurement"),
+                message: format!("converted commit {index}"),
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).expect("change id computes");
+            let raw_tree_oid = if index == 0 || index % 2 == 0 { oid_a } else { oid_b };
+            targets.insert(
+                change.id,
+                GitProjectionTreeTarget {
+                    commit_oid,
+                    raw_tree_oid,
+                },
+            );
+            parent = Some(change.id);
+            order.push(change.id);
+            snapshot.changes.insert(change.id, change);
+        }
+        snapshot.change_children = derive_change_children(&snapshot.changes);
+        GitHistory {
+            snapshot,
+            targets,
+            raw_trees,
+            order,
+        }
+    }
+
+    fn lap<T>(label: &str, body: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = body();
+        println!("    {label}={}", started.elapsed().as_millis());
+        out
+    }
+
+    /// Price the per-change bodies of one whole-history preparation at Git
+    /// origin, against history length.
+    #[test]
+    #[ignore = "measurement: prices step 13's per-change bodies at Git origin"]
+    fn git_origin_whole_history_body_costs() {
+        let sizes: Vec<usize> = std::env::var("KIN_CLOCKHALF_COMMITS")
+            .unwrap_or_else(|_| "300,600,1200,2400".to_string())
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect();
+        let files: usize = std::env::var("KIN_CLOCKHALF_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200);
+        let churn: usize = std::env::var("KIN_CLOCKHALF_CHURN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+
+        for commits in sizes {
+            let history = git_history(commits, files, churn);
+            println!("[git] commits={commits} files={files} churn={churn}");
+
+            lap("derive_change_children_ms", || {
+                let children = derive_change_children(&history.snapshot.changes);
+                assert_eq!(children.len(), commits.saturating_sub(1));
+            });
+
+            lap("derive_admission_policies_ms", || {
+                derive_admission_policies(&history.snapshot.changes)
+                    .expect("admission policies derive");
+            });
+
+            lap("storage_admission_ms", || {
+                history
+                    .snapshot
+                    .validate_storage_admission()
+                    .expect("synthetic snapshot admits");
+            });
+
+            lap("history_replay_ms", || {
+                validate_first_parent_history(&history.snapshot.changes, &history.order)
+                    .expect("first-parent history replays");
+            });
+
+            lap("history_root_ms", || {
+                let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
+                root.unordered(
+                    "changes",
+                    &history.snapshot.changes.iter().collect::<Vec<_>>(),
+                )
+                .expect("history root hashes");
+                let _ = root.finish();
+            });
+
+            let mut materializations = 0_usize;
+            lap("git_projection_replay_ms", || {
+                validate_git_projection_tree_replay(
+                    &history.snapshot,
+                    &history.targets,
+                    |raw_tree_oid| {
+                        materializations += 1;
+                        Ok(history
+                            .raw_trees
+                            .get(&raw_tree_oid)
+                            .expect("every projection has one exact raw tree")
+                            .clone())
+                    },
+                )
+                .expect("git projection tree replay");
+            });
+            println!("    materializations={materializations}");
+        }
+    }
+}
