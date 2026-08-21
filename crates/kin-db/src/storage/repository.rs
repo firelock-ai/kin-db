@@ -7291,6 +7291,11 @@ mod tests {
     /// somewhere": a lap that does not hang under the preparation span leaves a
     /// profile unable to split the preparation's self time, which is the defect
     /// this instrumentation exists to close.
+    ///
+    /// The entered stack is kept per thread, the way `tracing`'s own registry
+    /// keeps it. One shared stack would let any other thread that ever reached
+    /// this subscriber decide what the next span's contextual parent is, and
+    /// that is a wrong answer which only appears under load.
     #[derive(Clone, Default)]
     struct SpanRecorder(Arc<Mutex<SpanRecorderState>>);
 
@@ -7298,7 +7303,7 @@ mod tests {
     struct SpanRecorderState {
         next_id: u64,
         names: std::collections::HashMap<u64, &'static str>,
-        entered: Vec<u64>,
+        entered: std::collections::HashMap<std::thread::ThreadId, Vec<u64>>,
         opened: Vec<(&'static str, Option<&'static str>)>,
     }
 
@@ -7307,15 +7312,30 @@ mod tests {
             self.0.lock().opened.iter().map(|(name, _)| *name).collect()
         }
 
-        /// The spans opened directly under `parent`, in the order they opened.
-        fn children_of(&self, parent: &str) -> Vec<&'static str> {
-            self.0
+        /// Every span opened directly under `parent`, deduplicated and sorted.
+        ///
+        /// Deduplicated rather than counted because a publication may prepare a
+        /// successor more than once: its decision closure is retried, and a
+        /// count would then read twenty two where the set still reads eleven.
+        /// The set is the property worth asserting and the one a loaded runner
+        /// cannot perturb.
+        fn distinct_children_of(&self, parent: &str) -> Vec<&'static str> {
+            let mut children: Vec<&'static str> = self
+                .0
                 .lock()
                 .opened
                 .iter()
                 .filter(|(_, opened_under)| *opened_under == Some(parent))
                 .map(|(name, _)| *name)
-                .collect()
+                .collect();
+            children.sort_unstable();
+            children.dedup();
+            children
+        }
+
+        /// Every span opened, with its parent, for a failure to report.
+        fn opened_with_parents(&self) -> Vec<(&'static str, Option<&'static str>)> {
+            self.0.lock().opened.clone()
         }
     }
 
@@ -7325,6 +7345,7 @@ mod tests {
         }
 
         fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let thread = std::thread::current().id();
             let mut state = self.0.lock();
             state.next_id += 1;
             let id = state.next_id;
@@ -7336,8 +7357,9 @@ mod tests {
             } else {
                 state
                     .entered
-                    .last()
-                    .and_then(|entered| state.names.get(entered).copied())
+                    .get(&thread)
+                    .and_then(|stack| stack.last().copied())
+                    .and_then(|entered| state.names.get(&entered).copied())
             };
             state.names.insert(id, name);
             state.opened.push((name, parent));
@@ -7351,20 +7373,88 @@ mod tests {
         fn event(&self, _event: &tracing::Event<'_>) {}
 
         fn enter(&self, span: &tracing::span::Id) {
-            self.0.lock().entered.push(span.into_u64());
+            let thread = std::thread::current().id();
+            self.0
+                .lock()
+                .entered
+                .entry(thread)
+                .or_default()
+                .push(span.into_u64());
         }
 
         fn exit(&self, span: &tracing::span::Id) {
-            let mut state = self.0.lock();
+            let thread = std::thread::current().id();
             let leaving = span.into_u64();
-            if let Some(position) = state
-                .entered
-                .iter()
-                .rposition(|entered| *entered == leaving)
-            {
-                state.entered.remove(position);
+            let mut state = self.0.lock();
+            if let Some(stack) = state.entered.get_mut(&thread) {
+                if let Some(position) = stack.iter().rposition(|entered| *entered == leaving) {
+                    stack.remove(position);
+                }
             }
         }
+    }
+
+    /// Keep every `tracing` callsite dynamically evaluated for this test binary.
+    ///
+    /// `tracing` caches one `Interest` per callsite for the whole PROCESS, and a
+    /// thread with no subscriber answers `Interest::never` through
+    /// `NoSubscriber`. Under `cargo test` every test shares one process, so
+    /// whichever thread reaches a callsite first decides for all of them: a
+    /// concurrent test committing with no subscriber cached `never` on five of
+    /// the preparation laps, and the test below then saw six laps where the code
+    /// had opened eleven. It failed that way inside a merge group, passed at PR
+    /// level on the same commit, and never failed under nextest, which gives
+    /// each test its own process.
+    ///
+    /// A global default that is interested in every callsite and enables none of
+    /// them removes that in both directions. Installing it rebuilds the interest
+    /// of every callsite already registered, and a callsite first reached
+    /// afterwards resolves through this dispatcher too, because a thread with no
+    /// scoped subscriber falls back to the global one. What each span then does
+    /// is still decided per thread by whatever `with_default` installed, which
+    /// is the thing under test.
+    fn keep_callsites_dynamic() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            struct InterestedInEverythingEnablingNothing;
+
+            impl tracing::Subscriber for InterestedInEverythingEnablingNothing {
+                fn register_callsite(
+                    &self,
+                    _metadata: &'static tracing::Metadata<'static>,
+                ) -> tracing::subscriber::Interest {
+                    tracing::subscriber::Interest::sometimes()
+                }
+
+                fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                    false
+                }
+
+                fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                    tracing::span::Id::from_u64(1)
+                }
+
+                fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+                fn record_follows_from(
+                    &self,
+                    _span: &tracing::span::Id,
+                    _follows: &tracing::span::Id,
+                ) {
+                }
+
+                fn event(&self, _event: &tracing::Event<'_>) {}
+
+                fn enter(&self, _span: &tracing::span::Id) {}
+
+                fn exit(&self, _span: &tracing::span::Id) {}
+            }
+
+            // A global default already in place means someone else made the
+            // same guarantee or a stronger one, and this test's own scoped
+            // subscriber decides what it records either way.
+            let _ = tracing::subscriber::set_global_default(InterestedInEverythingEnablingNothing);
+        });
     }
 
     /// A commit reports every preparation lap and every commit phase as a span.
@@ -7378,9 +7468,13 @@ mod tests {
     /// The expected lap names are derived from the laps the summary event
     /// carries rather than restated here, so a lap added to one split and not
     /// the other fails this test instead of quietly making the two accounts
-    /// disagree.
+    /// disagree. What is asserted is a SET of names and a parent-child shape,
+    /// never a count and never an order: a publication may retry its decision
+    /// closure, which prepares a successor twice and would double any count
+    /// while leaving the set exactly as it is.
     #[test]
     fn a_commit_reports_its_preparation_laps_as_spans() {
+        keep_callsites_dynamic();
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
         let transaction = arbitrary_repository_transaction(&manager);
@@ -7399,7 +7493,8 @@ mod tests {
         ] {
             assert!(
                 opened.contains(&phase),
-                "commit phase {phase} must reach a profiler as a span; opened {opened:?}"
+                "commit phase {phase} must reach a profiler as a span; every span opened, with its parent: {:?}",
+                recorder.opened_with_parents()
             );
         }
 
@@ -7413,22 +7508,25 @@ mod tests {
             laps.len() >= 11,
             "the preparation reports eleven laps; recorded {laps:?}"
         );
-        let expected: Vec<String> = laps
+        let mut expected: Vec<String> = laps
             .iter()
             .map(|(field, _)| format!("kindb.prepare.{}", field.trim_end_matches("_ms")))
             .collect();
+        expected.sort();
+        expected.dedup();
 
-        let children = recorder.children_of("kindb.commit.prepare_successor");
+        let children = recorder.distinct_children_of("kindb.commit.prepare_successor");
         for lap in &expected {
             assert!(
                 children.iter().any(|child| child == lap),
-                "lap {lap} must open under the preparation span; children {children:?}"
+                "lap {lap} must open under the preparation span; children {children:?}; every span opened, with its parent: {:?}",
+                recorder.opened_with_parents()
             );
         }
         assert_eq!(
-            children.len(),
-            expected.len(),
-            "every span opened inside the preparation belongs to a lap; children {children:?}, laps {expected:?}"
+            children, expected,
+            "every span opened directly inside the preparation belongs to a lap; every span opened, with its parent: {:?}",
+            recorder.opened_with_parents()
         );
     }
 
