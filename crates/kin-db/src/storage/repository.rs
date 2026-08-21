@@ -1301,6 +1301,11 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
+        // The persist runs after the decision closure returns, so it sits inside
+        // the caller's commit phase and outside every preparation lap. Without a
+        // span of its own it was charged to the caller as self time, which is
+        // half of why a bootstrap commit could not be attributed (FIR-2579).
+        let _persist_span = tracing::info_span!("kindb.commit.persist_successor").entered();
         let mut timer = PublicationPhaseTimer::start();
         let mut state = self.state.lock();
         // A persist call means the publication holds no retained candidate:
@@ -2284,7 +2289,10 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // change and every delta a second time. A bootstrap commit carries the
         // whole converted history in one transaction, which is where that
         // second walk stops being free.
-        let transaction_hash = transaction.transaction_hash()?;
+        let transaction_hash = {
+            let _hash_span = tracing::info_span!("kindb.commit.transaction_hash").entered();
+            transaction.transaction_hash()?
+        };
         let repository_id = self.repository_id.clone();
         let backend = Arc::clone(&self.backend);
 
@@ -2318,7 +2326,10 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         // change and every delta a second time. A bootstrap commit carries the
         // whole converted history in one transaction, which is where that
         // second walk stops being free.
-        let transaction_hash = transaction.transaction_hash()?;
+        let transaction_hash = {
+            let _hash_span = tracing::info_span!("kindb.commit.transaction_hash").entered();
+            transaction.transaction_hash()?
+        };
         let repository_id = self.repository_id.clone();
         let backend = Arc::clone(&self.backend);
 
@@ -2631,15 +2642,29 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     transaction_hash: Hash256,
     backend: &B,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
+    // Every lap below runs inside its own span as well as reporting its
+    // milliseconds, and the two must not drift apart: a profiler reads spans and
+    // an operator reads the summary event, and a lap that exists in one split
+    // and not the other makes the two accounts irreconcilable. The whole
+    // preparation was a single unattributed stretch of a caller's self time
+    // before this (FIR-2579), which is why a conversion could name none of it.
+    //
+    // A lap's guard is dropped before the next lap's span is created,
+    // deliberately: a span created while another is entered becomes its child,
+    // and these laps are siblings that each carry their own self time.
+    let prepare_span = tracing::info_span!("kindb.commit.prepare_successor").entered();
     let prepare_started = std::time::Instant::now();
     let mut timer = PublicationPhaseTimer::start();
+    let lap = tracing::info_span!("kindb.prepare.clone").entered();
     let mut snapshot = current.snapshot.clone();
     let mut metadata = snapshot
         .repository_authority
         .take()
         .expect("repository authority state always carries metadata");
     let clone_ms = timer.lap_ms();
+    drop(lap);
 
+    let lap = tracing::info_span!("kindb.prepare.admit").entered();
     admit_external_objects(
         backend,
         &transaction.repository_id,
@@ -2651,7 +2676,9 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     apply_git_authority(backend, &snapshot, &mut metadata, transaction)?;
     metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
     let admit_ms = timer.lap_ms();
+    drop(lap);
 
+    let lap = tracing::info_span!("kindb.prepare.refs_overlay").entered();
     apply_ref_mutations(&snapshot, &mut metadata, transaction)?;
     apply_local_overlay(&mut metadata, transaction)?;
     validate_new_local_overlay_bodies(
@@ -2660,12 +2687,18 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction.local_overlay_delta.as_ref(),
     )?;
     let refs_overlay_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.workspace").entered();
     // Every remaining validation reads the same authority-free payload:
     // `changes` is final once admission above returns, and the steps below
     // mutate only the detached metadata. One shared decode serves them all.
     let replay = SharedReplayGraph::new(&snapshot);
     apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
     let workspace_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.merge").entered();
     apply_merge_transaction(&mut metadata, transaction)?;
     validate_merge_transaction_delta_bodies(
         backend,
@@ -2673,8 +2706,14 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction.merge_transaction_delta.as_ref(),
     )?;
     let merge_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.admission_verify").entered();
     verify_transaction_admission(backend, current, &replay, &snapshot, &metadata, transaction)?;
     let admission_verify_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.change_bodies").entered();
     validate_new_change_bodies(
         backend,
         &transaction.repository_id,
@@ -2682,11 +2721,19 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         &metadata.admission_policies,
     )?;
     let change_bodies_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.history_replay").entered();
     validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
     let history_replay_ms = timer.lap_ms();
+    drop(lap);
+    // The shared decode is charged to whichever lap first forced it rather than
+    // to a lap of its own, so `replay_decode_ms` is a part of the laps above and
+    // not a thirteenth alongside them.
     let replay_decode_ms = replay.build_ms();
     drop(replay);
 
+    let lap = tracing::info_span!("kindb.prepare.roots").entered();
     let next_generation = current
         .generation()
         .checked_add(1)
@@ -2711,6 +2758,9 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     metadata.operation_log.push(operation.clone());
     metadata.roots = compute_roots(&snapshot, &metadata, next_generation)?;
     let roots_ms = timer.lap_ms();
+    drop(lap);
+
+    let lap = tracing::info_span!("kindb.prepare.storage_admission").entered();
     operation.roots_after = metadata.roots.clone();
     *metadata
         .operation_log
@@ -2741,10 +2791,13 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // this caller's obligation to `GitProjectionTreeReplay::Required`.
     snapshot.validate_storage_admission_with(GitProjectionTreeReplay::Proven)?;
     let storage_admission_ms = timer.lap_ms();
+    drop(lap);
 
+    let lap = tracing::info_span!("kindb.prepare.successor_index").entered();
     let state =
         RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes);
     let successor_index_ms = timer.lap_ms();
+    drop(lap);
     let elapsed = prepare_started.elapsed();
     let elapsed_ms = elapsed.as_millis();
     if elapsed >= SLOW_PUBLICATION_PHASE {
@@ -2799,6 +2852,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             ("successor_index_ms", successor_index_ms),
         ],
     );
+    drop(prepare_span);
     Ok((state, receipt))
 }
 
@@ -7225,6 +7279,157 @@ mod tests {
 
     fn initial_manager(backend: Arc<MemoryBackend>) -> RepositoryAuthorityManager<MemoryBackend> {
         RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
+    }
+
+    /// The spans one commit opens, and the span each was opened under.
+    ///
+    /// kin-db depends on `tracing` and not on `tracing-subscriber`, and a
+    /// profiler is exactly a subscriber that keeps span metadata, so this
+    /// records what a profiling layer would record rather than asserting
+    /// against the summary event's fields. Keeping each span's parent is what
+    /// makes the assertion say more than "a span with this name exists
+    /// somewhere": a lap that does not hang under the preparation span leaves a
+    /// profile unable to split the preparation's self time, which is the defect
+    /// this instrumentation exists to close.
+    #[derive(Clone, Default)]
+    struct SpanRecorder(Arc<Mutex<SpanRecorderState>>);
+
+    #[derive(Default)]
+    struct SpanRecorderState {
+        next_id: u64,
+        names: std::collections::HashMap<u64, &'static str>,
+        entered: Vec<u64>,
+        opened: Vec<(&'static str, Option<&'static str>)>,
+    }
+
+    impl SpanRecorder {
+        fn opened_span_names(&self) -> Vec<&'static str> {
+            self.0.lock().opened.iter().map(|(name, _)| *name).collect()
+        }
+
+        /// The spans opened directly under `parent`, in the order they opened.
+        fn children_of(&self, parent: &str) -> Vec<&'static str> {
+            self.0
+                .lock()
+                .opened
+                .iter()
+                .filter(|(_, opened_under)| *opened_under == Some(parent))
+                .map(|(name, _)| *name)
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for SpanRecorder {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut state = self.0.lock();
+            state.next_id += 1;
+            let id = state.next_id;
+            let name = span.metadata().name();
+            let parent = if span.is_root() {
+                None
+            } else if let Some(explicit) = span.parent() {
+                state.names.get(&explicit.into_u64()).copied()
+            } else {
+                state
+                    .entered
+                    .last()
+                    .and_then(|entered| state.names.get(entered).copied())
+            };
+            state.names.insert(id, name);
+            state.opened.push((name, parent));
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, span: &tracing::span::Id) {
+            self.0.lock().entered.push(span.into_u64());
+        }
+
+        fn exit(&self, span: &tracing::span::Id) {
+            let mut state = self.0.lock();
+            let leaving = span.into_u64();
+            if let Some(position) = state
+                .entered
+                .iter()
+                .rposition(|entered| *entered == leaving)
+            {
+                state.entered.remove(position);
+            }
+        }
+    }
+
+    /// A commit reports every preparation lap and every commit phase as a span.
+    ///
+    /// The preparation reported its laps as `tracing` event fields only, so a
+    /// profiler attributed the whole of it to the caller as self time and could
+    /// name none of it: on one 3,111 s conversion that left 940 s on no span at
+    /// all (FIR-2579). Fields alone are not enough, because the tool an operator
+    /// reaches for on a slow run reads spans.
+    ///
+    /// The expected lap names are derived from the laps the summary event
+    /// carries rather than restated here, so a lap added to one split and not
+    /// the other fails this test instead of quietly making the two accounts
+    /// disagree.
+    #[test]
+    fn a_commit_reports_its_preparation_laps_as_spans() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let transaction = arbitrary_repository_transaction(&manager);
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+
+        let recorder = SpanRecorder::default();
+        tracing::subscriber::with_default(recorder.clone(), || {
+            manager.commit_repository_transaction(transaction).unwrap();
+        });
+
+        let opened = recorder.opened_span_names();
+        for phase in [
+            "kindb.commit.transaction_hash",
+            "kindb.commit.prepare_successor",
+            "kindb.commit.persist_successor",
+        ] {
+            assert!(
+                opened.contains(&phase),
+                "commit phase {phase} must reach a profiler as a span; opened {opened:?}"
+            );
+        }
+
+        let recorded = PREPARATION_PHASE_LOG.with(|log| log.borrow().clone());
+        let laps = recorded
+            .iter()
+            .find(|(phase, _)| *phase == "prepare_successor")
+            .map(|(_, laps)| laps.clone())
+            .expect("the preparation records its own laps");
+        assert!(
+            laps.len() >= 11,
+            "the preparation reports eleven laps; recorded {laps:?}"
+        );
+        let expected: Vec<String> = laps
+            .iter()
+            .map(|(field, _)| format!("kindb.prepare.{}", field.trim_end_matches("_ms")))
+            .collect();
+
+        let children = recorder.children_of("kindb.commit.prepare_successor");
+        for lap in &expected {
+            assert!(
+                children.iter().any(|child| child == lap),
+                "lap {lap} must open under the preparation span; children {children:?}"
+            );
+        }
+        assert_eq!(
+            children.len(),
+            expected.len(),
+            "every span opened inside the preparation belongs to a lap; children {children:?}, laps {expected:?}"
+        );
     }
 
     #[test]
