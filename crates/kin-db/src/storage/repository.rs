@@ -17572,7 +17572,11 @@ mod clockhalf_git_origin {
                 risk_summary: None,
             };
             change.id = compute_semantic_change_id(&change).expect("change id computes");
-            let raw_tree_oid = if index == 0 || index % 2 == 0 { oid_a } else { oid_b };
+            let raw_tree_oid = if index == 0 || index % 2 == 0 {
+                oid_a
+            } else {
+                oid_b
+            };
             targets.insert(
                 change.id,
                 GitProjectionTreeTarget {
