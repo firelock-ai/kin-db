@@ -8858,10 +8858,7 @@ impl InMemoryGraph {
         targets: &[SemanticChangeId],
     ) -> Result<std::collections::BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
         let changes = self.changes.read();
-        Ok(
-            crate::storage::history_replay::resolve_first_parent_trees(&changes.changes, targets)?
-                .trees,
-        )
+        crate::storage::history_replay::resolve_first_parent_trees(&changes.changes, targets)
     }
 
     /// Register an ordered batch of semantic changes with one acquisition of

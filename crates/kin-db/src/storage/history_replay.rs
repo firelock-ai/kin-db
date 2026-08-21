@@ -441,20 +441,6 @@ impl LineageSource for hashbrown::HashMap<SemanticChangeId, SemanticChange> {
     }
 }
 
-/// Every requested tree, plus the lineage members the pass entered to get them.
-#[derive(Debug)]
-pub(crate) struct FirstParentTrees {
-    /// One resolved tree per requested change, keyed by that change.
-    pub(crate) trees: BTreeMap<SemanticChangeId, ResolvedTree>,
-    /// Lineage members entered exactly once by this pass.
-    ///
-    /// This is the cost shape the pass exists to bound. Resolving each target
-    /// on its own walks that target's whole lineage, so `targets` times
-    /// `depth`; one pass over the union walks each member once, so
-    /// `depth` plus the members only some targets carry.
-    pub(crate) lineage_steps: usize,
-}
-
 /// Resolve the exact repository tree at every target in one first-parent pass.
 ///
 /// `ChangeStore::resolve_tree_at` resolves one head by collecting that head's
@@ -484,7 +470,7 @@ pub(crate) struct FirstParentTrees {
 pub(crate) fn resolve_first_parent_trees<S: LineageSource + ?Sized>(
     changes: &S,
     targets: &[SemanticChangeId],
-) -> Result<FirstParentTrees, KinDbError> {
+) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
     let wanted: BTreeSet<SemanticChangeId> = targets.iter().copied().collect();
     let lineage = collect_first_parent_lineage(changes, targets)?;
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
@@ -576,10 +562,7 @@ pub(crate) fn resolve_first_parent_trees<S: LineageSource + ?Sized>(
     #[cfg(test)]
     record_lineage_steps(visited.len());
 
-    Ok(FirstParentTrees {
-        trees,
-        lineage_steps: visited.len(),
-    })
+    Ok(trees)
 }
 
 /// Whether to enter a lineage member or put a branch point's state back.
@@ -590,7 +573,10 @@ enum TreeFrame {
 
 // Lineage members entered by every tree resolution on this thread, so a test
 // can assert the cost SHAPE of one whole verification rather than its seconds.
-// Production reads nothing from here; the counter exists only under `cfg(test)`.
+// That shape is the whole point of the pass: resolving each target on its own
+// enters that target's entire lineage, so targets times depth, where one pass
+// over the union enters each member once. Production reads nothing from here;
+// the counter exists only under `cfg(test)`.
 #[cfg(test)]
 thread_local! {
     pub(crate) static LINEAGE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1976,7 +1962,7 @@ mod tests {
                 panic!("{label} fixture must resolve in one pass: {error}")
             });
             assert_eq!(
-                resolved.trees, expected,
+                resolved, expected,
                 "{label}: the single pass resolved a different state than the per-target walk"
             );
             // A fixture whose trees are all empty would satisfy the comparison
@@ -2001,21 +1987,22 @@ mod tests {
         let lineage_members = TRUNK + 1 + TIPS;
         assert_eq!(targets.len(), lineage_members);
 
-        let single = resolve_first_parent_trees(&changes, &targets)
+        take_lineage_steps();
+        resolve_first_parent_trees(&changes, &targets)
             .expect("a deep history with many tips must resolve");
+        let single_pass_steps = take_lineage_steps();
         assert_eq!(
-            single.lineage_steps, lineage_members,
+            single_pass_steps, lineage_members,
             "one pass must enter each lineage member exactly once"
         );
 
         // The same trees, asked for one at a time: every trunk change walks its
         // own depth and every tip walks the whole trunk again.
-        let mut per_target_steps = 0;
         for target in &targets {
-            per_target_steps += resolve_first_parent_trees(&changes, std::slice::from_ref(target))
-                .expect("each target resolves on its own")
-                .lineage_steps;
+            resolve_first_parent_trees(&changes, std::slice::from_ref(target))
+                .expect("each target resolves on its own");
         }
+        let per_target_steps = take_lineage_steps();
         let trunk_steps = (lineage_members - TIPS) * (lineage_members - TIPS + 1) / 2;
         let tip_steps = TIPS * (lineage_members - TIPS + 1);
         assert_eq!(
@@ -2026,8 +2013,7 @@ mod tests {
         assert!(
             per_target_steps > lineage_members * 50,
             "the fixture must separate the two shapes by more than a constant: \
-             one pass {}, per target {per_target_steps}",
-            single.lineage_steps
+             one pass {single_pass_steps}, per target {per_target_steps}"
         );
     }
 
