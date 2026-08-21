@@ -17743,9 +17743,9 @@ mod native_admission_lineage {
     use crate::storage::history_replay::take_lineage_steps;
     use kin_model::{
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
-        AdmissionPolicyDelta, ChangeOrigin, EffectiveAdmissionPolicyStamp,
-        FrozenLocalOverlayDelta, LocatedEntry, WorkspaceExpectation, WorkspaceMutation,
-        WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        AdmissionPolicyDelta, ChangeOrigin, EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta,
+        LocatedEntry, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use sha2::{Digest, Sha256};
     use uuid::Uuid;

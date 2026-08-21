@@ -564,7 +564,10 @@ pub(crate) fn resolve_first_parent_trees<S: LineageSource + ?Sized>(
     }
     // A target the walk never reached would silently hand the caller no tree
     // where the per-target resolution would have raised, so say so instead.
-    if let Some(missing) = wanted.iter().find(|change_id| !trees.contains_key(change_id)) {
+    if let Some(missing) = wanted
+        .iter()
+        .find(|change_id| !trees.contains_key(change_id))
+    {
         return Err(storage(format!(
             "first-parent tree resolution reached no state for change {missing}"
         )));
@@ -1969,8 +1972,9 @@ mod tests {
         ] {
             let expected = per_target_trees(&changes, &targets)
                 .unwrap_or_else(|error| panic!("{label} fixture must resolve per target: {error}"));
-            let resolved = resolve_first_parent_trees(&changes, &targets)
-                .unwrap_or_else(|error| panic!("{label} fixture must resolve in one pass: {error}"));
+            let resolved = resolve_first_parent_trees(&changes, &targets).unwrap_or_else(|error| {
+                panic!("{label} fixture must resolve in one pass: {error}")
+            });
             assert_eq!(
                 resolved.trees, expected,
                 "{label}: the single pass resolved a different state than the per-target walk"
