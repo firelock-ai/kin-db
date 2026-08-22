@@ -17248,21 +17248,25 @@ mod tests {
         }
     }
 
-    /// One edit to one file, committed: the shape of `kin commit` after a
-    /// one-line change. Returns the source-blob reads the commit itself made,
-    /// which is the machine-independent half of this ticket's measurement.
-    fn commit_one_file_edit(store: &SyntheticTreeStore, round: usize) -> usize {
-        let workspace = store.manager.read_authority().metadata().workspaces[0].clone();
+    /// The transaction for one edit to one file: the shape `kin commit` takes
+    /// after a one-line change. Generic over the backend so the same edit can
+    /// be timed against the in-memory fixture and against real disk.
+    fn one_file_edit_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        body_bytes: usize,
+        round: usize,
+    ) -> RepositoryTransaction {
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
         let path = synthetic_tree_path(0);
         let old = workspace
             .tree
             .artifact_at_path(&path)
             .expect("artifact zero is in the seeded tree")
             .clone();
-        let mut body = synthetic_tree_body(0, store.body_bytes);
+        let mut body = synthetic_tree_body(0, body_bytes);
         body.extend_from_slice(format!("// edit {round}\n").as_bytes());
         let hash = digest(&body);
-        store.manager.save_source_blob(hash, &body).unwrap();
+        manager.save_source_blob(hash, &body).unwrap();
         let tree_delta = TreeDelta::Updated {
             artifact_id: old.artifact_id,
             old: old.located_entry(),
@@ -17293,9 +17297,17 @@ mod tests {
             new_shared_admission_policy: workspace.shared_admission_policy.clone(),
             new_admission_policy: workspace.admission_policy,
         };
-        let mut transaction =
-            transaction_shell(&store.manager, 0xf2_2291_1000 + round as u128);
+        let mut transaction = transaction_shell(manager, 0xf2_2291_1000 + round as u128);
         transaction.workspace_mutation = Some(mutation);
+        transaction
+    }
+
+    /// Commit one file edit against the in-memory fixture, returning the
+    /// source-blob reads the commit itself made. That count is the
+    /// machine-independent half of this ticket's measurement: it does not move
+    /// with host load, and it is what the whole-tree walk inflated.
+    fn commit_one_file_edit(store: &SyntheticTreeStore, round: usize) -> usize {
+        let transaction = one_file_edit_transaction(&store.manager, store.body_bytes, round);
         store.backend.source_load_count.store(0, Ordering::SeqCst);
         store
             .manager
@@ -17440,7 +17452,44 @@ mod tests {
         );
     }
 
-    /// Local, non-citable wall-clock and body-read probe for FIR-2291. Run:
+    /// Copy a synthetic tree store onto a real `LocalFileBackend`, so a commit
+    /// pays the lock acquisition, namespace re-confirmation and file read that
+    /// every body proof costs on disk. The in-memory fixture is a `HashMap`
+    /// lookup per body and hides exactly the cost this ticket is about.
+    fn seed_local_backend_from(
+        store: &SyntheticTreeStore,
+        dir: &TempDir,
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let (seed_bytes, _) = store
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic store persisted its head");
+        let backend = Arc::new(LocalFileBackend::new(dir.path()));
+        backend
+            .save_snapshot(
+                repository_id().as_str(),
+                &seed_bytes,
+                crate::storage::GENERATION_INIT,
+            )
+            .unwrap();
+        let bodies = store.backend.blobs.lock().clone();
+        backend
+            .with_source_blob_write_batch(repository_id().as_str(), &mut |batch| {
+                for (digest, body) in &bodies {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
+    }
+
+    /// Local, non-citable wall-clock and body-read probe for FIR-2291.
+    ///
+    /// Reports, for a small and a mid store, what one one-file commit costs on
+    /// a real local backend and how many bodies it reads. Run:
     ///
     /// ```text
     /// cargo test -p kin-db --release \
@@ -17453,20 +17502,22 @@ mod tests {
             ("small", 128usize, 4_096usize),
             ("mid", 2_048usize, 4_096usize),
         ] {
-            let built = std::time::Instant::now();
             let store = build_synthetic_tree_store(files, body_bytes);
-            let build_secs = built.elapsed().as_secs_f64();
+            let loads = commit_one_file_edit(&store, 0);
+
+            let dir = TempDir::new().unwrap();
+            let manager = seed_local_backend_from(&store, &dir);
             let mut samples = Vec::new();
-            let mut loads = 0;
-            for round in 0..3 {
+            for round in 1..=3 {
+                let transaction = one_file_edit_transaction(&manager, body_bytes, round);
                 let started = std::time::Instant::now();
-                loads = commit_one_file_edit(&store, round);
+                manager.commit_repository_transaction(transaction).unwrap();
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
             }
             samples.sort_by(f64::total_cmp);
             eprintln!(
-                "{label}: {files} files x {body_bytes} B ({:.1} MiB of bodies, built in {build_secs:.1}s) \
-                 -> one-file commit median {:.1} ms, min {:.1} ms, max {:.1} ms, body reads {loads}",
+                "{label}: {files} files x {body_bytes} B = {:.1} MiB of bodies | one-file commit on \
+                 disk median {:.1} ms (min {:.1}, max {:.1}) | body reads {loads}",
                 (files * body_bytes) as f64 / (1024.0 * 1024.0),
                 samples[samples.len() / 2],
                 samples[0],
