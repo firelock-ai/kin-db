@@ -3980,6 +3980,39 @@ impl InMemoryGraph {
         }
     }
 
+    /// Export exactly the domains a workspace comparison reads.
+    ///
+    /// Identical in value to calling [`to_snapshot`] and keeping four of its
+    /// fields, and very different in cost. `to_snapshot` clones every store
+    /// under its own lock, so a caller that wanted entity truth also paid for
+    /// a copy of the whole change map, the work, review, verification,
+    /// provenance and session domains, and every adjacency and secondary index
+    /// on the entity store. This takes one read lock on the entity store and
+    /// copies the four domains named below.
+    ///
+    /// [`to_snapshot`]: Self::to_snapshot
+    pub(crate) fn to_workspace_graph_facts(&self) -> crate::storage::format::WorkspaceGraphFacts {
+        let ent = self.entities.read();
+        crate::storage::format::WorkspaceGraphFacts {
+            entities: ent
+                .entities
+                .iter()
+                .map(|(id, entity)| (*id, entity.clone()))
+                .collect(),
+            relations: ent
+                .relations
+                .iter()
+                .map(|(id, relation)| (*id, relation.clone()))
+                .collect(),
+            external_references: ent
+                .external_references
+                .iter()
+                .map(|(id, reference)| (*id, reference.clone()))
+                .collect(),
+            resolved_tree: ent.resolved_tree.clone(),
+        }
+    }
+
     /// Compute the Merkle root hash directly from the live entity stores,
     /// without materialising a full `GraphSnapshot`.
     pub fn compute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
