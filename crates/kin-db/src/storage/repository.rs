@@ -3974,8 +3974,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // the resolved tree, and no other domain. Dropping the graph immediately
     // after is the other half of the same point, because its last reader is
     // the line above it.
-    let desired = desired_graph.to_workspace_graph_facts();
-    drop(desired_graph);
+    let desired = desired_graph.into_workspace_graph_facts();
 
     let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
     let next = mutation.validate_against(
@@ -5010,11 +5009,11 @@ fn materialize_workspace_graph_snapshot_from_base(
         delta.tree_deltas.len(),
     );
     drop(delta);
-    let materialized = graph.to_snapshot();
-    // The export is the graph's last reader. Leaving it bound held a whole
-    // second copy of everything `materialized` carries across the admission
-    // pass below, which at repository scale is one more whole history.
-    drop(graph);
+    // The export is the graph's last reader, so it consumes the graph. Copying
+    // it out instead held a whole second copy of everything `materialized`
+    // carries across the admission pass below, which at repository scale is
+    // one more whole history.
+    let materialized = graph.into_snapshot();
     let to_snapshot_ms = timer.lap_ms();
     if materialized.resolved_tree != workspace.tree {
         return Err(storage(format!(
