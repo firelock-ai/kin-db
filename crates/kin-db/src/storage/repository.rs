@@ -3968,12 +3968,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // whole published state a second time, held for the rest of a function
     // that never reads it again.
     drop(incremental_delta);
-    // Only the four compared domains leave this graph. Exporting a whole
-    // snapshot here copied the entire change map to be read by nobody: the
-    // two steps below consult entities, relations, external references and
-    // the resolved tree, and no other domain. Dropping the graph immediately
-    // after is the other half of the same point, because its last reader is
-    // the line above it.
+    // Only the four compared domains leave this graph, and the export
+    // consumes it. Exporting a whole snapshot here copied the entire change
+    // map to be read by nobody, because the two steps below consult entities,
+    // relations, external references and the resolved tree and no other
+    // domain, and it then left the graph itself bound for the rest of a
+    // function whose last reader of it is this line.
     let desired = desired_graph.into_workspace_graph_facts();
 
     let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
