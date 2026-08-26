@@ -17524,8 +17524,7 @@ mod tests {
                     // cannot see a copy of it come back. The payload is a
                     // parameter for that reason, not for realism.
                     if payload_bytes > 0 {
-                        entity.doc_summary =
-                            Some("payload  ".repeat(payload_bytes.div_ceil(9)));
+                        entity.doc_summary = Some("payload  ".repeat(payload_bytes.div_ceil(9)));
                     }
                     vec![EntityDelta::Added { new: entity }]
                 },
@@ -17547,7 +17546,10 @@ mod tests {
             parent = Some(change.id);
             chain.push(change);
         }
-        let change = chain.last().expect("a store has at least one change").clone();
+        let change = chain
+            .last()
+            .expect("a store has at least one change")
+            .clone();
 
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(2291));
         let overlay =
@@ -17700,10 +17702,18 @@ mod tests {
         );
     }
 
-    /// The budget the acceptance check in `scripts/acceptance` mirrors: a
-    /// one-file commit's body reads are bounded by the edit's own entry count,
-    /// with a small fixed allowance for the admission surfaces every commit
-    /// reads regardless of size.
+    /// The budget for a one-file commit: its body reads are bounded by the
+    /// edit's own entry count, with a small fixed allowance for the admission
+    /// surfaces every commit reads regardless of size.
+    ///
+    /// This check is the only thing guarding that budget. An earlier version of
+    /// this comment said an acceptance check in `scripts/acceptance` mirrored
+    /// it, and none does: that directory is in `kin`, not here, and `git grep`
+    /// finds no mention of this budget in it, against a control on FIR-2539
+    /// that returns two hits. Building the mirror is not a matter of writing
+    /// the script, because the number this asserts is `MemoryBackend`'s
+    /// `source_load_count`, a kin-db test-backend counter with no surface kin
+    /// can read. A mirror needs that observable first.
     #[test]
     fn a_one_file_commit_stays_inside_its_edit_size_budget() {
         const EDIT_ENTRIES: usize = 1;
@@ -18025,8 +18035,7 @@ mod tests {
                      was asked to grade; refusing to report a depth it does not have"
                 );
 
-                let transaction =
-                    one_file_edit_transaction(&manager, body_bytes, 10_000 + round);
+                let transaction = one_file_edit_transaction(&manager, body_bytes, 10_000 + round);
                 let started = std::time::Instant::now();
                 let receipt = manager
                     .commit_repository_transaction(transaction)
