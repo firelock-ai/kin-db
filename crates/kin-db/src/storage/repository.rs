@@ -17978,10 +17978,30 @@ mod tests {
             .unwrap_or_else(|_| "5".to_string())
             .parse()
             .expect("KIN_FIR1624_ROUNDS parses as a round count");
+        let want_entities: usize = std::env::var("KIN_FIR1624_ENTITIES")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("KIN_FIR1624_ENTITIES parses as an entity count");
 
         let store = build_synthetic_tree_store_with_history(files, 256, depth, payload);
         let lease = store.manager.read_authority();
-        let snapshot = lease.snapshot().clone();
+        let mut snapshot = lease.snapshot().clone();
+        // An authority snapshot's entity domain is not populated by the entity
+        // deltas its changes carry; those are materialized into a workspace
+        // graph. So a graph built straight from the authority reads zero
+        // entities, and a bench run against it measures every domain except
+        // the one a reference query is about. Seed the domain directly, which
+        // the public field allows, so the entity axis is a parameter rather
+        // than an accident of the fixture.
+        for index in 0..want_entities {
+            let entity = semantic_test_entity(
+                &format!("src/generated/query_{index:06}.rs"),
+                &format!("query_{index:06}"),
+                LanguageId::Rust,
+                (index % 251) as u8,
+            );
+            snapshot.entities.insert(entity.id.clone(), entity);
+        }
         let entities = snapshot.entities.len();
         let changes = snapshot.changes.len();
         let relations = snapshot.relations.len();
@@ -17998,6 +18018,12 @@ mod tests {
             changes, depth,
             "the graph under test carries {changes} changes, not the {depth} this run was \
              asked to grade"
+        );
+        assert_eq!(
+            entities, want_entities,
+            "the graph under test carries {entities} entities, not the {want_entities} this \
+             run was asked to grade; a bench that silently reads an empty domain measures \
+             everything except the thing a reference query is about"
         );
 
         let mut export = Vec::new();
