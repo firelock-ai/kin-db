@@ -4419,11 +4419,30 @@ impl InMemoryGraph {
                 .get(entity_id)
                 .cloned()
                 .map(ResolvedRetrievalItem::Entity),
+            // FIR-2727. The liveness test is the whole of this arm's fix.
+            //
+            // `EntityRevision` keys outlive retirement on purpose: history is
+            // immutable and retirement evicts only the live `Entity(E)` key.
+            // Without the filter below, the one key class that survives by
+            // design resolved through the one arm that never asked whether its
+            // entity still existed, and it returned `ResolvedRetrievalItem::
+            // Entity`, the SAME variant the live arm returns, so no caller
+            // could tell a live entity from a retired one. That is how a
+            // retired entity reached the fused seed set after the eviction that
+            // was supposed to prevent it.
+            //
+            // A revision key for a LIVE entity still resolves, so this removes
+            // exactly one case: history served as present. Every one of the
+            // eight production callers was enumerated first and not one wants
+            // historical resolution; the cosine arm even re-checks liveness
+            // itself after resolving, which is a consumer working around this
+            // gap rather than depending on it.
             RetrievalKey::EntityRevision(rev_id) => ent
                 .entity_revisions
                 .values()
                 .flat_map(|revisions| revisions.iter())
                 .find(|rev| rev.revision_id == *rev_id)
+                .filter(|rev| ent.entities.contains_key(&rev.entity.id))
                 .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone())),
             RetrievalKey::Artifact(artifact_id) => {
                 let file_path = file_path_for_repo_path(&ent.resolved_tree.get(artifact_id)?.path)?;
@@ -11201,19 +11220,23 @@ mod tests {
 
     /// FIR-2727. Retirement evicts the live `Entity(E)` vector key and keeps the
     /// immutable `EntityRevision` keys, which is correct and required. This pins
-    /// both halves, and then pins what the surviving key RESOLVES to, which is
-    /// the part nobody checks.
+    /// both halves, and then pins what the surviving key RESOLVES to, which was
+    /// the part nobody checked.
     ///
     /// Assertions (a) and (b) are the controls. Without (a) the fixture proves
     /// nothing about eviction; without (b) it could pass on a store that
     /// retired the revision history too, which is the opposite defect and is
-    /// pinned elsewhere. (c) is the finding: `resolve_retrieval_key` reaches
-    /// into revision history and returns `ResolvedRetrievalItem::Entity`, the
-    /// same variant the live arm returns, so a caller holding the result cannot
-    /// tell a live entity from a retired one.
+    /// pinned elsewhere.
+    ///
+    /// (c) is the fix. It was committed first in its defect-pinning form,
+    /// asserting `Some(Entity)`, because a fix whose failure was never observed
+    /// is a fix nobody can show you. That commit is deliberately left in
+    /// history; this one inverts it. The mutation that reddens this is removing
+    /// the `filter` from the `EntityRevision` arm of `resolve_retrieval_key`,
+    /// which restores exactly the behaviour the earlier commit pinned.
     #[cfg(feature = "vector")]
     #[test]
-    fn a_surviving_revision_key_resolves_a_retired_entity_as_if_it_were_live() {
+    fn a_surviving_revision_key_does_not_resolve_a_retired_entity() {
         let graph = InMemoryGraph::new();
         let file = FilePathId::new("src/retired.rs");
         let entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
@@ -11301,17 +11324,57 @@ mod tests {
             "retirement must NOT evict immutable revision history"
         );
 
-        // (c) THE FINDING: the surviving key resolves to an Entity, in the same
-        // variant the live arm returns, so the seed path cannot tell them apart.
-        let resolved = graph.resolve_retrieval_key(&RetrievalKey::EntityRevision(revision_id));
-        assert!(
-            matches!(resolved, Some(ResolvedRetrievalItem::Entity(_))),
-            "a revision key that outlives its entity resolves as a live Entity, which is \
-             what lets a retired entity into the seed set: {resolved:?}"
-        );
         assert!(
             graph.get_entity(&retired.id).unwrap().is_none(),
-            "the entity itself is retired, so the resolution above is of something gone"
+            "the entity must actually be retired, or (c) below is vacuous"
+        );
+
+        // (c) THE FIX: a revision key whose entity is gone resolves to nothing,
+        // so it cannot enter a seed set as a live entity.
+        let resolved = graph.resolve_retrieval_key(&RetrievalKey::EntityRevision(revision_id));
+        assert!(
+            resolved.is_none(),
+            "a revision key that outlives its retired entity must not resolve as a live \
+             Entity; that is what let a retired entity into the fused seed set: {resolved:?}"
+        );
+
+        // (d) THE OTHER CONTROL: a revision key for a LIVE entity still
+        // resolves. Without this, an arm that returned None unconditionally
+        // would pass (c) while breaking every historical resolution there is.
+        let live = test_entity("live", &file.0);
+        graph.upsert_entity(&live).unwrap();
+        admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("tester"),
+                message: "a revision for an entity that stays".into(),
+                entity_deltas: vec![EntityDelta::Added { new: live.clone() }],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                projected_files: vec![file.clone()],
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            },
+        );
+        let live_revision = graph
+            .to_snapshot()
+            .entity_revisions
+            .get(&live.id)
+            .and_then(|revisions| revisions.first().map(|rev| rev.revision_id))
+            .expect("the live entity must have a revision");
+        assert!(
+            matches!(
+                graph.resolve_retrieval_key(&RetrievalKey::EntityRevision(live_revision)),
+                Some(ResolvedRetrievalItem::Entity(_))
+            ),
+            "a revision key for a LIVE entity must still resolve, or the filter is too broad"
         );
     }
 
@@ -17668,10 +17731,34 @@ mod tests {
         };
 
         // Removal drops the HEAD-entity vector immediately but the revision
-        // vector survives until reconcile, so retrieval genuinely has one key
-        // it must drop: the degradation channel carries real signal here.
+        // vector survives until reconcile, so the index genuinely still holds
+        // one key for a dead entity. What CHANGED with FIR-2727 is what that
+        // key resolves to.
+        //
+        // This assertion read 1 before the fix, and the 1 was the defect rather
+        // than the design: the lingering revision key resolved to a live-looking
+        // Entity, and retrieval was expected to drop it downstream with a
+        // degradation. `resolve_retrieval_key` now refuses it at the source, so
+        // there is nothing for retrieval to drop and the count is 0.
+        //
+        // The change of expectation is deliberate and is not the test being
+        // bent to fit: the prune assertion below is untouched and still returns
+        // 1, because the key IS still in the index until reconcile evicts it.
+        // The two facts were conflated into one story here. They are now
+        // separate: the index still holds the key (prune finds it), and
+        // retrieval can no longer be handed it (resolution refuses it).
         graph.remove_entity(&retired.id).unwrap();
-        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 1);
+        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 0);
+        assert!(
+            graph
+                .vector_index
+                .lock()
+                .clone()
+                .expect("vector index installed")
+                .contains_retrievable(&retired_head_key),
+            "the revision key must still be IN the index, or the prune below has \
+             nothing to find and its assertion would pass vacuously"
+        );
 
         // Removal forces a full reconcile; the prune evicts exactly the dead
         // head and the store returns to a zero-drop steady state.
