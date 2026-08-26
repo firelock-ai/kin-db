@@ -3954,7 +3954,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
             snapshot,
             metadata,
             mutation.new_base_target.as_ref(),
-            None,
+            WorkspaceBaseHistory::Omitted,
         )?
     };
 
@@ -3964,7 +3964,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
             next_base.clone()
         } else {
-            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target, None)?
+            resolve_workspace_base_graph_snapshot(
+                snapshot,
+                metadata,
+                current_base_target,
+                WorkspaceBaseHistory::Omitted,
+            )?
         }
     };
     let current_graph = match current {
@@ -5000,7 +5005,7 @@ fn materialize_workspace_graph_snapshot(
         authority_snapshot,
         metadata,
         workspace.base_target.as_ref(),
-        admitted,
+        WorkspaceBaseHistory::Carried(admitted),
     )?;
     materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)
 }
@@ -5206,11 +5211,45 @@ thread_local! {
     static WORKSPACE_MUTATION_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether a resolved workspace base carries the repository's change map.
+///
+/// A base is read two ways. A daemon serving a workspace graph queries it, so
+/// it needs every domain the repository has. A workspace mutation compares four
+/// domains, entities, relations, external references and the resolved tree, and
+/// reads no change through its base at all: `derive_workspace_semantic_overlay`
+/// consults three of those four, `WorkspaceGraphFacts` keeps exactly those four,
+/// and `apply_transaction_delta` touches no history domain.
+///
+/// Carrying the map into the second kind costs a whole copy of it per
+/// resolution, and on a full-history conversion the change map IS the
+/// repository. It costs a second time through the graph built over that base,
+/// which derives an entity revision timeline across the entire history because
+/// the derivation is gated on the map being non-empty, and then drops every one
+/// of them at the export that keeps four domains.
+///
+/// Omitting it removes no proof. A base sets `repository_authority` to `None`,
+/// and the envelope is the only part of storage admission that reads the change
+/// map for anything beyond admitting the map itself, so a base's copy re-proves
+/// a map this same preparation admitted at `kindb.prepare.admit` and proves
+/// again over the authority's own map at `kindb.prepare.history_replay`. A
+/// relation endpoint is an entity, artifact, test, contract, work item,
+/// verification run or external reference and never a change, so the endpoint
+/// pass cannot weaken either.
+enum WorkspaceBaseHistory<'a> {
+    /// Carry the change map, with a witness when the caller holds one this
+    /// base's copy can carry instead of repeating.
+    Carried(Option<&'a AdmittedChangeMap<'a>>),
+    /// Leave the change map out. A witness is unrepresentable here on purpose:
+    /// carrying one onto an empty map would satisfy pointer identity while
+    /// attesting nothing.
+    Omitted,
+}
+
 fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
-    admitted: Option<&AdmittedChangeMap<'_>>,
+    history: WorkspaceBaseHistory<'_>,
 ) -> Result<GraphSnapshot, KinDbError> {
     #[cfg(test)]
     WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
@@ -5259,8 +5298,14 @@ fn resolve_workspace_base_graph_snapshot(
         relations,
         outgoing: HashMap::new(),
         incoming: HashMap::new(),
-        changes: authority_snapshot.changes.clone(),
-        change_children: authority_snapshot.change_children.clone(),
+        changes: match history {
+            WorkspaceBaseHistory::Carried(_) => authority_snapshot.changes.clone(),
+            WorkspaceBaseHistory::Omitted => HashMap::new(),
+        },
+        change_children: match history {
+            WorkspaceBaseHistory::Carried(_) => authority_snapshot.change_children.clone(),
+            WorkspaceBaseHistory::Omitted => HashMap::new(),
+        },
         work_items: authority_snapshot.work_items.clone(),
         annotations: authority_snapshot.annotations.clone(),
         work_links: authority_snapshot.work_links.clone(),
@@ -5294,13 +5339,16 @@ fn resolve_workspace_base_graph_snapshot(
     rebuild_snapshot_adjacency(&mut base);
     let adjacency_ms = timer.lap_ms();
     // CARRY SITE: `base.changes` is `authority_snapshot.changes.clone()`, made
-    // in the struct literal above, and `admitted` witnesses that same map.
-    match admitted {
-        Some(admitted) => {
+    // in the struct literal above, and `admitted` witnesses that same map. It
+    // is reachable only under `Carried`, where that clone happened.
+    match history {
+        WorkspaceBaseHistory::Carried(Some(admitted)) => {
             let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
             base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
         }
-        None => base.validate_storage_admission()?,
+        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::Omitted => {
+            base.validate_storage_admission()?
+        }
     }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
@@ -17736,7 +17784,7 @@ mod fir2334_attribution {
             snapshot,
             metadata,
             workspace.base_target.as_ref(),
-            None,
+            WorkspaceBaseHistory::Carried(None),
         )
         .expect("resolve workspace base");
         println!(
