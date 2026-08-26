@@ -66,7 +66,7 @@ run_phase() {
   local rc=0
   set +e
   env KIN_FIR2615_PHASE="$phase" KIN_FIR2615_DIR="$dir" KIN_FIR2615_FILES="$files" \
-      KIN_FIR2615_ROUND="$round" KIN_FIR2615_DEPTH="${KIN_FIR2615_DEPTH:-1}" \
+      KIN_FIR2615_ROUND="$round" KIN_FIR2615_DEPTH="${KIN_FIR2615_DEPTH:-1}" KIN_FIR2615_PAYLOAD="${KIN_FIR2615_PAYLOAD:-0}" \
       KIN_EMBED_BACKEND=cpu \
       /usr/bin/time -l "$BIN" "$TEST_PATH" --exact --ignored --nocapture > "$log" 2>&1
   rc=$?

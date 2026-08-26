@@ -17447,7 +17447,7 @@ mod tests {
     /// Seed a repository whose first change introduces `files` artifacts and
     /// whose workspace is admitted at that exact tree.
     fn build_synthetic_tree_store(files: usize, body_bytes: usize) -> SyntheticTreeStore {
-        build_synthetic_tree_store_with_history(files, body_bytes, 1)
+        build_synthetic_tree_store_with_history(files, body_bytes, 1, 0)
     }
 
     /// The same store, with `commits` chained changes behind its head instead
@@ -17467,6 +17467,7 @@ mod tests {
         files: usize,
         body_bytes: usize,
         commits: usize,
+        payload_bytes: usize,
     ) -> SyntheticTreeStore {
         assert!(
             files >= 2,
@@ -17512,14 +17513,21 @@ mod tests {
                 entity_deltas: if head {
                     Vec::new()
                 } else {
-                    vec![EntityDelta::Added {
-                        new: semantic_test_entity(
-                            &format!("src/generated/history_{index:05}.rs"),
-                            &format!("history_{index:05}"),
-                            LanguageId::Rust,
-                            (index % 251) as u8,
-                        ),
-                    }]
+                    let mut entity = semantic_test_entity(
+                        &format!("src/generated/history_{index:05}.rs"),
+                        &format!("history_{index:05}"),
+                        LanguageId::Rust,
+                        (index % 251) as u8,
+                    );
+                    // A change carrying almost nothing makes a copy of the
+                    // change map almost free, so a fixture built that way
+                    // cannot see a copy of it come back. The payload is a
+                    // parameter for that reason, not for realism.
+                    if payload_bytes > 0 {
+                        entity.doc_summary =
+                            Some("payload  ".repeat(payload_bytes.div_ceil(9)));
+                    }
+                    vec![EntityDelta::Added { new: entity }]
                 },
                 relation_deltas: Vec::new(),
                 tree_deltas: if head {
@@ -17965,6 +17973,10 @@ mod tests {
             .unwrap_or_else(|_| "1".to_string())
             .parse()
             .expect("KIN_FIR2615_ROUND parses as a round number");
+        let payload: usize = std::env::var("KIN_FIR2615_PAYLOAD")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("KIN_FIR2615_PAYLOAD parses as a byte count");
         let phase = std::env::var("KIN_FIR2615_PHASE").unwrap_or_else(|_| "commit".to_string());
         let path = std::path::PathBuf::from(&dir);
 
@@ -17979,11 +17991,13 @@ mod tests {
                 // copies FIR-2615 cites are copies of the whole graph with the
                 // change map in them, so the change map is the axis they are
                 // visible on.
-                let store = build_synthetic_tree_store_with_history(files, body_bytes, depth);
+                let store =
+                    build_synthetic_tree_store_with_history(files, body_bytes, depth, payload);
                 seed_local_backend_at(&store, &path);
                 let (raw, peak) = peak_resident_bytes();
                 println!(
                     "FIR2615 phase=seed files={files} body_bytes={body_bytes} depth={depth} \
+                     payload={payload} \
                      ru_maxrss_raw={raw} peak_rss_bytes={peak} dir={dir}"
                 );
             }
