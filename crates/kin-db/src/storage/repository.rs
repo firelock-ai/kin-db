@@ -17936,7 +17936,6 @@ mod tests {
             .unwrap();
     }
 
-
     /// FIR-1624 arm A: what one MCP reference query pays before it answers.
     ///
     /// `mcp_find_references_with_stable_authority` loops up to
