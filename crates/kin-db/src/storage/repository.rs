@@ -3943,21 +3943,30 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // that leaves the base where it was makes the starting workspace's target
     // that same target again, which is the shape every forced tree admission
     // takes.
+    // Each holder below opens its own span so the heap attribution probe
+    // charges the transient to the structure that caused it rather than to
+    // this whole lap. The lap is the largest single term in a full-history
+    // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    let next_base = resolve_workspace_base_graph_snapshot(
-        snapshot,
-        metadata,
-        mutation.new_base_target.as_ref(),
-        None,
-    )?;
+    let next_base = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
+        resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            mutation.new_base_target.as_ref(),
+            None,
+        )?
+    };
 
     let current_base_target = current.and_then(|workspace| workspace.base_target.as_ref());
-    let current_base =
+    let current_base = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.current_base").entered();
         if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
             next_base.clone()
         } else {
             resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target, None)?
-        };
+        }
+    };
     let current_graph = match current {
         Some(workspace) => {
             materialize_workspace_graph_snapshot_from_base(current_base, workspace, None)?
@@ -3966,22 +3975,28 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
     incremental_delta.tree_deltas = mutation.tree_deltas.clone();
-    let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
-    desired_graph.apply_transaction_delta(&incremental_delta)?;
-    // The delta is the mutation's own semantic delta plus a copy of its tree
-    // deltas, and the graph has absorbed both. On a conversion that is the
-    // whole published state a second time, held for the rest of a function
-    // that never reads it again.
-    drop(incremental_delta);
     // Only the four compared domains leave this graph, and the export
     // consumes it. Exporting a whole snapshot here copied the entire change
     // map to be read by nobody, because the two steps below consult entities,
     // relations, external references and the resolved tree and no other
     // domain, and it then left the graph itself bound for the rest of a
-    // function whose last reader of it is this line.
-    let desired = desired_graph.into_workspace_graph_facts();
+    // function whose last reader of it is that export.
+    let desired = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.desired_graph").entered();
+        let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
+        desired_graph.apply_transaction_delta(&incremental_delta)?;
+        // The delta is the mutation's own semantic delta plus a copy of its
+        // tree deltas, and the graph has absorbed both. On a conversion that
+        // is the whole published state a second time, held for the rest of a
+        // function that never reads it again.
+        drop(incremental_delta);
+        desired_graph.into_workspace_graph_facts()
+    };
 
-    let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
+    let derived_semantic_overlay = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.semantic_overlay").entered();
+        derive_workspace_semantic_overlay(&next_base, &desired)?
+    };
     let next = mutation.validate_against(
         &transaction.repository_id,
         current,
@@ -3990,7 +4005,10 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // The successor's own materialization follows immediately and is compared
     // against the desired graph, which subsumes the materialize-and-discard
     // check the validating entry point ends with.
-    validate_workspace_state_without_materialization(replay, snapshot, metadata, &next)?;
+    {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.validate_successor").entered();
+        validate_workspace_state_without_materialization(replay, snapshot, metadata, &next)?;
+    }
     // The successor takes its base target from the mutation, so the base
     // resolved above is the one it materializes over. Reuse is refused rather
     // than assumed: a successor pointing somewhere else must resolve its own
@@ -4004,9 +4022,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // Narrowed at the call for the same reason the desired graph is: the exact
     // comparison below reads four domains, and holding the rest of a
     // whole-history snapshot beside them buys nothing.
-    let rematerialized = WorkspaceGraphFacts::from_snapshot(
-        materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?,
-    );
+    let rematerialized = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.rematerialize").entered();
+        WorkspaceGraphFacts::from_snapshot(materialize_workspace_graph_snapshot_from_base(
+            next_base, &next, None,
+        )?)
+    };
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
