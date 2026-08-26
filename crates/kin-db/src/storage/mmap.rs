@@ -1823,7 +1823,10 @@ fn capability_write_recovery_candidate_bytes(
     })?;
 
     let result = (|| {
-        capability_write_new_bytes_and_fsync(directory, &unique_tmp_path, display_root, bytes)?;
+        {
+            let _probe = tracing::info_span!("kindb.probe.write_candidate_out").entered();
+            capability_write_new_bytes_and_fsync(directory, &unique_tmp_path, display_root, bytes)?;
+        }
         capability_write_new_bytes_and_fsync(
             directory,
             &unique_marker_path,
@@ -1885,13 +1888,16 @@ fn capability_promote_recovery_candidate_outcome(
             marker.version
         )));
     }
-    let candidate = read_regular_bounded_at(
-        directory,
-        &tmp_path,
-        display_root,
-        "recovery candidate",
-        marker.byte_len,
-    )?;
+    let candidate = {
+        let _probe = tracing::info_span!("kindb.probe.read_candidate_back").entered();
+        read_regular_bounded_at(
+            directory,
+            &tmp_path,
+            display_root,
+            "recovery candidate",
+            marker.byte_len,
+        )?
+    };
     if candidate.len() as u64 != marker.byte_len
         || <[u8; 32]>::from(Sha256::digest(&candidate)) != marker.sha256
     {
@@ -1956,15 +1962,18 @@ fn capability_promote_recovery_candidate_outcome(
         return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
     }
 
-    let installed = match read_regular_bounded_at(
-        directory,
-        relative,
-        display_root,
-        "promoted destination",
-        marker.byte_len,
-    ) {
-        Ok(installed) => installed,
-        Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
+    let installed = {
+        let _probe = tracing::info_span!("kindb.probe.read_installed_back").entered();
+        match read_regular_bounded_at(
+            directory,
+            relative,
+            display_root,
+            "promoted destination",
+            marker.byte_len,
+        ) {
+            Ok(installed) => installed,
+            Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
+        }
     };
     if installed.len() as u64 != marker.byte_len
         || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256

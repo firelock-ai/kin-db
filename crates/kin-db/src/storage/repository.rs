@@ -1419,13 +1419,24 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                 // `next` passed the successor's own storage-admission gate under
                 // the single writer permit and is immutable from that gate to
                 // this write.
-                let bytes = match next.snapshot.to_bytes_pre_validated() {
-                    Ok(bytes) => bytes,
-                    Err(error) => return PersistOutcome::NotCommitted(error),
+                let bytes = {
+                    let _probe = tracing::info_span!("kindb.probe.encode_frame").entered();
+                    match next.snapshot.to_bytes_pre_validated() {
+                        Ok(bytes) => bytes,
+                        Err(error) => return PersistOutcome::NotCommitted(error),
+                    }
                 };
                 let serialize_ms = timer.lap_ms();
                 let snapshot_bytes = bytes.len();
-                let outcome = self.persist_bytes(&bytes, &mut state);
+                tracing::info!(
+                    target: "kindb::probe",
+                    snapshot_bytes,
+                    "PROBE encoded snapshot frame length"
+                );
+                let outcome = {
+                    let _probe = tracing::info_span!("kindb.probe.persist_bytes").entered();
+                    self.persist_bytes(&bytes, &mut state)
+                };
                 let write_ms = timer.lap_ms();
                 record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
                 outcome
