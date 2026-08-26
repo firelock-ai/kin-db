@@ -17936,6 +17936,64 @@ mod tests {
             .unwrap();
     }
 
+    /// A transaction that admits `count` entities into the workspace through
+    /// the real admission path.
+    ///
+    /// Not a shortcut around the guard that refused one. The entities go in as
+    /// a `WorkspaceSemanticDelta` on a workspace mutation and are committed by
+    /// `commit_repository_transaction`, which is the route the product uses,
+    /// so what materializes afterwards is a workspace graph that genuinely
+    /// carries them rather than an authority snapshot with a domain stuffed
+    /// into it.
+    fn entity_admission_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        count: usize,
+        files: usize,
+    ) -> RepositoryTransaction {
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
+        let entity_deltas = (0..count)
+            .map(|index| EntityDelta::Added {
+                // An entity has to live on a file the staged tree tracks:
+                // admission refuses one whose origin is absent, which is the
+                // contract and not an obstacle to route around. So these land
+                // on the fixture's own artifacts, several entities per file
+                // exactly as a real repository has.
+                new: semantic_test_entity(
+                    &format!("src/generated/artifact_{:05}.rs", index % files),
+                    &format!("query_{index:06}"),
+                    LanguageId::Rust,
+                    (index % 251) as u8,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let semantic_delta = WorkspaceSemanticDelta::new(entity_deltas, Vec::new())
+            .expect("the synthetic entity delta validates");
+        let mutation = WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace.generation + 1,
+            new_head: workspace.head.clone(),
+            new_base_target: workspace.base_target.clone(),
+            new_base_tree_hash: workspace.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: workspace.tree_hash,
+            semantic_delta,
+            new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+            new_admission_policy: workspace.admission_policy,
+        };
+        let mut transaction = transaction_shell(manager, 0xf2_1624_0001);
+        transaction.workspace_mutation = Some(mutation);
+        transaction
+    }
+
     /// FIR-1624 arm A: what one MCP reference query pays before it answers.
     ///
     /// `mcp_find_references_with_stable_authority` loops up to
@@ -17983,6 +18041,13 @@ mod tests {
             .expect("KIN_FIR1624_ENTITIES parses as an entity count");
 
         let store = build_synthetic_tree_store_with_history(files, 256, depth, payload);
+        if want_entities > 0 {
+            let transaction = entity_admission_transaction(&store.manager, want_entities, files);
+            store
+                .manager
+                .commit_repository_transaction(transaction)
+                .expect("the entity admission commits");
+        }
         let lease = store.manager.read_authority();
         let authority = lease.snapshot();
         let metadata = lease.metadata();
@@ -18015,26 +18080,18 @@ mod tests {
 
         // Refuse to grade a graph that is not the shape this run asked for, the
         // same reason the peak bench refuses a store of the wrong size.
-        // A reference query reads entities and relations. No fixture in this
-        // module can put them into a materialized workspace graph: the entity
-        // deltas live in the history, the comparison base omits the change
-        // map, and the fixture's workspace mutation carries an empty semantic
-        // delta. Seeding the authority's entity map by hand does not work
-        // either, because `from_snapshot_without_text_index` refuses an
-        // authority snapshot carrying an unscoped graph view.
-        //
-        // So this bench measures the tree and change domains only, and what it
-        // reports is a floor rather than a query's cost. A run that asks for
-        // entities is refused outright rather than answered with a number that
-        // looks like the thing and is not, and every line it does print
-        // carries a marker naming the domains that were empty, so no reading
-        // can be carried out of here unlabelled.
-        assert!(
-            want_entities == 0,
-            "this bench cannot build a workspace graph carrying entities, so it cannot \
-             answer a run that asked for {want_entities} of them. Populating the entity \
-             and relation domains needs a fixture this module does not have, and building \
-             one is the first step for whoever measures a real reference query."
+        // A reference query reads entities and relations, so a run that leaves
+        // those domains empty measures everything except the thing the query
+        // is about. `KIN_FIR1624_ENTITIES` admits them through the real
+        // workspace mutation path, and the assertion below refuses to grade a
+        // graph that does not carry what the run asked for. Every printed line
+        // still names the domains that came out empty, so a reading taken at
+        // the default of zero cannot be carried away unlabelled.
+        assert_eq!(
+            entities, want_entities,
+            "the graph under test carries {entities} entities against the {want_entities} \
+             this run asked for; a bench that silently reads an empty domain measures \
+             everything except the thing a reference query is about"
         );
         let missing = {
             let mut empty = Vec::new();
@@ -18091,12 +18148,13 @@ mod tests {
         let live_merkle_ms = median(live_merkle);
         let rebuild_ms = median(rebuild);
         let attempt_ms = export_ms + snapshot_merkle_ms + live_merkle_ms + rebuild_ms;
+        let reading = if missing == "none" { "full" } else { "floor" };
         println!(
             "FIR1624 files={files} entities={entities} relations={relations} changes={changes} \
              payload={payload} rounds={rounds} to_snapshot_ms={export_ms:.1} \
              snapshot_merkle_ms={snapshot_merkle_ms:.1} live_merkle_ms={live_merkle_ms:.1} \
              rebuild_ms={rebuild_ms:.1} one_attempt_ms={attempt_ms:.1} \
-             four_attempts_ms={:.1} empty_domains={missing} reading=floor",
+             four_attempts_ms={:.1} empty_domains={missing} reading={reading}",
             attempt_ms * 4.0
         );
     }
