@@ -4147,6 +4147,26 @@ impl InMemoryGraph {
         self.entities.read().relations.len()
     }
 
+    /// Number of relations whose source or destination is not an admitted node.
+    ///
+    /// Zero is the invariant every persist gate already demands. Since
+    /// `upsert_relation` now refuses an unadmitted endpoint at write time, a
+    /// store built by this version has no way to reach a nonzero count, and the
+    /// number stays readable for the stores that predate the refusal: one
+    /// restored from an older snapshot can still carry strands, and until now
+    /// the only count kin-db ever took was the one `compact` returns, which its
+    /// single caller discarded.
+    pub fn stranded_relation_count(&self) -> usize {
+        let ent = self.entities.read();
+        ent.relations
+            .values()
+            .filter(|relation| {
+                !self.relation_endpoint_is_present(&ent, relation.src)
+                    || !self.relation_endpoint_is_present(&ent, relation.dst)
+            })
+            .count()
+    }
+
     /// Return incoming and outgoing relations for any graph node.
     ///
     /// The `EntityStore` relation APIs intentionally expose entity-only edges.
@@ -6706,23 +6726,26 @@ impl InMemoryGraph {
                     delta_map_remove(&mut pending.delta.incoming, eid);
                 }
                 for rid in &inc_rids {
-                    // If the relation still exists, it's from an external file — keep it
-                    // in the relations map but just remove from this entity's incoming vec
-                    // (which we already did by removing the key). However we also need to
-                    // check if the source is in the same file set — if so the relation
-                    // was already removed above.
-                    if let Some(rel) = ent.relations.get(rid) {
-                        if let Some(src) = rel.src.as_entity() {
-                            if entity_set.contains(&src) {
-                                // Already removed as outgoing above — this is a leftover ref.
-                                // The relation is already gone from ent.relations via the
-                                // outgoing removal pass.
-                            } else {
-                                merkle_seeds.insert(src);
-                            }
-                        }
-                        // If src is NOT in entity_set, this is a cross-file incoming
-                        // relation. Keep the relation in ent.relations (dangling dst).
+                    let Some(src) = ent.relations.get(rid).map(|rel| rel.src.as_entity()) else {
+                        continue;
+                    };
+                    // A source inside this same file set was already dropped with
+                    // its outgoing edges above, so this is only a leftover ref.
+                    if src.is_some_and(|src| entity_set.contains(&src)) {
+                        continue;
+                    }
+                    if let Some(src) = src {
+                        merkle_seeds.insert(src);
+                    }
+                    // The destination is going away in this pass. Keeping the edge
+                    // anyway is what put a stranded relation in the store, and
+                    // every persist gate refuses a whole snapshot over one of
+                    // them, so a deleted file could take an unrelated commit down
+                    // long after this ran. The edge goes with the endpoint it can
+                    // no longer reach.
+                    if let Some(rel) = ent.relations.remove(rid) {
+                        remove_relation_indexes(&mut ent, &rel);
+                        self.record_relation_delta_remove(&ent, &rel);
                     }
                 }
             }
@@ -6880,6 +6903,93 @@ fn graph_node_is_admitted(
         GraphNodeId::Work(id) => work.work_items.contains_key(&id),
         GraphNodeId::VerificationRun(id) => verification.verification_runs.contains_key(&id),
         GraphNodeId::ExternalReference(id) => external_reference_ids.contains(&id),
+    }
+}
+
+impl InMemoryGraph {
+    /// Whether the live store actually carries `node`.
+    ///
+    /// Every kind is judged here, entities included. This is the question the
+    /// persist gates ask, so it is the question the strand census reports, and
+    /// it is deliberately NOT the question a relation write asks.
+    ///
+    /// This is the live-map twin of [`graph_node_is_admitted`], which the
+    /// transaction gate runs against prospective sets it has already
+    /// materialized. A relation write has no such sets and must not build them:
+    /// copying the resolved tree per edge would make an enrichment sweep
+    /// quadratic. So every arm is a direct lookup, and the work and
+    /// verification locks are taken only by the arms that need them.
+    ///
+    /// **Entity endpoints are deliberately not judged here**, and that is the
+    /// whole of the difference from the transaction gate. kin's linker mints a
+    /// canonical external-import placeholder whose destination entity is, by
+    /// that predicate's own documented contract, intentionally absent from the
+    /// repository; kin's shipped `graph validate` recognizes the shape and
+    /// reports such a graph as passing every integrity check. Refusing a
+    /// dangling entity endpoint at the write would therefore refuse a shape the
+    /// layer above declares correct. Deciding that is not this layer's call
+    /// while the predicate that recognizes the shape lives in kin-index and is
+    /// invisible from here; a strict entity gate needs that vocabulary moved
+    /// somewhere both layers can read it, which is its own change.
+    ///
+    /// Every other node kind is judged, and that is the case this guard exists
+    /// for. A relation into an artifact, test, contract, work item,
+    /// verification run or external reference the store does not carry is a
+    /// strand with no sanctioned meaning anywhere in the product, and the
+    /// artifact arm in particular is how a stranded artifact edge got into the
+    /// graph at all.
+    ///
+    /// Lock order is entities then work then verification, the order
+    /// `apply_transaction_delta` and `graph_stats` already establish.
+    fn relation_endpoint_is_present(&self, ent: &EntityData, node: GraphNodeId) -> bool {
+        match node {
+            GraphNodeId::Entity(id) => ent.entities.contains_key(&id),
+            GraphNodeId::Artifact(id) => ent.resolved_tree.get(&id).is_some(),
+            GraphNodeId::ExternalReference(id) => ent.external_references.contains_key(&id),
+            GraphNodeId::Test(id) => self.verification.read().test_cases.contains_key(&id),
+            GraphNodeId::Contract(id) => self.verification.read().contracts.contains_key(&id),
+            GraphNodeId::VerificationRun(id) => {
+                self.verification.read().verification_runs.contains_key(&id)
+            }
+            GraphNodeId::Work(id) => self.work.read().work_items.contains_key(&id),
+        }
+    }
+
+    /// Whether a relation write may name `node` as an endpoint.
+    ///
+    /// Deliberately narrower than presence, and the gap is the entity arm. See
+    /// [`Self::relation_endpoint_is_present`] for why an absent entity endpoint
+    /// is a shape kin sanctions rather than a defect this layer may refuse.
+    /// Refusing a write and reporting a census are different questions, so they
+    /// ask different predicates; keeping them one function made the census
+    /// blind to exactly the strands it exists to count.
+    fn relation_endpoint_may_be_written(&self, ent: &EntityData, node: GraphNodeId) -> bool {
+        match node {
+            GraphNodeId::Entity(_) => true,
+            other => self.relation_endpoint_is_present(ent, other),
+        }
+    }
+
+    /// Refuse a relation whose source or destination is not an admitted node.
+    ///
+    /// The wording is deliberately the wording the transaction gate and the
+    /// snapshot gates already use, because kin reads these refusals by
+    /// substring to name the endpoint back to the operator. Changing the phrase
+    /// would not fail a test here; it would silently blank that message.
+    fn require_admitted_relation_endpoints(
+        &self,
+        ent: &EntityData,
+        relation: &Relation,
+    ) -> Result<(), KinDbError> {
+        for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+            if !self.relation_endpoint_may_be_written(ent, node) {
+                return Err(KinDbError::StorageError(format!(
+                    "relation {} has unadmitted {side} endpoint {node}",
+                    relation.id
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7537,6 +7647,15 @@ impl EntityStore for InMemoryGraph {
 
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
         let mut ent = self.entities_write();
+        self.require_admitted_relation_endpoints(&ent, relation)?;
+        // A re-offer of the edge the graph already holds changes nothing, so it
+        // must cost nothing. Without this it still rewrites both index entries,
+        // records a remove and an upsert delta, reseeds the merkle, and through
+        // `invalidate_entities_for_embedding` below retires both endpoints'
+        // vectors for an edge that did not move.
+        if ent.relations.get(&relation.id) == Some(relation) {
+            return Ok(());
+        }
         let mut affected = HashSet::new();
         let mut merkle_seeds = Vec::new();
 
@@ -8522,6 +8641,11 @@ impl EntityStore for InMemoryGraph {
 
         let affected = {
             let mut ent = self.entities_write();
+            // Validate the whole batch before any of it lands, so a bad edge
+            // late in the batch cannot leave the earlier ones half applied.
+            for relation in relations {
+                self.require_admitted_relation_endpoints(&ent, relation)?;
+            }
             let mut merkle_seeds = Vec::new();
             let mut affected = HashSet::new();
 
@@ -8583,6 +8707,11 @@ impl EntityStore for InMemoryGraph {
         // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
         let affected = {
             let mut ent = self.entities_write();
+            // Validate before the retain, so a refusal leaves the relations of
+            // this kind exactly as they were rather than deleted and unreplaced.
+            for relation in &new_relations {
+                self.require_admitted_relation_endpoints(&ent, relation)?;
+            }
             let mut merkle_seeds = Vec::new();
             let mut affected = HashSet::new();
 
@@ -11796,6 +11925,314 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Relation endpoint admission at the write (FIR-2613)
+    // ---------------------------------------------------------------------
+
+    /// An entity endpoint the store does not carry is admitted on purpose, on
+    /// either side.
+    ///
+    /// This is not an oversight and it is not laxity. kin's linker mints a
+    /// canonical external-import placeholder whose destination entity is
+    /// intentionally absent from the repository, and kin's shipped
+    /// `graph validate` reports a graph carrying one as passing every integrity
+    /// check. Refusing it here would refuse a shape the layer above declares
+    /// correct. The predicate that recognizes the shape lives in kin-index and
+    /// cannot be read from this crate, so a strict entity gate waits on that
+    /// vocabulary moving somewhere both layers share.
+    ///
+    /// If this test ever starts failing, the entity gate was tightened without
+    /// that move, and roughly two dozen kin tests will be failing beside it.
+    #[test]
+    fn upsert_relation_admits_a_dangling_entity_endpoint_on_either_side() {
+        let graph = InMemoryGraph::new();
+        let present = test_entity("present", "src/a.rs");
+        graph.upsert_entity(&present).unwrap();
+
+        graph
+            .upsert_relation(&test_relation(
+                EntityId::new(),
+                present.id,
+                RelationKind::Calls,
+            ))
+            .expect("a dangling entity source is the placeholder shape kin relies on");
+        graph
+            .upsert_relation(&test_relation(
+                present.id,
+                EntityId::new(),
+                RelationKind::Calls,
+            ))
+            .expect("a dangling entity destination is the placeholder shape kin relies on");
+
+        assert_eq!(graph.relation_count(), 2);
+        assert_eq!(
+            graph.stranded_relation_count(),
+            2,
+            "admitted is not the same as unremarkable: the census still sees them"
+        );
+    }
+
+    /// The exact shape kin's linker mints, pinned here as admitted.
+    ///
+    /// The two layers disagreed once already: kin-db 0.7.61 refused this shape
+    /// at the write while kin's shipped `graph validate` reported a graph
+    /// carrying it as passing every integrity check, and twenty-seven tests
+    /// across kin-cli, kin-daemon and kin-review went red saying so. The
+    /// contract lives in `kin_index::is_external_import_placeholder`
+    /// (`crates/kin-index/src/linker.rs:4123`) and the exemption that consumes
+    /// it lives in kin's `build_graph_validate_response`
+    /// (`crates/kin-cli/src/commands/graph.rs:1109`). Neither is visible from
+    /// this crate, which is exactly why the contract is written out here: a
+    /// future tightening of the entity arm has to turn this test red before it
+    /// can rediscover the disagreement the expensive way.
+    ///
+    /// The constants below are duplicated from kin-index on purpose and under
+    /// protest. kin-index depends on kin-db, so the dependency cannot run the
+    /// other way, and until the predicate moves down into kin-model where
+    /// `Relation` already lives, two copies is the only way this layer can name
+    /// the shape at all. The follow-up ticket that moves it is what deletes
+    /// this duplication, and this test is where the single shared copy lands.
+    #[test]
+    fn the_external_import_placeholder_shape_kin_mints_is_admitted() {
+        // Values pinned from crates/kin-index/src/linker.rs: EXTERNAL_REFERENCE
+        // _CONFIDENCE (:3961), EXTERNAL_REFERENCE_KIND_TAG (:3966) and
+        // EXTERNAL_IMPORT_REFERENCE_RULE (:3971).
+        const EXTERNAL_REFERENCE_CONFIDENCE: f32 = 0.2;
+        const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
+        const EXTERNAL_IMPORT_REFERENCE_RULE: &str = "external_import_reference";
+        let import_source = "kin_db";
+        let symbol = "InMemoryGraph";
+
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("run_task", "src/app.rs");
+        graph.upsert_entity(&caller).unwrap();
+
+        // The destination is derived, not invented: it is the deterministic
+        // placeholder id the linker computes, and it is intentionally absent
+        // from this repo. That absence is the whole point of the shape.
+        let placeholder =
+            EntityId::from_content(import_source, symbol, EXTERNAL_REFERENCE_KIND_TAG, 0);
+        assert!(
+            graph.get_entity(&placeholder).unwrap().is_none(),
+            "the placeholder destination must not be an entity this store carries"
+        );
+
+        for kind in [RelationKind::Calls, RelationKind::References] {
+            let relation = Relation {
+                id: RelationId::new(),
+                kind,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(placeholder),
+                confidence: EXTERNAL_REFERENCE_CONFIDENCE,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: Some(import_source.to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    source_span: None,
+                    parser_rule: Some(EXTERNAL_IMPORT_REFERENCE_RULE.to_string()),
+                    token: Some(symbol.to_string()),
+                    source_path: Some(import_source.to_string()),
+                    resolved_path: None,
+                    occurrence_count: 1,
+                    call_shape: None,
+                }],
+            };
+
+            graph.upsert_relation(&relation).unwrap_or_else(|error| {
+                panic!(
+                    "kin mints this {kind:?} edge on the real indexing path and its own \
+                     validator calls the result clean; refusing it here puts the two layers \
+                     back into the disagreement 0.7.61 shipped: {error}"
+                )
+            });
+        }
+
+        assert_eq!(graph.relation_count(), 2);
+        assert_eq!(
+            graph.stranded_relation_count(),
+            2,
+            "admitting the shape is not the same as pretending the endpoint is there"
+        );
+    }
+
+    /// The predicate has to consult the map that matches the node's variant. A
+    /// check weakened to wave every entity endpoint through still passes both
+    /// tests above; only an artifact endpoint separates "the check ran" from
+    /// "the check ran on the right map".
+    #[test]
+    fn upsert_relation_refuses_unadmitted_artifact_endpoint() {
+        let graph = InMemoryGraph::new();
+        let source = test_entity("caller", "src/a.rs");
+        graph.upsert_entity(&source).unwrap();
+        let unadmitted = ArtifactId::new();
+        let mut relation = test_relation(source.id, EntityId::new(), RelationKind::Calls);
+        relation.dst = GraphNodeId::Artifact(unadmitted);
+
+        let message = graph.upsert_relation(&relation).unwrap_err().to_string();
+        assert!(
+            message.contains("unadmitted destination endpoint"),
+            "an artifact the resolved tree does not carry must be refused, got: {message}"
+        );
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    /// Negative control: the ordinary edge still lands.
+    #[test]
+    fn upsert_relation_admits_an_edge_whose_endpoints_are_both_present() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("caller", "src/a.rs");
+        let callee = test_entity("callee", "src/b.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+
+        graph
+            .upsert_relation(&test_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    /// Negative control: an artifact the resolved tree does carry is admitted,
+    /// so the artifact arm refuses absence rather than refusing artifacts.
+    #[test]
+    fn upsert_relation_admits_an_admitted_artifact_endpoint() {
+        let graph = InMemoryGraph::new();
+        let source = test_entity("caller", "src/a.rs");
+        graph.upsert_entity(&source).unwrap();
+        let artifact_id = graph.admit_artifact_for_test("src/b.rs", regular_tree_entry(7));
+        let mut relation = test_relation(source.id, EntityId::new(), RelationKind::Calls);
+        relation.dst = GraphNodeId::Artifact(artifact_id);
+
+        graph.upsert_relation(&relation).unwrap();
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    /// The control the fix is most likely to break. `create_test_case` inserts
+    /// the test into the verification map and then batches `Test -> Entity`
+    /// edges, so a check that consults only `ent.entities` passes every test
+    /// above and takes this production path down.
+    #[test]
+    fn create_test_case_still_links_entity_scopes_through_the_batch() {
+        let graph = InMemoryGraph::new();
+        let covered = test_entity("covered", "src/a.rs");
+        graph.upsert_entity(&covered).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "covers_a".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(covered.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/a.rs")),
+        };
+
+        graph.create_test_case(&test_case).unwrap();
+        assert_eq!(
+            graph.relation_count(),
+            1,
+            "a Test endpoint held by the verification map must be admitted"
+        );
+    }
+
+    /// A batch is validated whole before any of it lands, so a bad edge late in
+    /// the batch cannot leave the earlier ones half applied.
+    #[test]
+    fn upsert_relations_batch_refuses_unadmitted_endpoint_and_writes_nothing() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        graph.upsert_entity(&a).unwrap();
+        graph.upsert_entity(&b).unwrap();
+        let good = test_relation(a.id, b.id, RelationKind::Calls);
+        let mut bad = test_relation(a.id, EntityId::new(), RelationKind::Calls);
+        bad.dst = GraphNodeId::Artifact(ArtifactId::new());
+
+        let message = graph
+            .upsert_relations_batch(&[good, bad])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("unadmitted destination endpoint"),
+            "{message}"
+        );
+        assert_eq!(
+            graph.relation_count(),
+            0,
+            "the good edge ahead of the bad one must not land either"
+        );
+    }
+
+    /// A refusal must leave the relations of that kind exactly as they were,
+    /// rather than deleted and unreplaced.
+    #[test]
+    fn replace_relations_of_kind_refuses_unadmitted_endpoint_and_keeps_the_existing_edges() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        graph.upsert_entity(&a).unwrap();
+        graph.upsert_entity(&b).unwrap();
+        let held = test_relation(a.id, b.id, RelationKind::Calls);
+        graph.upsert_relation(&held).unwrap();
+
+        let mut replacement = test_relation(a.id, EntityId::new(), RelationKind::Calls);
+        replacement.dst = GraphNodeId::Artifact(ArtifactId::new());
+        let message = graph
+            .replace_relations_of_kind(RelationKind::Calls, vec![replacement])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("unadmitted destination endpoint"),
+            "{message}"
+        );
+        assert_eq!(
+            graph.relation_count(),
+            1,
+            "the held edge must survive a refused replacement"
+        );
+        assert_eq!(
+            graph
+                .get_relations(&a.id, &[RelationKind::Calls])
+                .unwrap()
+                .first()
+                .map(|relation| relation.id),
+            Some(held.id),
+            "the surviving edge must be the one that was already held"
+        );
+    }
+
+    /// The census has to be able to report a number other than zero, or a
+    /// hardcoded zero would pass it. The strand is minted through the test-only
+    /// bypass because the write path now refuses to make one.
+    #[test]
+    fn stranded_relation_count_counts_a_strand_and_reports_zero_when_clean() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        graph.upsert_entity(&a).unwrap();
+        graph.upsert_entity(&b).unwrap();
+        graph
+            .upsert_relation(&test_relation(a.id, b.id, RelationKind::Calls))
+            .unwrap();
+        assert_eq!(
+            graph.stranded_relation_count(),
+            0,
+            "a store built through the write path carries no strand"
+        );
+
+        // The write path admits a dangling ENTITY endpoint (kin's placeholder
+        // shape), so the census can be driven to nonzero through the public API
+        // and needs no test-only bypass. That it counts what the write path
+        // allows is the point: admitted and unremarkable are different claims.
+        graph
+            .upsert_relation(&test_relation(a.id, EntityId::new(), RelationKind::Calls))
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+        assert_eq!(
+            graph.stranded_relation_count(),
+            1,
+            "the census must see the edge whose destination is gone"
+        );
     }
 
     /// Once the graph is one connected component, adding relations one at a time
@@ -16139,6 +16576,51 @@ mod tests {
         graph.embedding_queue.lock().clear();
         graph.queue_missing_for_embedding();
         assert_eq!(graph.pending_embeddings(), 1);
+    }
+
+    /// Re-offering the edge the graph already holds must retire nothing, and a
+    /// genuinely changed edge must still retire both endpoints. The second half
+    /// is the control: an entity's embed text carries its graph neighborhood
+    /// context, so a fix that simply stopped invalidating would ship vectors
+    /// quoting a neighborhood the entity no longer has.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn reoffering_a_held_relation_retires_no_vector_while_a_changed_one_does() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        graph.upsert_entity(&a).unwrap();
+        graph.upsert_entity(&b).unwrap();
+        let relation = test_relation(a.id, b.id, RelationKind::Calls);
+        graph.upsert_relation(&relation).unwrap();
+
+        // Both endpoints are embedded only after the edge exists, so the
+        // re-offer below is the first write either vector sees.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(a.id, &[1.0, 0.0]).unwrap();
+        index.upsert(b.id, &[0.0, 1.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+        assert_eq!(graph.embedding_status().indexed, 2);
+
+        graph.upsert_relation(&relation).unwrap();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            2,
+            "an edge that did not move must not retire either endpoint's vector"
+        );
+
+        let mut changed = relation.clone();
+        changed.confidence = 0.5;
+        graph.upsert_relation(&changed).unwrap();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            0,
+            "a changed edge still retires both endpoints, because their embed \
+             text carries the neighborhood this edge is part of"
+        );
     }
 
     #[cfg(feature = "vector")]
