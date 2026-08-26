@@ -17936,6 +17936,120 @@ mod tests {
             .unwrap();
     }
 
+
+    /// FIR-1624 arm A: what one MCP reference query pays before it answers.
+    ///
+    /// `mcp_find_references_with_stable_authority` loops up to
+    /// `XREF_CURRENCY_ATTEMPTS` times, four on kin main, and each attempt runs
+    /// `prepare_xref_graph_read`, which on the HEAD path does a whole-graph
+    /// `to_snapshot`, a merkle over that snapshot, a second root hash on the
+    /// live graph, and a full rebuild. That is kin's code, but all four
+    /// operations are this crate's, so the growth law is measurable here with
+    /// no daemon, no network, no GPU and no lock.
+    ///
+    /// Each operation is timed separately rather than as a lump, because the
+    /// point is attribution: a total says the query is expensive and says
+    /// nothing about which of the four to attack.
+    ///
+    /// This measures one attempt. The loop's worst case is four of them, and
+    /// an attempt that finds the graph moved is thrown away and retried, so
+    /// the reported per-attempt cost is a floor for a contended query.
+    ///
+    /// ```text
+    /// KIN_FIR1624_FILES=8192 cargo test -p kin-db --release \
+    ///     fir1624_xref_read_cost_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn fir1624_xref_read_cost_bench() {
+        let files: usize = std::env::var("KIN_FIR1624_FILES")
+            .unwrap_or_else(|_| "2048".to_string())
+            .parse()
+            .expect("KIN_FIR1624_FILES parses as a file count");
+        let depth: usize = std::env::var("KIN_FIR1624_DEPTH")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .expect("KIN_FIR1624_DEPTH parses as a change count");
+        let payload: usize = std::env::var("KIN_FIR1624_PAYLOAD")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("KIN_FIR1624_PAYLOAD parses as a byte count");
+        let rounds: usize = std::env::var("KIN_FIR1624_ROUNDS")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse()
+            .expect("KIN_FIR1624_ROUNDS parses as a round count");
+
+        let store = build_synthetic_tree_store_with_history(files, 256, depth, payload);
+        let lease = store.manager.read_authority();
+        let snapshot = lease.snapshot().clone();
+        let entities = snapshot.entities.len();
+        let changes = snapshot.changes.len();
+        let relations = snapshot.relations.len();
+        drop(lease);
+
+        // The graph a reference query reads is the live in-process graph, so
+        // build one the same way the daemon does and time against that.
+        let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot)
+            .expect("the authority snapshot builds a graph");
+
+        // Refuse to grade a graph that is not the shape this run asked for, the
+        // same reason the peak bench refuses a store of the wrong size.
+        assert_eq!(
+            changes, depth,
+            "the graph under test carries {changes} changes, not the {depth} this run was \
+             asked to grade"
+        );
+
+        let mut export = Vec::new();
+        let mut snapshot_merkle = Vec::new();
+        let mut live_merkle = Vec::new();
+        let mut rebuild = Vec::new();
+        for _ in 0..rounds {
+            let started = std::time::Instant::now();
+            let exported = graph.to_snapshot();
+            export.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            let started = std::time::Instant::now();
+            let root_hash = crate::storage::merkle::compute_graph_root_hash(&exported);
+            snapshot_merkle.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            let started = std::time::Instant::now();
+            let live = graph.compute_root_hash();
+            live_merkle.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(
+                hex::encode(root_hash),
+                hex::encode(live),
+                "the exported root and the live root must agree, or this is not the \
+                 comparison the reference path makes"
+            );
+
+            let started = std::time::Instant::now();
+            let rebuilt =
+                InMemoryGraph::from_snapshot_without_text_index_with_root_hash(exported, root_hash)
+                    .expect("the exported snapshot rebuilds");
+            rebuild.push(started.elapsed().as_secs_f64() * 1000.0);
+            drop(rebuilt);
+        }
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let export_ms = median(export);
+        let snapshot_merkle_ms = median(snapshot_merkle);
+        let live_merkle_ms = median(live_merkle);
+        let rebuild_ms = median(rebuild);
+        let attempt_ms = export_ms + snapshot_merkle_ms + live_merkle_ms + rebuild_ms;
+        println!(
+            "FIR1624 files={files} entities={entities} relations={relations} changes={changes} \
+             payload={payload} rounds={rounds} to_snapshot_ms={export_ms:.1} \
+             snapshot_merkle_ms={snapshot_merkle_ms:.1} live_merkle_ms={live_merkle_ms:.1} \
+             rebuild_ms={rebuild_ms:.1} one_attempt_ms={attempt_ms:.1} \
+             four_attempts_ms={:.1}",
+            attempt_ms * 4.0
+        );
+    }
+
     /// FIR-2615's acceptance measurement: what one one-file commit costs in
     /// peak resident set, on a store this process did not build.
     ///
