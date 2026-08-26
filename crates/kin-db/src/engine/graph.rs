@@ -11199,6 +11199,122 @@ mod tests {
         assert!(pending.structured_artifacts.is_empty());
     }
 
+    /// FIR-2727. Retirement evicts the live `Entity(E)` vector key and keeps the
+    /// immutable `EntityRevision` keys, which is correct and required. This pins
+    /// both halves, and then pins what the surviving key RESOLVES to, which is
+    /// the part nobody checks.
+    ///
+    /// Assertions (a) and (b) are the controls. Without (a) the fixture proves
+    /// nothing about eviction; without (b) it could pass on a store that
+    /// retired the revision history too, which is the opposite defect and is
+    /// pinned elsewhere. (c) is the finding: `resolve_retrieval_key` reaches
+    /// into revision history and returns `ResolvedRetrievalItem::Entity`, the
+    /// same variant the live arm returns, so a caller holding the result cannot
+    /// tell a live entity from a retired one.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_surviving_revision_key_resolves_a_retired_entity_as_if_it_were_live() {
+        let graph = InMemoryGraph::new();
+        let file = FilePathId::new("src/retired.rs");
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file.0, entry);
+
+        let retired = test_entity("retired", &file.0);
+        graph.upsert_entity(&retired).unwrap();
+
+        admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x21; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("tester"),
+                message: "record the revision that outlives retirement".into(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: retired.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                projected_files: vec![file.clone()],
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            },
+        );
+        graph.clear_pending_delta();
+
+        let revision_id = graph
+            .to_snapshot()
+            .entity_revisions
+            .get(&retired.id)
+            .and_then(|revisions| revisions.first().map(|rev| rev.revision_id))
+            .expect("the change must record a revision for the entity");
+
+        // Put both keys in the vector index, which is the state a real store
+        // reaches after embedding: the live key and its revision history.
+        // The index rejects a wrong-width vector, and its error names the
+        // expected width, so this constant is checked by construction rather
+        // than guessed: a change to the default dimension fails here loudly.
+        let vector = vec![0.5_f32; 768];
+        {
+            let vi = graph
+                .get_vector_index()
+                .expect("vector index must be available under the vector feature");
+            vi.upsert_retrievable(RetrievalKey::Entity(retired.id), &vector)
+                .unwrap();
+            vi.upsert_retrievable(RetrievalKey::EntityRevision(revision_id), &vector)
+                .unwrap();
+        }
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: retired.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(&file.0, entry),
+                }],
+                external_reference_deltas: Vec::new(),
+                admission_policy_delta: None,
+            })
+            .expect("retiring the entity must succeed");
+
+        let vi = graph
+            .get_vector_index()
+            .expect("vector index must survive the transaction");
+
+        // (a) CONTROL: eviction happened. Without this the rest proves nothing.
+        assert!(
+            !vi.contains_retrievable(&RetrievalKey::Entity(retired.id)),
+            "retirement must evict the live Entity key from the vector index"
+        );
+
+        // (b) CONTROL: history survived. Without this the fixture could pass on
+        // a store that retired the revisions too, which is a different defect.
+        assert!(
+            vi.contains_retrievable(&RetrievalKey::EntityRevision(revision_id)),
+            "retirement must NOT evict immutable revision history"
+        );
+
+        // (c) THE FINDING: the surviving key resolves to an Entity, in the same
+        // variant the live arm returns, so the seed path cannot tell them apart.
+        let resolved = graph.resolve_retrieval_key(&RetrievalKey::EntityRevision(revision_id));
+        assert!(
+            matches!(resolved, Some(ResolvedRetrievalItem::Entity(_))),
+            "a revision key that outlives its entity resolves as a live Entity, which is \
+             what lets a retired entity into the seed set: {resolved:?}"
+        );
+        assert!(
+            graph.get_entity(&retired.id).unwrap().is_none(),
+            "the entity itself is retired, so the resolution above is of something gone"
+        );
+    }
+
     #[test]
     fn explicit_content_change_removals_preserve_semantic_revision_history() {
         let graph = InMemoryGraph::new();
