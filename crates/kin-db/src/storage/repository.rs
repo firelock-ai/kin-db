@@ -17816,6 +17816,150 @@ mod tests {
             );
         }
     }
+
+    /// This process's peak resident set, as the raw `ru_maxrss` field and as
+    /// bytes.
+    ///
+    /// `ru_maxrss` is bytes on macOS and kilobytes on Linux, so the unit is
+    /// normalized here and the raw field is printed beside it. The driver
+    /// cross-checks the normalized number against `/usr/bin/time -l`, which
+    /// is the reading FIR-2615's acceptance names. Two independent readings
+    /// of one quantity means a unit mistake shows up as a factor of 1024
+    /// rather than as a plausible number.
+    fn peak_resident_bytes() -> (u64, u64) {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        assert_eq!(rc, 0, "getrusage(RUSAGE_SELF) must succeed");
+        let raw = usage.ru_maxrss as u64;
+        let bytes = if cfg!(target_os = "macos") {
+            raw
+        } else {
+            raw * 1024
+        };
+        (raw, bytes)
+    }
+
+    /// Write a synthetic tree store to a named directory, so a later process
+    /// can open it without paying the fixture's own peak.
+    fn seed_local_backend_at(store: &SyntheticTreeStore, path: &std::path::Path) {
+        let (seed_bytes, _) = store
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic store persisted its head");
+        let backend = Arc::new(LocalFileBackend::new(path));
+        backend
+            .save_snapshot(
+                repository_id().as_str(),
+                &seed_bytes,
+                crate::storage::GENERATION_INIT,
+            )
+            .unwrap();
+        let bodies = store.backend.blobs.lock().clone();
+        backend
+            .with_source_blob_write_batch(repository_id().as_str(), &mut |batch| {
+                for (digest, body) in &bodies {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// FIR-2615's acceptance measurement: what one one-file commit costs in
+    /// peak resident set, on a store this process did not build.
+    ///
+    /// Two phases on purpose. Peak RSS is a high-water mark that never comes
+    /// down, and `/usr/bin/time -l` reports one number for a whole process,
+    /// so a process that builds an N-file fixture and then commits into it
+    /// reports whichever of the two was larger. On this fixture the build is
+    /// the larger one at every size that matters, so a single-process bench
+    /// would measure the fixture and report it as the commit. The `seed`
+    /// phase writes the store to `KIN_FIR2615_DIR` and exits; the `commit`
+    /// phase opens that store cold in a fresh process and commits one
+    /// one-file edit. Only the commit phase's number answers the ticket.
+    ///
+    /// Run one process per store size:
+    ///
+    /// ```text
+    /// KIN_FIR2615_PHASE=seed KIN_FIR2615_DIR=/tmp/s512 KIN_FIR2615_FILES=512 \
+    ///   cargo test -p kin-db --release fir2615_commit_peak_bench -- --ignored --nocapture
+    /// KIN_FIR2615_PHASE=commit KIN_FIR2615_DIR=/tmp/s512 KIN_FIR2615_FILES=512 \
+    ///   /usr/bin/time -l cargo test ... (same filter)
+    /// ```
+    ///
+    /// The commit phase refuses to grade a store whose tracked-file count is
+    /// not the count it was asked for, so a stale or half-written directory
+    /// cannot be reported as a measurement of the size named on the command
+    /// line.
+    #[test]
+    #[ignore = "peak-RSS bench; run one process per store size, seed then commit"]
+    fn fir2615_commit_peak_bench() {
+        let dir = std::env::var("KIN_FIR2615_DIR")
+            .expect("set KIN_FIR2615_DIR to the store directory for this size");
+        let files: usize = std::env::var("KIN_FIR2615_FILES")
+            .expect("set KIN_FIR2615_FILES to the store's file count")
+            .parse()
+            .expect("KIN_FIR2615_FILES parses as a file count");
+        let body_bytes: usize = std::env::var("KIN_FIR2615_BODY")
+            .unwrap_or_else(|_| "256".to_string())
+            .parse()
+            .expect("KIN_FIR2615_BODY parses as a byte count");
+        let phase = std::env::var("KIN_FIR2615_PHASE").unwrap_or_else(|_| "commit".to_string());
+        let path = std::path::PathBuf::from(&dir);
+
+        match phase.as_str() {
+            "seed" => {
+                std::fs::create_dir_all(&path).expect("the store directory is creatable");
+                let store = build_synthetic_tree_store(files, body_bytes);
+                seed_local_backend_at(&store, &path);
+                let (raw, peak) = peak_resident_bytes();
+                println!(
+                    "FIR2615 phase=seed files={files} body_bytes={body_bytes} \
+                     ru_maxrss_raw={raw} peak_rss_bytes={peak} dir={dir}"
+                );
+            }
+            "commit" => {
+                let backend = Arc::new(LocalFileBackend::new(&path));
+                let open_started = std::time::Instant::now();
+                let manager = RepositoryAuthorityManager::open(repository_id(), backend)
+                    .expect("the seeded store opens");
+                let open_ms = open_started.elapsed().as_millis();
+                let (_, after_open) = peak_resident_bytes();
+
+                let before = manager.read_authority();
+                let workspace = &before.metadata().workspaces[0];
+                let tracked = workspace.tree.artifacts().count();
+                let generation_before = workspace.generation;
+                drop(before);
+                assert_eq!(
+                    tracked, files,
+                    "the store under test tracks {tracked} files, not the {files} this run was \
+                     asked to grade; refusing to report a size it does not have"
+                );
+
+                let transaction = one_file_edit_transaction(&manager, body_bytes, 1);
+                let started = std::time::Instant::now();
+                let receipt = manager
+                    .commit_repository_transaction(transaction)
+                    .expect("the one-file edit commits");
+                let commit_ms = started.elapsed().as_millis();
+                let (raw, peak) = peak_resident_bytes();
+                assert_eq!(
+                    receipt.generation,
+                    generation_before + 1,
+                    "the one-file edit publishes the next workspace generation"
+                );
+                println!(
+                    "FIR2615 phase=commit files={files} tracked={tracked} body_bytes={body_bytes} \
+                     open_ms={open_ms} commit_ms={commit_ms} peak_after_open_bytes={after_open} \
+                     ru_maxrss_raw={raw} peak_rss_bytes={peak}"
+                );
+            }
+            other => panic!("KIN_FIR2615_PHASE must be seed or commit, not {other}"),
+        }
+    }
 }
 
 /// FIR-2334 attribution harness.
