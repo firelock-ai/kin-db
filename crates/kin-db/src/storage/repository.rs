@@ -17906,6 +17906,10 @@ mod tests {
             .unwrap_or_else(|_| "256".to_string())
             .parse()
             .expect("KIN_FIR2615_BODY parses as a byte count");
+        let depth: usize = std::env::var("KIN_FIR2615_DEPTH")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .expect("KIN_FIR2615_DEPTH parses as a change count");
         let round: usize = std::env::var("KIN_FIR2615_ROUND")
             .unwrap_or_else(|_| "1".to_string())
             .parse()
@@ -17918,9 +17922,27 @@ mod tests {
                 std::fs::create_dir_all(&path).expect("the store directory is creatable");
                 let store = build_synthetic_tree_store(files, body_bytes);
                 seed_local_backend_at(&store, &path);
+                drop(store);
+                // The fixture commits exactly one change, so its change map
+                // holds one entry however many files it tracks. The copies
+                // FIR-2615 cites are copies of the whole graph, change map
+                // included, so a one-change store cannot show them however
+                // large it is. Deepen history here, through the same commit
+                // path, so the measurement has an axis they are visible on.
+                if depth > 1 {
+                    let backend = Arc::new(LocalFileBackend::new(&path));
+                    let manager = RepositoryAuthorityManager::open(repository_id(), backend)
+                        .expect("the seeded store opens for deepening");
+                    for extra in 1..depth {
+                        let transaction = one_file_edit_transaction(&manager, body_bytes, extra);
+                        manager
+                            .commit_repository_transaction(transaction)
+                            .expect("a deepening edit commits");
+                    }
+                }
                 let (raw, peak) = peak_resident_bytes();
                 println!(
-                    "FIR2615 phase=seed files={files} body_bytes={body_bytes} \
+                    "FIR2615 phase=seed files={files} body_bytes={body_bytes} depth={depth} \
                      ru_maxrss_raw={raw} peak_rss_bytes={peak} dir={dir}"
                 );
             }
@@ -17935,14 +17957,21 @@ mod tests {
                 let before = manager.read_authority();
                 let tracked = before.metadata().workspaces[0].tree.artifacts().count();
                 let generation_before = before.generation();
+                let changes = before.snapshot().changes.len();
                 drop(before);
                 assert_eq!(
                     tracked, files,
                     "the store under test tracks {tracked} files, not the {files} this run was \
                      asked to grade; refusing to report a size it does not have"
                 );
+                assert_eq!(
+                    changes, depth,
+                    "the store under test carries {changes} changes, not the {depth} this run \
+                     was asked to grade; refusing to report a depth it does not have"
+                );
 
-                let transaction = one_file_edit_transaction(&manager, body_bytes, round);
+                let transaction =
+                    one_file_edit_transaction(&manager, body_bytes, 10_000 + round);
                 let started = std::time::Instant::now();
                 let receipt = manager
                     .commit_repository_transaction(transaction)
@@ -17955,9 +17984,10 @@ mod tests {
                     "the one-file edit publishes the next authority generation"
                 );
                 println!(
-                    "FIR2615 phase=commit files={files} tracked={tracked} body_bytes={body_bytes} \
-                     round={round} open_ms={open_ms} commit_ms={commit_ms} \
-                     peak_after_open_bytes={after_open} ru_maxrss_raw={raw} peak_rss_bytes={peak}"
+                    "FIR2615 phase=commit files={files} tracked={tracked} changes={changes} \
+                     body_bytes={body_bytes} round={round} open_ms={open_ms} \
+                     commit_ms={commit_ms} peak_after_open_bytes={after_open} \
+                     ru_maxrss_raw={raw} peak_rss_bytes={peak}"
                 );
             }
             other => panic!("KIN_FIR2615_PHASE must be seed or commit, not {other}"),

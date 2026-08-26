@@ -66,7 +66,8 @@ run_phase() {
   local rc=0
   set +e
   env KIN_FIR2615_PHASE="$phase" KIN_FIR2615_DIR="$dir" KIN_FIR2615_FILES="$files" \
-      KIN_FIR2615_ROUND="$round" KIN_EMBED_BACKEND=cpu \
+      KIN_FIR2615_ROUND="$round" KIN_FIR2615_DEPTH="${KIN_FIR2615_DEPTH:-1}" \
+      KIN_EMBED_BACKEND=cpu \
       /usr/bin/time -l "$BIN" "$TEST_PATH" --exact --ignored --nocapture > "$log" 2>&1
   rc=$?
   set -e
@@ -82,7 +83,7 @@ run_phase() {
   fi
 }
 
-printf '%s\n' "files,round,store_kib,open_ms,commit_ms,peak_after_open_bytes,bench_peak_bytes,time_l_peak_bytes"
+printf '%s\n' "files,depth,round,store_kib,open_ms,commit_ms,peak_after_open_bytes,bench_peak_bytes,time_l_peak_bytes"
 for files in "${SIZES[@]}"; do
   for round in $(seq 1 "$SAMPLES"); do
     dir="$(mktemp -d "${TMPDIR:-/tmp}/fir2615-${files}-XXXXXX")"
@@ -95,14 +96,15 @@ for files in "${SIZES[@]}"; do
     run_phase commit "$dir" "$files" "$round" "$commit_log"
 
     line="$(grep -m1 '^FIR2615 phase=commit' "$commit_log")"
+    depth="$(sed -n 's/.* changes=\([0-9]*\).*/\1/p' <<<"$line")"
     open_ms="$(sed -n 's/.* open_ms=\([0-9]*\).*/\1/p' <<<"$line")"
     commit_ms="$(sed -n 's/.* commit_ms=\([0-9]*\).*/\1/p' <<<"$line")"
     after_open="$(sed -n 's/.* peak_after_open_bytes=\([0-9]*\).*/\1/p' <<<"$line")"
     bench_peak="$(sed -n 's/.* peak_rss_bytes=\([0-9]*\).*/\1/p' <<<"$line")"
     time_peak="$(awk '/maximum resident set size/ {print $1; exit}' "$commit_log")"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
-      "$files" "$round" "$store_kib" "$open_ms" "$commit_ms" \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$files" "$depth" "$round" "$store_kib" "$open_ms" "$commit_ms" \
       "$after_open" "$bench_peak" "$time_peak"
 
     rm -rf "$dir" "$seed_log" "$commit_log"
