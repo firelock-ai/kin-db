@@ -17906,6 +17906,10 @@ mod tests {
             .unwrap_or_else(|_| "256".to_string())
             .parse()
             .expect("KIN_FIR2615_BODY parses as a byte count");
+        let round: usize = std::env::var("KIN_FIR2615_ROUND")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .expect("KIN_FIR2615_ROUND parses as a round number");
         let phase = std::env::var("KIN_FIR2615_PHASE").unwrap_or_else(|_| "commit".to_string());
         let path = std::path::PathBuf::from(&dir);
 
@@ -17929,9 +17933,8 @@ mod tests {
                 let (_, after_open) = peak_resident_bytes();
 
                 let before = manager.read_authority();
-                let workspace = &before.metadata().workspaces[0];
-                let tracked = workspace.tree.artifacts().count();
-                let generation_before = workspace.generation;
+                let tracked = before.metadata().workspaces[0].tree.artifacts().count();
+                let generation_before = before.generation();
                 drop(before);
                 assert_eq!(
                     tracked, files,
@@ -17939,7 +17942,7 @@ mod tests {
                      asked to grade; refusing to report a size it does not have"
                 );
 
-                let transaction = one_file_edit_transaction(&manager, body_bytes, 1);
+                let transaction = one_file_edit_transaction(&manager, body_bytes, round);
                 let started = std::time::Instant::now();
                 let receipt = manager
                     .commit_repository_transaction(transaction)
@@ -17949,12 +17952,12 @@ mod tests {
                 assert_eq!(
                     receipt.generation,
                     generation_before + 1,
-                    "the one-file edit publishes the next workspace generation"
+                    "the one-file edit publishes the next authority generation"
                 );
                 println!(
                     "FIR2615 phase=commit files={files} tracked={tracked} body_bytes={body_bytes} \
-                     open_ms={open_ms} commit_ms={commit_ms} peak_after_open_bytes={after_open} \
-                     ru_maxrss_raw={raw} peak_rss_bytes={peak}"
+                     round={round} open_ms={open_ms} commit_ms={commit_ms} \
+                     peak_after_open_bytes={after_open} ru_maxrss_raw={raw} peak_rss_bytes={peak}"
                 );
             }
             other => panic!("KIN_FIR2615_PHASE must be seed or commit, not {other}"),
