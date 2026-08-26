@@ -15357,10 +15357,16 @@ mod tests {
     /// another term has already set, so restoring that copy alone moves the
     /// ratio by nothing at all.
     ///
-    /// The resolution counts are asserted beside the change counts on purpose.
-    /// Zero changes across zero resolutions is what a mutation that stopped
-    /// resolving anything would also report, and that is a different bug
-    /// wearing this one's passing costume.
+    /// The resolution counts are asserted beside the change counts because zero
+    /// changes across zero resolutions is what a mutation that stopped resolving
+    /// anything would also report, and that is a different bug wearing this
+    /// one's passing costume. Those two lines are defensive rather than proven,
+    /// and that is worth saying rather than leaving someone to assume otherwise.
+    /// Every mutation tried against them, forcing one base to serve for two and
+    /// returning from `apply_workspace` before it resolves anything, is refused
+    /// by the product at the fixture's own bootstrap commit, so the test fails
+    /// on that `unwrap` and never reaches its own assertions. The change counts
+    /// below are the part of this test that has been shown to fail on demand.
     #[test]
     fn a_workspace_mutation_resolves_no_base_carrying_the_history() {
         let store = build_synthetic_history_store(2, 8, 1, 3);
