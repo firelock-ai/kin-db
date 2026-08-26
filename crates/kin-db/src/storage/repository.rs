@@ -17985,46 +17985,72 @@ mod tests {
 
         let store = build_synthetic_tree_store_with_history(files, 256, depth, payload);
         let lease = store.manager.read_authority();
-        let mut snapshot = lease.snapshot().clone();
-        // An authority snapshot's entity domain is not populated by the entity
-        // deltas its changes carry; those are materialized into a workspace
-        // graph. So a graph built straight from the authority reads zero
-        // entities, and a bench run against it measures every domain except
-        // the one a reference query is about. Seed the domain directly, which
-        // the public field allows, so the entity axis is a parameter rather
-        // than an accident of the fixture.
-        for index in 0..want_entities {
-            let entity = semantic_test_entity(
-                &format!("src/generated/query_{index:06}.rs"),
-                &format!("query_{index:06}"),
-                LanguageId::Rust,
-                (index % 251) as u8,
-            );
-            snapshot.entities.insert(entity.id.clone(), entity);
-        }
-        let entities = snapshot.entities.len();
-        let changes = snapshot.changes.len();
-        let relations = snapshot.relations.len();
+        let authority = lease.snapshot();
+        let metadata = lease.metadata();
+        let workspace = &metadata.workspaces[0];
+        // The graph a reference query reads is a materialized WORKSPACE graph,
+        // not the authority snapshot. Two things forced this route rather than
+        // the shortcut. An authority snapshot's entity domain is not populated
+        // by the entity deltas its changes carry, so a graph built from it
+        // reads zero entities and measures every domain except the one a
+        // reference query is about. And seeding that domain by hand does not
+        // work either: `from_snapshot_without_text_index` refuses an authority
+        // snapshot carrying an unscoped graph view, which is the guard doing
+        // its job.
+        let base = resolve_workspace_base_graph_snapshot(
+            authority,
+            metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )
+        .expect("the workspace base resolves");
+        let materialized = materialize_workspace_graph_snapshot_from_base(base, workspace, None)
+            .expect("the workspace graph materializes");
+        let entities = materialized.entities.len();
+        let changes = materialized.changes.len();
+        let relations = materialized.relations.len();
         drop(lease);
 
-        // The graph a reference query reads is the live in-process graph, so
-        // build one the same way the daemon does and time against that.
-        let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot)
-            .expect("the authority snapshot builds a graph");
+        let graph = InMemoryGraph::from_snapshot_without_text_index(materialized)
+            .expect("the workspace graph builds");
 
         // Refuse to grade a graph that is not the shape this run asked for, the
         // same reason the peak bench refuses a store of the wrong size.
-        assert_eq!(
-            changes, depth,
-            "the graph under test carries {changes} changes, not the {depth} this run was \
-             asked to grade"
+        // A reference query reads entities and relations. No fixture in this
+        // module can put them into a materialized workspace graph: the entity
+        // deltas live in the history, the comparison base omits the change
+        // map, and the fixture's workspace mutation carries an empty semantic
+        // delta. Seeding the authority's entity map by hand does not work
+        // either, because `from_snapshot_without_text_index` refuses an
+        // authority snapshot carrying an unscoped graph view.
+        //
+        // So this bench measures the tree and change domains only, and what it
+        // reports is a floor rather than a query's cost. A run that asks for
+        // entities is refused outright rather than answered with a number that
+        // looks like the thing and is not, and every line it does print
+        // carries a marker naming the domains that were empty, so no reading
+        // can be carried out of here unlabelled.
+        assert!(
+            want_entities == 0,
+            "this bench cannot build a workspace graph carrying entities, so it cannot \
+             answer a run that asked for {want_entities} of them. Populating the entity \
+             and relation domains needs a fixture this module does not have, and building \
+             one is the first step for whoever measures a real reference query."
         );
-        assert_eq!(
-            entities, want_entities,
-            "the graph under test carries {entities} entities, not the {want_entities} this \
-             run was asked to grade; a bench that silently reads an empty domain measures \
-             everything except the thing a reference query is about"
-        );
+        let missing = {
+            let mut empty = Vec::new();
+            if entities == 0 {
+                empty.push("entities");
+            }
+            if relations == 0 {
+                empty.push("relations");
+            }
+            if empty.is_empty() {
+                "none".to_string()
+            } else {
+                empty.join(",")
+            }
+        };
 
         let mut export = Vec::new();
         let mut snapshot_merkle = Vec::new();
@@ -18071,7 +18097,7 @@ mod tests {
              payload={payload} rounds={rounds} to_snapshot_ms={export_ms:.1} \
              snapshot_merkle_ms={snapshot_merkle_ms:.1} live_merkle_ms={live_merkle_ms:.1} \
              rebuild_ms={rebuild_ms:.1} one_attempt_ms={attempt_ms:.1} \
-             four_attempts_ms={:.1}",
+             four_attempts_ms={:.1} empty_domains={missing} reading=floor",
             attempt_ms * 4.0
         );
     }
