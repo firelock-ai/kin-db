@@ -367,17 +367,25 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> BootstrapArm {
 ///
 /// Set from measurement on this fixture, not from taste. Release, this
 /// fixture, one copy of the history at 2,833,178 bytes: the shape that carried
-/// whole snapshots for four-domain comparisons measured 8.81 copies, and the
-/// shape that replaced it measures 4.56. A ceiling of 6.0 fails the first and
-/// passes the second, with room on both sides for a different allocator and a
-/// different host, since the number is a ratio of two live-heap readings taken
-/// in the same process.
+/// whole snapshots for four-domain comparisons measured 8.81 copies, the shape
+/// that replaced it measured 4.56 and had drifted to 4.07, and the shape that
+/// stops a comparison base carrying the change map measures 3.67. A ceiling of
+/// 3.9 fails the 4.07 and passes the 3.67, and the readings it separates jitter
+/// by about half a percent across runs, because the number is a ratio of two
+/// live-heap readings taken in the same process.
 ///
-/// The remaining 4.56 is not slack: `apply_workspace` still resolves two base
-/// graphs that each carry a copy of the authority's change map, and the shared
-/// replay decode is forced while the second of them is alive. Lowering this
-/// ceiling is the way to record that when it is fixed.
-const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 6.0;
+/// What this ceiling does NOT price is the second of the two copies, and that
+/// is worth writing down rather than leaving for someone to rediscover.
+/// Restoring the `next_base` copy alone takes the ratio to 4.07 and this fails.
+/// Restoring the `current_base` copy alone leaves it at 3.67 and this passes,
+/// because on a 300-commit fixture that copy fits entirely under a high-water
+/// mark another term has already set. Peak growth is measured against a running
+/// mark and overlapping terms are not additive, so a ratio cannot see a term
+/// that never reaches the top. The per-holder job belongs to
+/// `a_workspace_mutation_resolves_no_base_carrying_the_history`, which counts
+/// the changes each resolved base actually carried and goes red for either
+/// copy on its own.
+const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 3.9;
 
 /// A workspace mutation must not hold the repository's whole change map more
 /// than about twice while it prepares a successor.

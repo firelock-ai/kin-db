@@ -3930,6 +3930,8 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     let current = workspaces.get(&mutation.workspace_id);
     #[cfg(test)]
     let resolutions_before = WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get());
+    #[cfg(test)]
+    let base_changes_before = WORKSPACE_BASE_CHANGES.with(|count| count.get());
 
     // One workspace mutation reached for a resolved base graph four times: for
     // the workspace it starts from, for the overlay it derives against the
@@ -4052,6 +4054,10 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     #[cfg(test)]
     WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| {
         count.set(WORKSPACE_BASE_RESOLUTIONS.with(|total| total.get()) - resolutions_before)
+    });
+    #[cfg(test)]
+    WORKSPACE_MUTATION_BASE_CHANGES.with(|count| {
+        count.set(WORKSPACE_BASE_CHANGES.with(|total| total.get()) - base_changes_before)
     });
     Ok(())
 }
@@ -5209,6 +5215,24 @@ thread_local! {
     /// runs on its own thread, so a test reads this without another test's
     /// transactions reaching it.
     static WORKSPACE_MUTATION_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Changes carried by every base graph resolved on this thread, summed.
+    ///
+    /// Read only as the endpoints of a span, for the same reason the
+    /// resolution total is.
+    static WORKSPACE_BASE_CHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Changes carried by the base graphs the last workspace mutation to
+    /// complete on this thread resolved, summed.
+    ///
+    /// A workspace mutation compares entities, relations, external references
+    /// and the resolved tree, and reaches no change through a base, so this is
+    /// zero. It sums the maps that were actually built rather than flagging
+    /// what was asked for, so it moves both when a call site asks for the
+    /// history back and when the resolver starts carrying it whatever it was
+    /// asked. Each test runs on its own thread, so a test reads this without
+    /// another test's transactions reaching it.
+    static WORKSPACE_MUTATION_BASE_CHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a resolved workspace base carries the repository's change map.
@@ -5369,6 +5393,8 @@ fn resolve_workspace_base_graph_snapshot(
             ("admission_ms", admission_ms),
         ],
     );
+    #[cfg(test)]
+    WORKSPACE_BASE_CHANGES.with(|count| count.set(count.get() + base.changes.len()));
     Ok(base)
 }
 
@@ -15245,6 +15271,20 @@ mod tests {
         )
     }
 
+    /// Bases resolved by one workspace mutation, and the changes they carried.
+    fn mutation_base_resolutions_and_changes_during<T>(
+        work: impl FnOnce() -> T,
+    ) -> (T, usize, usize) {
+        WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.set(0));
+        WORKSPACE_MUTATION_BASE_CHANGES.with(|count| count.set(0));
+        let value = work();
+        (
+            value,
+            WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.get()),
+            WORKSPACE_MUTATION_BASE_CHANGES.with(|count| count.get()),
+        )
+    }
+
     /// One workspace overlay staged on top of the synthetic head, leaving the
     /// base where it is.
     fn overlay_transaction_at_unchanged_base(
@@ -15299,6 +15339,73 @@ mod tests {
             advanced_resolutions, 2,
             "a mutation that advances its base names two distinct base graphs and must \
              resolve both, never fewer"
+        );
+    }
+
+    /// A workspace mutation compares four domains and reads no change through
+    /// the bases it compares over, so the bases it resolves carry no change
+    /// map. On a full-history conversion that map IS the repository, and each
+    /// base carrying one was a whole extra copy of it live at the point where
+    /// the preparation reaches its peak.
+    ///
+    /// This counts the changes the resolutions actually built rather than the
+    /// mode they were asked for, so it goes red three separate ways: a call
+    /// site asking for the history back, either one of them independently, and
+    /// a resolver that starts carrying the map whatever it was asked. The
+    /// peak-ratio guard in `tests/workspace_prepare_memory.rs` cannot do that
+    /// job: on its fixture one of the two copies fits entirely under a mark
+    /// another term has already set, so restoring that copy alone moves the
+    /// ratio by nothing at all.
+    ///
+    /// The resolution counts are asserted beside the change counts on purpose.
+    /// Zero changes across zero resolutions is what a mutation that stopped
+    /// resolving anything would also report, and that is a different bug
+    /// wearing this one's passing costume.
+    #[test]
+    fn a_workspace_mutation_resolves_no_base_carrying_the_history() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let history_changes = {
+            let lease = store.manager.read_authority();
+            let count = lease.snapshot().changes.len();
+            drop(lease);
+            count
+        };
+        assert!(
+            history_changes > 1,
+            "the fixture must carry a history worth not copying, got {history_changes} changes"
+        );
+
+        let unchanged_base = overlay_transaction_at_unchanged_base(&store, 0xf2_6510_0001, 0);
+        let (receipt, resolutions, base_changes) =
+            mutation_base_resolutions_and_changes_during(|| {
+                store
+                    .manager
+                    .commit_repository_transaction(unchanged_base)
+                    .unwrap()
+            });
+        receipt.validate().unwrap();
+        assert_eq!(
+            resolutions, 1,
+            "a mutation that leaves its base where it was resolves one base"
+        );
+        assert_eq!(
+            base_changes, 0,
+            "the base this mutation resolved carried {base_changes} changes out of the              repository's {history_changes}, which a workspace comparison never reads"
+        );
+
+        let advanced = advance_synthetic_base(&store);
+        let (advanced_receipt, advanced_resolutions, advanced_base_changes) =
+            mutation_base_resolutions_and_changes_during(|| {
+                store.manager.commit_repository_transaction(advanced)
+            });
+        advanced_receipt.unwrap().validate().unwrap();
+        assert_eq!(
+            advanced_resolutions, 2,
+            "a mutation that advances its base resolves two"
+        );
+        assert_eq!(
+            advanced_base_changes, 0,
+            "the two bases this mutation resolved carried {advanced_base_changes} changes              between them out of the repository's {history_changes}"
         );
     }
 
