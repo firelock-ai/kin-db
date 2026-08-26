@@ -11974,6 +11974,89 @@ mod tests {
         );
     }
 
+    /// The exact shape kin's linker mints, pinned here as admitted.
+    ///
+    /// The two layers disagreed once already: kin-db 0.7.61 refused this shape
+    /// at the write while kin's shipped `graph validate` reported a graph
+    /// carrying it as passing every integrity check, and twenty-seven tests
+    /// across kin-cli, kin-daemon and kin-review went red saying so. The
+    /// contract lives in `kin_index::is_external_import_placeholder`
+    /// (`crates/kin-index/src/linker.rs:4123`) and the exemption that consumes
+    /// it lives in kin's `build_graph_validate_response`
+    /// (`crates/kin-cli/src/commands/graph.rs:1109`). Neither is visible from
+    /// this crate, which is exactly why the contract is written out here: a
+    /// future tightening of the entity arm has to turn this test red before it
+    /// can rediscover the disagreement the expensive way.
+    ///
+    /// The constants below are duplicated from kin-index on purpose and under
+    /// protest. kin-index depends on kin-db, so the dependency cannot run the
+    /// other way, and until the predicate moves down into kin-model where
+    /// `Relation` already lives, two copies is the only way this layer can name
+    /// the shape at all. The follow-up ticket that moves it is what deletes
+    /// this duplication, and this test is where the single shared copy lands.
+    #[test]
+    fn the_external_import_placeholder_shape_kin_mints_is_admitted() {
+        // Values pinned from crates/kin-index/src/linker.rs: EXTERNAL_REFERENCE
+        // _CONFIDENCE (:3961), EXTERNAL_REFERENCE_KIND_TAG (:3966) and
+        // EXTERNAL_IMPORT_REFERENCE_RULE (:3971).
+        const EXTERNAL_REFERENCE_CONFIDENCE: f32 = 0.2;
+        const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
+        const EXTERNAL_IMPORT_REFERENCE_RULE: &str = "external_import_reference";
+        let import_source = "kin_db";
+        let symbol = "InMemoryGraph";
+
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("run_task", "src/app.rs");
+        graph.upsert_entity(&caller).unwrap();
+
+        // The destination is derived, not invented: it is the deterministic
+        // placeholder id the linker computes, and it is intentionally absent
+        // from this repo. That absence is the whole point of the shape.
+        let placeholder =
+            EntityId::from_content(import_source, symbol, EXTERNAL_REFERENCE_KIND_TAG, 0);
+        assert!(
+            graph.get_entity(&placeholder).unwrap().is_none(),
+            "the placeholder destination must not be an entity this store carries"
+        );
+
+        for kind in [RelationKind::Calls, RelationKind::References] {
+            let relation = Relation {
+                id: RelationId::new(),
+                kind,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(placeholder),
+                confidence: EXTERNAL_REFERENCE_CONFIDENCE,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: Some(import_source.to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    source_span: None,
+                    parser_rule: Some(EXTERNAL_IMPORT_REFERENCE_RULE.to_string()),
+                    token: Some(symbol.to_string()),
+                    source_path: Some(import_source.to_string()),
+                    resolved_path: None,
+                    occurrence_count: 1,
+                    call_shape: None,
+                }],
+            };
+
+            graph.upsert_relation(&relation).unwrap_or_else(|error| {
+                panic!(
+                    "kin mints this {kind:?} edge on the real indexing path and its own \
+                     validator calls the result clean; refusing it here puts the two layers \
+                     back into the disagreement 0.7.61 shipped: {error}"
+                )
+            });
+        }
+
+        assert_eq!(graph.relation_count(), 2);
+        assert_eq!(
+            graph.stranded_relation_count(),
+            2,
+            "admitting the shape is not the same as pretending the endpoint is there"
+        );
+    }
+
     /// The predicate has to consult the map that matches the node's variant. A
     /// check weakened to wave every entity endpoint through still passes both
     /// tests above; only an artifact endpoint separates "the check ran" from
