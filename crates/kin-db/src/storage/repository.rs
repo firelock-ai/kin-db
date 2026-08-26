@@ -17447,10 +17447,32 @@ mod tests {
     /// Seed a repository whose first change introduces `files` artifacts and
     /// whose workspace is admitted at that exact tree.
     fn build_synthetic_tree_store(files: usize, body_bytes: usize) -> SyntheticTreeStore {
+        build_synthetic_tree_store_with_history(files, body_bytes, 1)
+    }
+
+    /// The same store, with `commits` chained changes behind its head instead
+    /// of one.
+    ///
+    /// The head change carries the tree, exactly as the one-change fixture
+    /// does, and every change before it carries one entity, so the shape a
+    /// converted repository has is the shape this builds: a change map with
+    /// depth in it and a tree published once at the tip. The one-change
+    /// fixture is the `commits == 1` case of this and is byte-for-byte what it
+    /// always was, so every check already written against it is unmoved.
+    ///
+    /// The distinction matters because a whole-graph copy is a copy of the
+    /// change map too, and a one-change store has no change map to speak of
+    /// however many files it tracks.
+    fn build_synthetic_tree_store_with_history(
+        files: usize,
+        body_bytes: usize,
+        commits: usize,
+    ) -> SyntheticTreeStore {
         assert!(
             files >= 2,
             "a tree store needs one file to edit and at least one to leave alone"
         );
+        assert!(commits >= 1, "a store has at least one change");
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
 
@@ -17467,28 +17489,57 @@ mod tests {
         let tree = ResolvedTree::default().apply(&tree_deltas).unwrap();
         let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
         let shared = SharedAdmissionPolicy::empty(0);
-        let mut change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
-            origin: ChangeOrigin::Native,
-            parents: Vec::new(),
-            timestamp: Timestamp(
-                chrono::DateTime::parse_from_rfc3339("2026-08-22T12:00:00Z")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc),
-            ),
-            author: AuthorId::new("fir2291-tree-store"),
-            message: format!("introduce {files} synthetic artifacts"),
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: tree_deltas.clone(),
-            admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared.clone())),
-            external_reference_deltas: Vec::new(),
-            projected_files: Vec::new(),
-            spec_link: None,
-            evidence: Vec::new(),
-            risk_summary: None,
-        };
-        change.id = compute_semantic_change_id(&change).unwrap();
+        let timestamp = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-08-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let mut chain: Vec<SemanticChange> = Vec::with_capacity(commits);
+        let mut parent: Option<SemanticChangeId> = None;
+        for index in 0..commits {
+            let head = index + 1 == commits;
+            let mut change = SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::Native,
+                parents: parent.into_iter().collect(),
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("fir2291-tree-store"),
+                message: if head {
+                    format!("introduce {files} synthetic artifacts")
+                } else {
+                    format!("synthetic history commit {index}")
+                },
+                entity_deltas: if head {
+                    Vec::new()
+                } else {
+                    vec![EntityDelta::Added {
+                        new: semantic_test_entity(
+                            &format!("src/generated/history_{index:05}.rs"),
+                            &format!("history_{index:05}"),
+                            LanguageId::Rust,
+                            (index % 251) as u8,
+                        ),
+                    }]
+                },
+                relation_deltas: Vec::new(),
+                tree_deltas: if head {
+                    tree_deltas.clone()
+                } else {
+                    Vec::new()
+                },
+                admission_policy_delta: (index == 0)
+                    .then(|| AdmissionPolicyDelta::initialize(shared.clone())),
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).unwrap();
+            parent = Some(change.id);
+            chain.push(change);
+        }
+        let change = chain.last().expect("a store has at least one change").clone();
 
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(2291));
         let overlay =
@@ -17516,7 +17567,7 @@ mod tests {
         };
 
         let mut transaction = transaction_shell(&manager, 0xf2_2291_0001);
-        transaction.changes.push(change);
+        transaction.changes.extend(chain);
         transaction.ref_mutations.push(RefMutation {
             name: main.clone(),
             expected: RefExpectation::MustNotExist,
@@ -17920,26 +17971,16 @@ mod tests {
         match phase.as_str() {
             "seed" => {
                 std::fs::create_dir_all(&path).expect("the store directory is creatable");
-                let store = build_synthetic_tree_store(files, body_bytes);
+                // Depth is a chain of changes, not a run of workspace
+                // edits. A workspace edit advances the generation and mints no
+                // SemanticChange, so deepening that way leaves the change map
+                // at one entry; the first attempt here did exactly that and
+                // the commit phase's depth refusal is what caught it. The
+                // copies FIR-2615 cites are copies of the whole graph with the
+                // change map in them, so the change map is the axis they are
+                // visible on.
+                let store = build_synthetic_tree_store_with_history(files, body_bytes, depth);
                 seed_local_backend_at(&store, &path);
-                drop(store);
-                // The fixture commits exactly one change, so its change map
-                // holds one entry however many files it tracks. The copies
-                // FIR-2615 cites are copies of the whole graph, change map
-                // included, so a one-change store cannot show them however
-                // large it is. Deepen history here, through the same commit
-                // path, so the measurement has an axis they are visible on.
-                if depth > 1 {
-                    let backend = Arc::new(LocalFileBackend::new(&path));
-                    let manager = RepositoryAuthorityManager::open(repository_id(), backend)
-                        .expect("the seeded store opens for deepening");
-                    for extra in 1..depth {
-                        let transaction = one_file_edit_transaction(&manager, body_bytes, extra);
-                        manager
-                            .commit_repository_transaction(transaction)
-                            .expect("a deepening edit commits");
-                    }
-                }
                 let (raw, peak) = peak_resident_bytes();
                 println!(
                     "FIR2615 phase=seed files={files} body_bytes={body_bytes} depth={depth} \
