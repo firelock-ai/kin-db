@@ -84,12 +84,17 @@ run_phase() {
 }
 
 printf '%s\n' "files,depth,round,store_kib,open_ms,commit_ms,peak_after_open_bytes,bench_peak_bytes,time_l_peak_bytes"
+depth_in="${KIN_FIR2615_DEPTH:-1}"
 for files in "${SIZES[@]}"; do
   for round in $(seq 1 "$SAMPLES"); do
-    dir="$(mktemp -d "${TMPDIR:-/tmp}/fir2615-${files}-XXXXXX")"
-    rm -rf "$dir"
-    seed_log="$(mktemp "${TMPDIR:-/tmp}/fir2615-seed-XXXXXX.log")"
-    commit_log="$(mktemp "${TMPDIR:-/tmp}/fir2615-commit-XXXXXX.log")"
+    # Named rather than mktemp'd: a shared temp directory is a race between
+    # every live session, and mktemp against a large one fails outright.
+    scratch="${KIN_FIR2615_SCRATCH:-/tmp/fir2615-peak-matrix}"
+    dir="$scratch/store-${files}-${depth_in}-${round}"
+    seed_log="$scratch/seed-${files}-${depth_in}-${round}.log"
+    commit_log="$scratch/commit-${files}-${depth_in}-${round}.log"
+    mkdir -p "$scratch"
+    rm -rf "$dir" "$seed_log" "$commit_log"
 
     run_phase seed "$dir" "$files" 1 "$seed_log"
     store_kib="$(du -sk "$dir" | awk '{print $1}')"
