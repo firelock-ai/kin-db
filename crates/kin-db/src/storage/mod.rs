@@ -28,11 +28,12 @@ pub use authority::{
 pub use authority_frame::AuthorityFrame;
 pub use backend::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
-    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,
+    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
     PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
     SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
-    StorageBackend, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
+    VectorArtifactSaveOutcome, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,

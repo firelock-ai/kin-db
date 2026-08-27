@@ -39,10 +39,12 @@ pub use storage::{
 };
 pub use storage::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
-    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot,
-    SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome,
-    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlob,
-    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
+    RecoveredSnapshot, SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState,
+    SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
+    VectorArtifact, VectorArtifactBinding, VectorArtifactCursor, VectorArtifactSaveOutcome,
+    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,

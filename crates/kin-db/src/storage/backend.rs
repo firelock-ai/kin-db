@@ -71,6 +71,74 @@ pub enum SnapshotSaveOutcome {
     Indeterminate(KinDbError),
 }
 
+/// Maximum serialized vector-index payload accepted by a storage backend.
+///
+/// The vector index is a derived accelerator, so a hostile or corrupt object
+/// must never force an unbounded allocation while graph authority is opened.
+pub const MAX_VECTOR_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum metadata envelope accepted beside one vector-index payload.
+pub const MAX_VECTOR_ARTIFACT_METADATA_BYTES: u64 = 1024 * 1024;
+
+/// Exact graph authority one derived vector artifact belongs to.
+///
+/// `graph_generation` is the backend's acknowledged authority generation, not
+/// Kin's logical repository generation. The retrieval hash binds every graph
+/// domain that can change vector and locate results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorArtifactBinding {
+    pub graph_generation: Generation,
+    pub retrieval_authority_hash: [u8; 32],
+}
+
+/// One complete derived vector artifact.
+///
+/// Storage keeps the opaque vector bytes and their validator-owned metadata in
+/// one integrity envelope. It does not interpret either payload. The caller
+/// remains responsible for validating model, dimensions, pipeline epoch, and
+/// indexed coverage recorded in `metadata`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorArtifact {
+    pub binding: VectorArtifactBinding,
+    pub metadata: Vec<u8>,
+    pub index: Vec<u8>,
+}
+
+/// Backend compare-and-swap cursor for repeated vector checkpoints.
+///
+/// This is intentionally distinct from the graph snapshot cursor. Embedding
+/// can checkpoint several times without changing graph authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorArtifactCursor(Generation);
+
+impl VectorArtifactCursor {
+    pub const INITIAL: Self = Self(GENERATION_INIT);
+
+    pub const fn from_backend_generation(generation: Generation) -> Self {
+        Self(generation)
+    }
+
+    pub const fn backend_generation(self) -> Generation {
+        self.0
+    }
+}
+
+/// A vector artifact together with the cursor required to replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedVectorArtifact {
+    pub artifact: VectorArtifact,
+    pub cursor: VectorArtifactCursor,
+}
+
+/// Classified outcome of one vector-artifact compare-and-swap attempt.
+#[must_use = "a vector artifact save outcome must be classified before progress is acknowledged"]
+#[derive(Debug)]
+pub enum VectorArtifactSaveOutcome {
+    Committed { cursor: VectorArtifactCursor },
+    NotCommitted(KinDbError),
+    Indeterminate(KinDbError),
+}
+
 /// Maximum exact-source object size accepted by any storage backend.
 /// Archive consumers may apply a lower aggregate limit, but no individual
 /// object is allowed to force an allocation larger than this boundary.
@@ -2454,6 +2522,42 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<bool, KinDbError> {
         let _ = (repo_id, workspace_id, artifact);
         Ok(false)
+    }
+
+    /// Whether this backend durably persists generation-bound vector artifacts.
+    fn supports_vector_artifacts(&self) -> bool {
+        false
+    }
+
+    /// Load the vector artifact for one exact graph authority binding.
+    ///
+    /// `Ok(None)` means no artifact exists for that binding. Backends that do
+    /// not implement the capability also return `Ok(None)` and advertise that
+    /// fact through [`supports_vector_artifacts`](Self::supports_vector_artifacts).
+    fn load_vector_artifact(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<Option<PersistedVectorArtifact>, KinDbError> {
+        let _ = (repo_id, binding);
+        Ok(None)
+    }
+
+    /// Persist one complete vector artifact with compare-and-swap semantics.
+    ///
+    /// `expected` is the cursor returned by the previous load or save. The
+    /// graph binding never changes at this path; a caller embedding a new graph
+    /// authority starts again at [`VectorArtifactCursor::INITIAL`].
+    fn save_vector_artifact(
+        &self,
+        repo_id: &str,
+        artifact: &VectorArtifact,
+        expected: VectorArtifactCursor,
+    ) -> VectorArtifactSaveOutcome {
+        let _ = (artifact, expected);
+        VectorArtifactSaveOutcome::NotCommitted(KinDbError::StorageError(format!(
+            "repo {repo_id}: vector artifact persistence is not supported by this backend"
+        )))
     }
 
     /// Read snapshot authority and its journal from one coherent backend view.
