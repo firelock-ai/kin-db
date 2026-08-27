@@ -32,8 +32,9 @@ pub use backend::{
     PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
     SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
     StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
-    VectorArtifactSaveOutcome, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+    VectorArtifactLoadOutcome, VectorArtifactSaveOutcome, VectorRepositoryIdentity,
+    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
@@ -55,7 +56,7 @@ pub use repository::{
     WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 #[cfg(feature = "vector")]
-pub use snapshot::VECTOR_INDEX_METADATA_VERSION;
+pub use snapshot::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
 pub use snapshot::{SnapshotManager, VectorSidecarDisposition, VectorSidecarLoadOutcome};
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;

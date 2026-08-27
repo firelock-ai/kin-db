@@ -26,8 +26,6 @@ pub use storage::format::{CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
 pub use storage::SnapshotManager;
-#[cfg(feature = "vector")]
-pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use storage::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
@@ -42,10 +40,13 @@ pub use storage::{
     LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
     RecoveredSnapshot, SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState,
     SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
-    VectorArtifact, VectorArtifactBinding, VectorArtifactCursor, VectorArtifactSaveOutcome,
-    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
-    MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+    VectorArtifact, VectorArtifactBinding, VectorArtifactCursor, VectorArtifactLoadOutcome,
+    VectorArtifactSaveOutcome, VectorRepositoryIdentity, VerifiedSourceBlob,
+    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES,
+    MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
+#[cfg(feature = "vector")]
+pub use storage::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, VersionedAuthorityState,
