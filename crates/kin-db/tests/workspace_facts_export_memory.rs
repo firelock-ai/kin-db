@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
     compute_semantic_change_id, AuthorId, ChangeOrigin, Entity, EntityId, EntityKind,
-    EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-    SemanticChange, SemanticChangeId, SemanticFingerprint, Timestamp, Visibility,
+    EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId,
+    Relation, RelationId, RelationKind, RelationOrigin, SemanticChange, SemanticChangeId,
+    SemanticFingerprint, Timestamp, Visibility,
 };
 
 // --- the instrument -------------------------------------------------------
@@ -101,6 +102,7 @@ fn grown<T>(work: impl FnOnce() -> T) -> usize {
 
 /// Roughly psf/requests: a few thousand changes over about a thousand entities.
 const ENTITIES: usize = 1_058;
+const RELATIONS: usize = 2_213;
 const CHANGES: usize = 6_733;
 /// Payload per change, so the change map is a real cost and not a map of stubs.
 const CHANGE_MESSAGE_BYTES: usize = 512;
@@ -133,6 +135,31 @@ fn entity(index: usize) -> Entity {
         superseded_by: None,
         created_in: None,
     }
+}
+
+/// A relation between two fixture entities.
+///
+/// Relations are half of what the planner's semantic diff compares, so a
+/// fixture without them cannot tell an export that carries relations from one
+/// that drops them.
+fn relation(index: usize) -> (RelationId, Relation) {
+    let src = entity(index % ENTITIES).id;
+    let dst = entity((index + 1) % ENTITIES).id;
+    let id = RelationId::new();
+    (
+        id,
+        Relation {
+            id,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            kind: RelationKind::Calls,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        },
+    )
 }
 
 fn fixed_timestamp() -> Timestamp {
@@ -174,6 +201,10 @@ fn fixture() -> GraphSnapshot {
         let entity = entity(index);
         snapshot.entities.insert(entity.id, entity);
     }
+    for index in 0..RELATIONS {
+        let (id, relation) = relation(index);
+        snapshot.relations.insert(id, relation);
+    }
     for index in 0..CHANGES {
         let (id, change) = change(index);
         snapshot.changes.insert(id, change);
@@ -184,6 +215,18 @@ fn fixture() -> GraphSnapshot {
         snapshot.changes.len(),
         CHANGES,
         "every synthetic change must be distinct or this fixture prices nothing"
+    );
+    // And one that collapsed its relations would let an export that drops the
+    // second compared domain pass the survival assertions below.
+    assert_eq!(
+        snapshot.entities.len(),
+        ENTITIES,
+        "every synthetic entity must be distinct or the survival check grades nothing"
+    );
+    assert_eq!(
+        snapshot.relations.len(),
+        RELATIONS,
+        "every synthetic relation must be distinct or the survival check grades nothing"
     );
     snapshot
 }
@@ -242,11 +285,32 @@ fn exporting_the_compared_domains_does_not_pay_for_the_change_map() {
     );
 
     // The facts must still carry what the comparison reads, or a narrow export
-    // could pass the line above by exporting nothing at all.
+    // could pass the line above by exporting nothing at all. Both compared
+    // domains are asserted, not just the first: an export that dropped
+    // relations would satisfy a ratio bound and an entity count together while
+    // silently handing the planner half a diff.
     let facts = graph.workspace_graph_facts();
     assert_eq!(
         facts.entities.len(),
         ENTITIES,
         "every entity the diff compares must survive the narrow export"
+    );
+    assert_eq!(
+        facts.relations.len(),
+        RELATIONS,
+        "every relation the diff compares must survive the narrow export"
+    );
+
+    // The borrowing export must agree with the whole one on both domains, or
+    // it is exporting a different graph rather than a cheaper view of the same
+    // one. Counts alone cannot see a wrong-but-same-sized map.
+    let whole_snapshot = graph.to_snapshot();
+    assert_eq!(
+        facts.entities, whole_snapshot.entities,
+        "the narrow export must agree with the whole export on entities"
+    );
+    assert_eq!(
+        facts.relations, whole_snapshot.relations,
+        "the narrow export must agree with the whole export on relations"
     );
 }

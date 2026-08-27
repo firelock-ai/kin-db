@@ -4085,20 +4085,6 @@ impl InMemoryGraph {
         }
     }
 
-    /// Export exactly the domains a workspace comparison reads, by consuming
-    /// this graph.
-    ///
-    /// Identical in value to calling [`to_snapshot`] and keeping four of its
-    /// fields, and very different in cost. `to_snapshot` clones every store
-    /// under its own lock, so a caller that wanted entity truth also paid for
-    /// a copy of the whole change map, the work, review, verification,
-    /// provenance and session domains, and every adjacency and secondary index
-    /// on the entity store, and then held all of it beside the four domains it
-    /// actually read. This moves the entity store out and rehashes four of its
-    /// maps into the snapshot's map type, copying no payload at all and
-    /// freeing everything else at the call.
-    ///
-    /// [`to_snapshot`]: Self::to_snapshot
     /// The compared domains, taken from a graph the caller only borrows.
     ///
     /// [`into_workspace_graph_facts`] consumes the graph, which suits a
@@ -4112,6 +4098,11 @@ impl InMemoryGraph {
     /// and the change map alone was 1191.7 MiB of it. This clones the four
     /// domains a workspace comparison consults and touches no other sub-store,
     /// under one read lock on the entity store.
+    ///
+    /// Borrowing costs a copy the consuming sibling avoids. That one moves the
+    /// entity store out and rehashes its maps without touching a payload; this
+    /// one cannot move out of a shared borrow, so it rehashes and clones the
+    /// values. What it buys back is the six sub-stores it never reads.
     ///
     /// [`into_workspace_graph_facts`]: Self::into_workspace_graph_facts
     /// [`to_snapshot`]: Self::to_snapshot
@@ -4142,6 +4133,20 @@ impl InMemoryGraph {
         }
     }
 
+    /// Export exactly the domains a workspace comparison reads, by consuming
+    /// this graph.
+    ///
+    /// Identical in value to calling [`to_snapshot`] and keeping four of its
+    /// fields, and very different in cost. `to_snapshot` clones every store
+    /// under its own lock, so a caller that wanted entity truth also paid for
+    /// a copy of the whole change map, the work, review, verification,
+    /// provenance and session domains, and every adjacency and secondary index
+    /// on the entity store, and then held all of it beside the four domains it
+    /// actually read. This moves the entity store out and rehashes four of its
+    /// maps into the snapshot's map type, copying no payload at all and
+    /// freeing everything else at the call.
+    ///
+    /// [`to_snapshot`]: Self::to_snapshot
     pub(crate) fn into_workspace_graph_facts(self) -> crate::storage::format::WorkspaceGraphFacts {
         let ent = self.entities.into_inner();
         crate::storage::format::WorkspaceGraphFacts {
