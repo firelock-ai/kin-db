@@ -4099,6 +4099,49 @@ impl InMemoryGraph {
     /// freeing everything else at the call.
     ///
     /// [`to_snapshot`]: Self::to_snapshot
+    /// The compared domains, taken from a graph the caller only borrows.
+    ///
+    /// [`into_workspace_graph_facts`] consumes the graph, which suits a
+    /// preparation that owns one. A daemon planning a commit does not: it holds
+    /// a long-lived shared graph and exports the desired side of a semantic
+    /// diff out of it, so its only option was [`to_snapshot`], which clones all
+    /// seven sub-stores.
+    ///
+    /// On psf/requests, 1058 entities, 2213 relations and 6733 changes, that
+    /// export grew live heap 1375.5 MiB to produce the 3.5 MiB the diff reads,
+    /// and the change map alone was 1191.7 MiB of it. This clones the four
+    /// domains a workspace comparison consults and touches no other sub-store,
+    /// under one read lock on the entity store.
+    ///
+    /// [`into_workspace_graph_facts`]: Self::into_workspace_graph_facts
+    /// [`to_snapshot`]: Self::to_snapshot
+    pub fn workspace_graph_facts(&self) -> crate::storage::format::WorkspaceGraphFacts {
+        // The entity store keys its maps with hashbrown and the snapshot type
+        // with std, which is why the consuming sibling rehashes rather than
+        // moves. Borrowing has to rehash AND clone the values, so this is a
+        // real copy of the two compared domains and not a view over them. On
+        // psf/requests that copy is 3.5 MiB.
+        let ent = self.entities.read();
+        crate::storage::format::WorkspaceGraphFacts {
+            entities: ent
+                .entities
+                .iter()
+                .map(|(id, entity)| (*id, entity.clone()))
+                .collect(),
+            relations: ent
+                .relations
+                .iter()
+                .map(|(id, relation)| (*id, relation.clone()))
+                .collect(),
+            external_references: ent
+                .external_references
+                .iter()
+                .map(|(id, reference)| (*id, reference.clone()))
+                .collect(),
+            resolved_tree: ent.resolved_tree.clone(),
+        }
+    }
+
     pub(crate) fn into_workspace_graph_facts(self) -> crate::storage::format::WorkspaceGraphFacts {
         let ent = self.entities.into_inner();
         crate::storage::format::WorkspaceGraphFacts {
