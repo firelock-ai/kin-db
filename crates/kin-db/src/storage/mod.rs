@@ -10,6 +10,7 @@ pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+mod gcs_compatibility;
 pub(crate) mod history_replay;
 pub mod index;
 mod local_journal;
@@ -42,6 +43,9 @@ pub use delta::{
 pub use format::{CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
+pub use gcs_compatibility::{
+    GcsFullAuthorityEnvelopeCompatibility, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
+};
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,

@@ -36,13 +36,14 @@ pub use storage::{
     VerificationReport, REPO_TRUTH_HASH_VERSION, ZERO_HASH,
 };
 pub use storage::{
-    load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
-    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
-    RecoveredSnapshot, SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState,
-    SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
-    VectorArtifact, VectorArtifactBinding, VectorArtifactCursor, VectorArtifactLoadOutcome,
-    VectorArtifactSaveOutcome, VectorRepositoryIdentity, VerifiedSourceBlob,
-    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES,
+    load_recovered_snapshot, AuthorityPayloadStats, GcsFullAuthorityEnvelopeCompatibility,
+    Generation, LocalFileBackend, LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,
+    PersistedVectorArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
+    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
+    StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
+    VectorArtifactLoadOutcome, VectorArtifactSaveOutcome, VectorRepositoryIdentity,
+    VerifiedSourceBlob, VerifiedSourceBlobBatch, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
+    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES,
     MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 #[cfg(feature = "vector")]
