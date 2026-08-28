@@ -1895,7 +1895,18 @@ mod tests {
             .set_len(MAX_LEGACY_PROVENANCE_DECODE_BYTES + 1)
             .unwrap();
         drop(oversized);
-        assert!(VectorIndex::producer_provenance_from_path(&oversized_path).is_err());
+        // Assert the CAP's own wording, not merely that an error came back. This
+        // fixture is zeroes, so it is undecodable as a v1 container anyway; a
+        // bare is_err() passes whether the size bound refused it before decoding
+        // or the decoder refused it after, which is the whole property.
+        let oversized_error = VectorIndex::producer_provenance_from_path(&oversized_path)
+            .expect_err("a legacy container above the classification bound must fail closed");
+        assert!(
+            oversized_error.to_string().contains(&format!(
+                "above the bounded {MAX_LEGACY_PROVENANCE_DECODE_BYTES}-byte provenance classification limit"
+            )),
+            "the refusal must come from the size bound before decoding: {oversized_error}"
+        );
         assert!(matches!(
             VectorIndex::inspect_producer_provenance_from_path(&oversized_path).unwrap(),
             VectorProducerProvenance::Incompatible { .. }
