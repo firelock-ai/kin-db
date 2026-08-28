@@ -17,7 +17,10 @@ mod local_journal;
 pub mod merkle;
 mod mmap;
 pub(crate) use local_journal::sync_parent_directory;
-pub(crate) use mmap::{open_regular_nofollow, read_regular_bounded};
+#[cfg(feature = "vector")]
+pub(crate) use mmap::open_regular_nofollow;
+#[cfg(feature = "embeddings")]
+pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
 mod snapshot;
 #[cfg(feature = "sql")]

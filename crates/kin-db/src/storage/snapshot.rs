@@ -1425,7 +1425,7 @@ fn validate_vector_index_metadata_shape(
     Ok(())
 }
 
-#[cfg(feature = "vector")]
+#[cfg(all(test, feature = "vector"))]
 fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>, KinDbError> {
     if !path.exists() {
         return Ok(None);
@@ -8568,7 +8568,7 @@ mod tests {
         let mut unspecified_metadata = current_vector_metadata(root, 4, 1, "unspecified-hosted");
         unspecified_metadata.index_binding_sha256 = hex::encode(unspecified_binding);
         let unspecified_artifact = VectorArtifact {
-            binding: mixed_artifact.binding.clone(),
+            binding: mixed_artifact.binding,
             metadata: serde_json::to_vec(&unspecified_metadata).unwrap(),
             index: unspecified_bytes.clone(),
         };

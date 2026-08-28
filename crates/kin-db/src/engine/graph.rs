@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
-#[cfg(any(feature = "embeddings", feature = "vector"))]
+#[cfg(all(feature = "embeddings", feature = "vector"))]
 use crate::embed::EmbeddingProducer;
 use crate::embed::EmbeddingProducerSet;
 use crate::error::KinDbError;
@@ -6119,6 +6119,7 @@ impl InMemoryGraph {
         )
     }
 
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn persist_produced_embedding_batch(
         &self,
         embedded: ProducedRetrievalBatch,

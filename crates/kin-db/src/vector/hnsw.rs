@@ -317,6 +317,7 @@ fn parse_unsigned_producer_trailer(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn bind_vector_index_producers_to_bytes(
     base_index: &[u8],
     producers: &EmbeddingProducerSet,
