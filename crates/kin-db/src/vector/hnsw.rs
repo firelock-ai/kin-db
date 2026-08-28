@@ -1584,10 +1584,12 @@ mod tests {
         std::fs::write(&path, b"corrupted hnsw index").unwrap();
 
         let error = VectorIndex::load_from_disk(&path).unwrap_err();
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("failed to deserialize")
-                || error.to_string().contains("recovery"),
-            "unexpected error: {error}"
+            message.contains("failed to deserialize")
+                || message.contains("recovery")
+                || message.contains("is not a readable legacy kvec"),
+            "unexpected error: {message}"
         );
     }
 

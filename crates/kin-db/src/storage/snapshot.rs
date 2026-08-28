@@ -8326,7 +8326,14 @@ mod tests {
         std::fs::write(&path, oversized).unwrap();
         let error = read_vector_index_metadata_for_load(&path)
             .expect_err("metadata above the public bound must not be allocated and decoded");
-        assert!(error.to_string().contains("exceeds"));
+        let message = error.to_string();
+        assert!(
+            message.contains("vector index metadata")
+                && message.contains(&format!(
+                    "above the {MAX_VECTOR_ARTIFACT_METADATA_BYTES}-byte safety limit"
+                )),
+            "the refusal must name the role and the exact public bound: {message}"
+        );
     }
 
     #[test]
