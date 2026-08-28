@@ -13,10 +13,16 @@ pub mod types;
 #[cfg(feature = "vector")]
 pub mod vector;
 
-pub use embed::CodeEmbedder;
+pub use embed::{
+    CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch,
+    VectorProducerProvenance,
+};
 #[cfg(feature = "vector")]
 pub use engine::VectorSalvageStats;
-pub use engine::{EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ResolvedRetrievalItem};
+pub use engine::{
+    EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
+    ProducedSemanticSearchBatch, ResolvedRetrievalItem,
+};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
@@ -46,7 +52,13 @@ pub use storage::{
     MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 #[cfg(feature = "vector")]
-pub use storage::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
+pub use storage::{
+    read_hosted_vector_artifact_actual_producers,
+    validate_hosted_vector_artifact_inner,
+    validate_hosted_vector_artifact_inner_for_producers,
+    validate_hosted_vector_artifact_inner_with_producers,
+    VECTOR_INDEX_METADATA_VERSION,
+};
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, VersionedAuthorityState,

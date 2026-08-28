@@ -15,6 +15,8 @@ pub mod index;
 mod local_journal;
 pub mod merkle;
 mod mmap;
+pub(crate) use local_journal::sync_parent_directory;
+pub(crate) use mmap::{open_regular_nofollow, read_regular_bounded};
 pub mod repository;
 mod snapshot;
 #[cfg(feature = "sql")]
@@ -56,7 +58,13 @@ pub use repository::{
     WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 #[cfg(feature = "vector")]
-pub use snapshot::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
+pub use snapshot::{
+    read_hosted_vector_artifact_actual_producers,
+    validate_hosted_vector_artifact_inner,
+    validate_hosted_vector_artifact_inner_for_producers,
+    validate_hosted_vector_artifact_inner_with_producers,
+    VECTOR_INDEX_METADATA_VERSION,
+};
 pub use snapshot::{SnapshotManager, VectorSidecarDisposition, VectorSidecarLoadOutcome};
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;
