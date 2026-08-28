@@ -8315,6 +8315,18 @@ mod tests {
         assert!(validate_hosted_vector_producer_set(0, &unspecified).is_err());
         assert!(validate_hosted_vector_producer_set(1, &unspecified).is_err());
         assert!(validate_hosted_vector_producer_set(0, &EmbeddingProducerSet::new()).is_ok());
+
+        // Attested controls that MUST pass. Without a non-empty attributed case,
+        // a policy mutated to refuse everything would still satisfy the refusals
+        // above, and only the empty-index case would notice.
+        let cpu = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+        assert!(validate_hosted_vector_producer_set(1, &cpu).is_ok());
+        let mixed = {
+            let mut set = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+            set.insert(crate::EmbeddingProducer::Metal);
+            set
+        };
+        assert!(validate_hosted_vector_producer_set(2, &mixed).is_ok());
     }
 
     #[test]
