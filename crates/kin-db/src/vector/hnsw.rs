@@ -184,7 +184,7 @@ fn validate_legacy_kvec_reader<R: Read + Seek>(
     let snapshot: kin_vector::HnswSnapshot<RetrievalKey> = rmp_serde::from_read(&mut *reader)
         .map_err(|error| {
             KinDbError::StorageError(format!(
-                "non-v2 vector index is not a readable legacy kvec: {error}"
+                "vector index has no current container magic and is not a readable legacy container: {error}"
             ))
         })?;
     if snapshot.format_version != KVEC_V1_VERSION {
@@ -1588,7 +1588,7 @@ mod tests {
         assert!(
             message.contains("failed to deserialize")
                 || message.contains("recovery")
-                || message.contains("is not a readable legacy kvec"),
+                || message.contains("has no current container magic"),
             "unexpected error: {message}"
         );
     }
