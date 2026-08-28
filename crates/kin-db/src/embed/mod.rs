@@ -1058,7 +1058,7 @@ impl CodeEmbedder {
         )
     }
 
-    #[cfg(all(test, feature = "embeddings"))]
+    #[cfg(all(test, feature = "embeddings", feature = "vector"))]
     pub(crate) fn test_local_success(
         dimensions: usize,
         cache_root: PathBuf,

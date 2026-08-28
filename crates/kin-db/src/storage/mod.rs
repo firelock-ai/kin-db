@@ -16,6 +16,7 @@ pub mod index;
 mod local_journal;
 pub mod merkle;
 mod mmap;
+#[cfg(feature = "vector")]
 pub(crate) use local_journal::sync_parent_directory;
 #[cfg(feature = "vector")]
 pub(crate) use mmap::open_regular_nofollow;

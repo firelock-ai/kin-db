@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(feature = "vector")]
 use crate::embed::EmbeddingProducer;
 use crate::embed::EmbeddingProducerSet;
 use crate::error::KinDbError;
