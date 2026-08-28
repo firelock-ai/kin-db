@@ -4,6 +4,7 @@
 mod hnsw;
 
 pub use hnsw::{IndexLoadOutcome, VectorIndex};
+pub(crate) use hnsw::VectorIndexPersistenceInfo;
 pub use kin_vector::IndexDescriptor;
 
 /// Result of installing a persisted index into a graph via
