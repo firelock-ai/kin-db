@@ -19032,7 +19032,7 @@ mod tests {
         let embedder = Arc::new(CodeEmbedder::test_local_success(
             2,
             dir.path().to_path_buf(),
-            kin_infer::GpuBackend::Metal,
+            kin_infer::gpu::GpuBackend::Metal,
             vec![1.0, 0.0],
         ));
         *graph.embedder.lock() = Some(embedder);
@@ -20631,7 +20631,7 @@ mod tests {
             texts: Vec::new(),
             recency: hashbrown::HashMap::new(),
         };
-        assert!(g.embed_prepared_batch(&empty).unwrap().is_empty());
+        assert!(g.embed_prepared_batch(&empty).unwrap().items.is_empty());
         assert_eq!(g.persist_embedded_batch(Vec::new(), &empty).unwrap(), 0);
 
         let changed = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xbeef)));

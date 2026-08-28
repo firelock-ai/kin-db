@@ -2986,10 +2986,9 @@ impl LocalChunkRuntime for BertChunkRuntime<'_> {
         token_ids: &[u32],
         attention_mask: &[u32],
     ) -> Result<Vec<Vec<f32>>, kin_infer::InferError> {
-        model.forward(
-            std::slice::from_ref(token_ids),
-            std::slice::from_ref(attention_mask),
-        )
+        let token_ids = [token_ids.to_vec()];
+        let attention_mask = [attention_mask.to_vec()];
+        model.forward(&token_ids, &attention_mask)
     }
 }
 

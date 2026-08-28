@@ -8462,7 +8462,7 @@ mod tests {
             .expect_err("declared and decoded dimensions must match exactly");
         assert!(dimension_error.to_string().contains("4 dimensions"));
 
-        let mut mismatched_metadata = metadata;
+        let mut mismatched_metadata = metadata.clone();
         mismatched_metadata.actual_producers =
             EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Metal);
         let mut mismatched = artifact.clone();
