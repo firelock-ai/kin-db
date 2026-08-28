@@ -187,7 +187,10 @@ mod tests {
         second.insert(EmbeddingProducer::Cpu);
         second.insert(EmbeddingProducer::Metal);
 
-        assert_eq!(serde_json::to_vec(&first).unwrap(), serde_json::to_vec(&second).unwrap());
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
         assert_eq!(
             rmp_serde::to_vec(&first).unwrap(),
             rmp_serde::to_vec(&second).unwrap()

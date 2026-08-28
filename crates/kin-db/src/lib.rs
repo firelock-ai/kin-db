@@ -54,11 +54,9 @@ pub use storage::{
 };
 #[cfg(feature = "vector")]
 pub use storage::{
-    read_hosted_vector_artifact_actual_producers,
-    validate_hosted_vector_artifact_inner,
+    read_hosted_vector_artifact_actual_producers, validate_hosted_vector_artifact_inner,
     validate_hosted_vector_artifact_inner_for_producers,
-    validate_hosted_vector_artifact_inner_with_producers,
-    VECTOR_INDEX_METADATA_VERSION,
+    validate_hosted_vector_artifact_inner_with_producers, VECTOR_INDEX_METADATA_VERSION,
 };
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,

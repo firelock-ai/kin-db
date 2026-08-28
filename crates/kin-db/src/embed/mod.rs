@@ -5,8 +5,7 @@
 pub mod cache_admin;
 mod producer;
 pub use producer::{
-    EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch,
-    VectorProducerProvenance,
+    EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch, VectorProducerProvenance,
 };
 #[cfg(feature = "embeddings")]
 mod inference;
@@ -720,7 +719,8 @@ pub(crate) struct TestLocalRuntimeStats {
 #[cfg(all(test, feature = "embeddings"))]
 impl TestLocalRuntimeStats {
     pub(crate) fn cpu_model_calls(&self) -> usize {
-        self.cpu_model_calls.load(std::sync::atomic::Ordering::SeqCst)
+        self.cpu_model_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn primary_forward_calls(&self) -> usize {
@@ -811,9 +811,7 @@ fn actual_producer_from_returning_backend(backend: GpuBackend) -> EmbeddingProdu
 fn metal_oom_reason(error: kin_infer::InferError) -> Result<String, KinDbError> {
     match error {
         kin_infer::InferError::OutOfMemory(message) => Ok(message),
-        other => Err(KinDbError::IndexError(format!(
-            "inference failed: {other}"
-        ))),
+        other => Err(KinDbError::IndexError(format!("inference failed: {other}"))),
     }
 }
 
@@ -840,8 +838,7 @@ where
         }
     };
     let vectors = forward(returning_model)?;
-    let actual_producer =
-        actual_producer_from_returning_backend(backend(returning_model));
+    let actual_producer = actual_producer_from_returning_backend(backend(returning_model));
     Ok((vectors, returning_model, actual_producer))
 }
 
@@ -899,9 +896,9 @@ where
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => {
             on_wait();
-            source.lock().map_err(|_| {
-                KinDbError::IndexError("single-flight source mutex poisoned".into())
-            })?
+            source
+                .lock()
+                .map_err(|_| KinDbError::IndexError("single-flight source mutex poisoned".into()))?
         }
         Err(std::sync::TryLockError::Poisoned(_)) => {
             return Err(KinDbError::IndexError(
@@ -1411,11 +1408,7 @@ impl CodeEmbedder {
                 }
             }
 
-            fanout_attributed_embedding(
-                &mut cached_results,
-                &missing_slots[miss_idx],
-                &embedding,
-            )?;
+            fanout_attributed_embedding(&mut cached_results, &missing_slots[miss_idx], &embedding)?;
         }
 
         let attributed = cached_results
@@ -1765,8 +1758,7 @@ impl BertEmbedder {
             return Ok(placed);
         }
 
-        let mut placed: Vec<(usize, Vec<f32>, EmbeddingProducer)> =
-            Vec::with_capacity(batch.len());
+        let mut placed: Vec<(usize, Vec<f32>, EmbeddingProducer)> = Vec::with_capacity(batch.len());
         for &(s, e, longest) in &ranges {
             let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
             placed.extend(self.process_chunk(
@@ -3174,8 +3166,7 @@ fn process_chunk_with_runtime<R: LocalChunkRuntime>(
                     }
                 }
             };
-            let producer =
-                actual_producer_from_returning_backend(runtime.backend(forward_model));
+            let producer = actual_producer_from_returning_backend(runtime.backend(forward_model));
             (vectors, forward_model, producer)
         }
         EmbedBackendChoice::Cpu { reason } => {
@@ -3225,9 +3216,7 @@ fn process_chunk_with_runtime<R: LocalChunkRuntime>(
         for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
             let out = runtime
                 .forward_single(forward_model, ids, mask)
-                .map_err(|error| {
-                    KinDbError::IndexError(format!("inference failed: {error}"))
-                })?;
+                .map_err(|error| KinDbError::IndexError(format!("inference failed: {error}")))?;
             retried.push(out.into_iter().next().ok_or_else(|| {
                 KinDbError::IndexError("forward returned empty batch".to_string())
             })?);
@@ -3556,9 +3545,7 @@ fn balanced_partition_with_cpu_max_seq_len(
 }
 
 #[cfg(feature = "embeddings")]
-fn produced_batch_from_attributed(
-    attributed: Vec<AttributedEmbedding>,
-) -> ProducedEmbeddingBatch {
+fn produced_batch_from_attributed(attributed: Vec<AttributedEmbedding>) -> ProducedEmbeddingBatch {
     let mut producers = EmbeddingProducerSet::new();
     let mut vectors = Vec::with_capacity(attributed.len());
     for embedding in attributed {
@@ -4115,12 +4102,7 @@ impl EmbeddingCache {
         }
     }
 
-    fn put_by_key(
-        &self,
-        key: &str,
-        vector: &[f32],
-        producers: &EmbeddingProducerSet,
-    ) {
+    fn put_by_key(&self, key: &str, vector: &[f32], producers: &EmbeddingProducerSet) {
         if vector.len() != self.dimensions {
             return;
         }
@@ -4320,8 +4302,7 @@ where
         "embedder produced malformed vector; substituting unattributed zero vector"
     );
     embedding.vector = vec![0.0f32; dimensions];
-    embedding.producers =
-        EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified);
+    embedding.producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified);
     embedding
 }
 
@@ -5652,10 +5633,7 @@ mod tests {
 
         assert_eq!(first.join().unwrap(), 14);
         assert_eq!(second.join().unwrap(), 14);
-        assert_eq!(
-            builds.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(source.lock().unwrap().is_none());
     }
 
@@ -5747,10 +5725,8 @@ mod tests {
         let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
 
         let oversized_path = dir.path().join("oversized.bin");
-        let max_entry_bytes = 5
-            + MAX_EMBEDDING_CACHE_PRODUCERS
-            + dimensions * std::mem::size_of::<f32>()
-            + 32;
+        let max_entry_bytes =
+            5 + MAX_EMBEDDING_CACHE_PRODUCERS + dimensions * std::mem::size_of::<f32>() + 32;
         std::fs::write(&oversized_path, vec![0u8; max_entry_bytes + 1]).unwrap();
         assert!(
             read_cached_embedding(&oversized_path, dimensions).is_none(),
@@ -5824,8 +5800,7 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn cpu_route_cpu_twin_construction_failure_uses_primary_actual_backend_through_process_chunk()
-    {
+    fn cpu_route_cpu_twin_construction_failure_uses_primary_actual_backend_through_process_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let (embedder, stats) = CodeEmbedder::test_cpu_route_with_unavailable_twin(
             2,
@@ -5851,11 +5826,8 @@ mod tests {
     #[test]
     fn metal_oom_fallback_records_the_cpu_model_that_returned_the_vectors() {
         let dir = tempfile::tempdir().unwrap();
-        let (embedder, stats) = CodeEmbedder::test_local_oom_fallback(
-            2,
-            dir.path().to_path_buf(),
-            vec![0.25, 0.75],
-        );
+        let (embedder, stats) =
+            CodeEmbedder::test_local_oom_fallback(2, dir.path().to_path_buf(), vec![0.25, 0.75]);
         let produced = embedder
             .embed_batch_with_producers(&["model-free-oom".to_string()])
             .unwrap();
@@ -5877,11 +5849,9 @@ mod tests {
             "synthetic non-OOM failure".to_string(),
         ))
         .expect_err("generic local failures must return Err without producer evidence");
-        assert!(
-            classifier_error
-                .to_string()
-                .contains("synthetic non-OOM failure")
-        );
+        assert!(classifier_error
+            .to_string()
+            .contains("synthetic non-OOM failure"));
         assert_eq!(
             metal_oom_reason(kin_infer::InferError::OutOfMemory("oom".to_string())).unwrap(),
             "oom"
@@ -6201,14 +6171,10 @@ mod tests {
             r#"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#,
         );
         let dir = tempfile::tempdir().unwrap();
-        let cache = EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-mock".into(), 2)
-            .unwrap();
+        let cache =
+            EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-mock".into(), 2).unwrap();
         let embedder = CodeEmbedder {
-            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(
-                endpoint,
-                "",
-                "",
-            )),
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
             dimensions: 2,
             cache: Some(cache),
         };
@@ -6234,16 +6200,12 @@ mod tests {
         let (endpoint, server) =
             serve_one_embedding_response("500 Internal Server Error", r#"{"error":"boom"}"#);
         let dir = tempfile::tempdir().unwrap();
-        let cache = EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-error".into(), 2)
-            .unwrap();
+        let cache =
+            EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-error".into(), 2).unwrap();
         let key = cache.key_for_text("remote-error");
         let cache_path = cache.path_for_key(&key);
         let embedder = CodeEmbedder {
-            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(
-                endpoint,
-                "",
-                "",
-            )),
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
             dimensions: 2,
             cache: Some(cache),
         };
@@ -6411,12 +6373,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dims = 4;
 
-        let writer = EmbeddingCache::new_in(
-            tmp.path().to_path_buf(),
-            "lru-equality".to_string(),
-            dims,
-        )
-            .expect("cache root");
+        let writer =
+            EmbeddingCache::new_in(tmp.path().to_path_buf(), "lru-equality".to_string(), dims)
+                .expect("cache root");
         let key = writer.key_for_text("function\nsrc/lib.rs\nload_registry");
         let vector = vec![0.5_f32, -0.25, 0.125, 0.0625];
         let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
@@ -6429,12 +6388,9 @@ mod tests {
         // A fresh cache over the same root starts with an empty LRU, so the
         // first read is served from disk (and populates the LRU); the second is
         // served from the LRU. Both must equal the disk bytes.
-        let reader = EmbeddingCache::new_in(
-            tmp.path().to_path_buf(),
-            "lru-equality".to_string(),
-            dims,
-        )
-        .expect("cache root");
+        let reader =
+            EmbeddingCache::new_in(tmp.path().to_path_buf(), "lru-equality".to_string(), dims)
+                .expect("cache root");
         let served_from_disk = reader.get_by_key(&key).expect("disk-backed hit");
         let served_from_lru = reader.get_by_key(&key).expect("memory hit");
 

@@ -9,9 +9,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::embed::{
-    EmbeddingProducer, EmbeddingProducerSet, VectorProducerProvenance,
-};
+use crate::embed::{EmbeddingProducer, EmbeddingProducerSet, VectorProducerProvenance};
 use crate::error::KinDbError;
 use crate::search::{resolve_roles, ScoredHit};
 use crate::types::EntityId;
@@ -183,8 +181,8 @@ fn validate_legacy_kvec_reader<R: Read + Seek>(
     reader.seek(SeekFrom::Start(0)).map_err(|error| {
         KinDbError::StorageError(format!("failed to rewind legacy vector index: {error}"))
     })?;
-    let snapshot: kin_vector::HnswSnapshot<RetrievalKey> =
-        rmp_serde::from_read(&mut *reader).map_err(|error| {
+    let snapshot: kin_vector::HnswSnapshot<RetrievalKey> = rmp_serde::from_read(&mut *reader)
+        .map_err(|error| {
             KinDbError::StorageError(format!(
                 "non-v2 vector index is not a readable legacy kvec: {error}"
             ))
@@ -224,14 +222,10 @@ fn parse_producer_trailer_from_bytes(
     if base_end == bytes.len() {
         return Ok(None);
     }
-    let minimum_current_len = base_end
-        .checked_add(32 + 8 + 8)
-        .ok_or_else(|| {
-            KinDbError::StorageError("vector producer trailer extent overflows".to_string())
-        })?;
-    if bytes.len() < minimum_current_len
-        || !bytes.ends_with(&PRODUCER_TRAILER_END_MAGIC)
-    {
+    let minimum_current_len = base_end.checked_add(32 + 8 + 8).ok_or_else(|| {
+        KinDbError::StorageError("vector producer trailer extent overflows".to_string())
+    })?;
+    if bytes.len() < minimum_current_len || !bytes.ends_with(&PRODUCER_TRAILER_END_MAGIC) {
         return Err(KinDbError::StorageError(
             "vector producer trailer is truncated or has extra trailing bytes".to_string(),
         ));
@@ -240,8 +234,7 @@ fn parse_producer_trailer_from_bytes(
     let unsigned_len = usize::try_from(read_u64_le(bytes, unsigned_len_start)?).map_err(|_| {
         KinDbError::StorageError("vector producer trailer length does not fit usize".to_string())
     })?;
-    if !(PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES..=MAX_PRODUCER_TRAILER_BYTES)
-        .contains(&unsigned_len)
+    if !(PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES..=MAX_PRODUCER_TRAILER_BYTES).contains(&unsigned_len)
     {
         return Err(KinDbError::StorageError(format!(
             "vector producer trailer length {unsigned_len} is outside the bounded current format"
@@ -251,7 +244,9 @@ fn parse_producer_trailer_from_bytes(
         KinDbError::StorageError("vector producer trailer digest is truncated".to_string())
     })?;
     let unsigned_start = digest_start.checked_sub(unsigned_len).ok_or_else(|| {
-        KinDbError::StorageError("vector producer trailer length exceeds the index bytes".to_string())
+        KinDbError::StorageError(
+            "vector producer trailer length exceeds the index bytes".to_string(),
+        )
     })?;
     if unsigned_start != base_end {
         return Err(KinDbError::StorageError(
@@ -331,9 +326,8 @@ pub(crate) fn bind_vector_index_producers_to_bytes(
             "producer binding requires one exact raw kvec v2 base".to_string(),
         ));
     }
-    let base_len = u64::try_from(base_index.len()).map_err(|_| {
-        KinDbError::StorageError("kvec base length exceeds u64".to_string())
-    })?;
+    let base_len = u64::try_from(base_index.len())
+        .map_err(|_| KinDbError::StorageError("kvec base length exceeds u64".to_string()))?;
     let unsigned = encode_unsigned_producer_trailer(base_len, producers)?;
     let digest = producer_binding_digest(base_index, &unsigned);
     let unsigned_len = u64::try_from(unsigned.len()).expect("bounded trailer length fits u64");
@@ -352,9 +346,8 @@ fn decode_current_vector_index_producer_binding(
     let Some(trailer) = parse_producer_trailer_from_bytes(bytes)? else {
         return Ok(None);
     };
-    let base_len = usize::try_from(trailer.base_len).map_err(|_| {
-        KinDbError::StorageError("kvec base length does not fit usize".to_string())
-    })?;
+    let base_len = usize::try_from(trailer.base_len)
+        .map_err(|_| KinDbError::StorageError("kvec base length does not fit usize".to_string()))?;
     let expected = producer_binding_digest(&bytes[..base_len], &trailer.unsigned);
     if trailer.digest != expected {
         return Err(KinDbError::StorageError(
@@ -365,9 +358,7 @@ fn decode_current_vector_index_producer_binding(
     Ok(Some((trailer.producers, trailer.digest)))
 }
 
-fn decode_vector_index_producers(
-    bytes: &[u8],
-) -> Result<VectorProducerProvenance, KinDbError> {
+fn decode_vector_index_producers(bytes: &[u8]) -> Result<VectorProducerProvenance, KinDbError> {
     match decode_current_vector_index_producer_binding(bytes)? {
         Some((producers, _)) => Ok(VectorProducerProvenance::Known(producers)),
         None => Ok(VectorProducerProvenance::UnknownLegacy {
@@ -412,9 +403,10 @@ fn read_kvec_v2_base_extent(file: &mut File, file_len: u64) -> Result<Option<u64
 fn parse_producer_trailer_from_file(
     file: &mut File,
 ) -> Result<Option<ParsedProducerTrailer>, KinDbError> {
-    let file_len = file.metadata().map_err(|error| {
-        KinDbError::StorageError(format!("failed to stat vector index: {error}"))
-    })?.len();
+    let file_len = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(format!("failed to stat vector index: {error}")))?
+        .len();
     let Some(base_end) = read_kvec_v2_base_extent(file, file_len)? else {
         validate_legacy_kvec_reader(file, file_len)?;
         return Ok(None);
@@ -467,7 +459,9 @@ fn parse_producer_trailer_from_file(
         KinDbError::StorageError("vector producer trailer digest is truncated".to_string())
     })?;
     let unsigned_start = digest_start.checked_sub(unsigned_len).ok_or_else(|| {
-        KinDbError::StorageError("vector producer trailer length exceeds the index bytes".to_string())
+        KinDbError::StorageError(
+            "vector producer trailer length exceeds the index bytes".to_string(),
+        )
     })?;
     if unsigned_start != base_end {
         return Err(KinDbError::StorageError(
@@ -476,15 +470,12 @@ fn parse_producer_trailer_from_file(
     }
     let unsigned_len = usize::try_from(unsigned_len).expect("bounded trailer length fits usize");
     let mut unsigned = vec![0u8; unsigned_len];
-    file.seek(SeekFrom::Start(unsigned_start)).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to seek vector producer trailer: {error}"
-        ))
-    })?;
+    file.seek(SeekFrom::Start(unsigned_start))
+        .map_err(|error| {
+            KinDbError::StorageError(format!("failed to seek vector producer trailer: {error}"))
+        })?;
     file.read_exact(&mut unsigned).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to read vector producer trailer: {error}"
-        ))
+        KinDbError::StorageError(format!("failed to read vector producer trailer: {error}"))
     })?;
     let mut digest = [0u8; 32];
     file.read_exact(&mut digest).map_err(|error| {
@@ -556,9 +547,7 @@ fn current_producer_binding_from_file(
     Ok(Some((trailer.producers, trailer.digest)))
 }
 
-fn producer_provenance_from_file(
-    file: &mut File,
-) -> Result<VectorProducerProvenance, KinDbError> {
+fn producer_provenance_from_file(file: &mut File) -> Result<VectorProducerProvenance, KinDbError> {
     match current_producer_binding_from_file(file)? {
         Some((producers, _)) => Ok(VectorProducerProvenance::Known(producers)),
         None => Ok(VectorProducerProvenance::UnknownLegacy {
@@ -581,12 +570,15 @@ fn append_vector_index_producer_trailer(
                 path.display()
             ))
         })?;
-    let base_len = file.metadata().map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to stat staged vector index {}: {error}",
-            path.display()
-        ))
-    })?.len();
+    let base_len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to stat staged vector index {}: {error}",
+                path.display()
+            ))
+        })?
+        .len();
     if read_kvec_v2_base_extent(&mut file, base_len)? != Some(base_len) {
         return Err(KinDbError::StorageError(
             "producer binding requires one exact raw kvec v2 base".to_string(),
@@ -596,12 +588,16 @@ fn append_vector_index_producer_trailer(
     let mut hasher = stream_base_and_hash(&mut file, base_len, None)?;
     hasher.update(&unsigned);
     let digest: [u8; 32] = hasher.finalize().into();
-    if file.metadata().map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to restat staged vector index {}: {error}",
-            path.display()
-        ))
-    })?.len() != base_len
+    if file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to restat staged vector index {}: {error}",
+                path.display()
+            ))
+        })?
+        .len()
+        != base_len
     {
         return Err(KinDbError::StorageError(
             "staged vector index changed while binding producer evidence".to_string(),
@@ -699,10 +695,8 @@ impl Drop for VerifiedVectorBase {
 fn stage_verified_vector_base(
     source_path: &Path,
 ) -> Result<(VerifiedVectorBase, EmbeddingProducerSet, [u8; 32]), KinDbError> {
-    let mut source = crate::storage::open_regular_nofollow(
-        source_path,
-        "producer-bound vector index",
-    )?;
+    let mut source =
+        crate::storage::open_regular_nofollow(source_path, "producer-bound vector index")?;
     let trailer = parse_producer_trailer_from_file(&mut source)?.ok_or_else(|| {
         KinDbError::StorageError("vector index has no current actual-producer binding".to_string())
     })?;
@@ -723,12 +717,14 @@ fn stage_verified_vector_base(
         use std::os::unix::fs::DirBuilderExt as _;
         directory_builder.mode(0o700);
     }
-    directory_builder.create(&staged_directory).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to create private verified vector directory {}: {error}",
-            staged_directory.display()
-        ))
-    })?;
+    directory_builder
+        .create(&staged_directory)
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to create private verified vector directory {}: {error}",
+                staged_directory.display()
+            ))
+        })?;
     let verified = VerifiedVectorBase {
         path: staged_directory.join("base.kvec"),
         directory: staged_directory,
@@ -811,9 +807,8 @@ static NEXT_PRODUCER_SAVE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 type ProducerFrontierHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
-static PRODUCER_FRONTIER_HOOK: std::sync::Mutex<
-    Option<(RetrievalKey, ProducerFrontierHook)>,
-> = std::sync::Mutex::new(None);
+static PRODUCER_FRONTIER_HOOK: std::sync::Mutex<Option<(RetrievalKey, ProducerFrontierHook)>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn set_producer_frontier_hook(key: Option<RetrievalKey>, hook: Option<ProducerFrontierHook>) {
@@ -893,9 +888,7 @@ impl VectorIndex {
     /// into an untyped error. Callers can distinguish exact legacy absence from
     /// malformed current evidence while strict attach paths continue to return
     /// an error and refuse the artifact.
-    pub fn inspect_producer_provenance_from_bytes(
-        bytes: &[u8],
-    ) -> VectorProducerProvenance {
+    pub fn inspect_producer_provenance_from_bytes(bytes: &[u8]) -> VectorProducerProvenance {
         decode_vector_index_producers(bytes).unwrap_or_else(|error| {
             VectorProducerProvenance::Incompatible {
                 reason: error.to_string(),
@@ -934,11 +927,13 @@ impl VectorIndex {
     ) -> Result<VectorProducerProvenance, KinDbError> {
         let mut file =
             crate::storage::open_regular_nofollow(path, "vector index producer binding")?;
-        Ok(producer_provenance_from_file(&mut file).unwrap_or_else(|error| {
-            VectorProducerProvenance::Incompatible {
-                reason: error.to_string(),
-            }
-        }))
+        Ok(
+            producer_provenance_from_file(&mut file).unwrap_or_else(|error| {
+                VectorProducerProvenance::Incompatible {
+                    reason: error.to_string(),
+                }
+            }),
+        )
     }
 
     /// Record that the key set just changed.
@@ -1082,8 +1077,7 @@ impl VectorIndex {
         let _guard = self.mutation_guard.write();
         #[cfg(test)]
         let hook_key = key;
-        self
-            .inner
+        self.inner
             .upsert(key, embedding)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         #[cfg(test)]
@@ -1123,8 +1117,7 @@ impl VectorIndex {
             tracing::info_span!("kindb.vector_index.upsert_batch", batch_size = items.len())
                 .entered();
         let _guard = self.mutation_guard.write();
-        self
-            .inner
+        self.inner
             .upsert_batch(items)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         self.actual_producers.write().extend(producers);
@@ -1142,8 +1135,7 @@ impl VectorIndex {
     /// Remove the embedding for any retrieval key.
     pub fn remove_retrievable(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
         let _guard = self.mutation_guard.write();
-        self
-            .inner
+        self.inner
             .remove(key)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         self.mark_key_set_changed();
@@ -1158,8 +1150,7 @@ impl VectorIndex {
         let _guard = self.mutation_guard.write();
         for id in entity_ids {
             let key = RetrievalKey::from(*id);
-            self
-                .inner
+            self.inner
                 .remove(&key)
                 .map_err(|e| KinDbError::IndexError(e.to_string()))?;
             self.mark_key_set_changed();
@@ -1252,7 +1243,8 @@ impl VectorIndex {
     /// Persists the full HNSW graph as a single MessagePack file with atomic
     /// write semantics (write-to-tmp then rename).
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
-        self.save_with_provenance(path, None, |_| Ok(())).map(|_| ())
+        self.save_with_provenance(path, None, |_| Ok(()))
+            .map(|_| ())
     }
 
     pub(crate) fn save_with_provenance<F>(
@@ -1297,8 +1289,7 @@ impl VectorIndex {
             self.inner
                 .save(&staged)
                 .map_err(|e| KinDbError::IndexError(e.to_string()))?;
-            let index_binding_sha256 =
-                append_vector_index_producer_trailer(&staged, &producers)?;
+            let index_binding_sha256 = append_vector_index_producer_trailer(&staged, &producers)?;
             let info = VectorIndexPersistenceInfo {
                 dimensions,
                 indexed,
@@ -1726,8 +1717,7 @@ mod tests {
     #[test]
     fn producer_lineage_distinguishes_raw_and_actual_writes_and_survives_removal() {
         let raw = VectorIndex::new(4).unwrap();
-        raw.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0])
-            .unwrap();
+        raw.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert_eq!(
             raw.actual_producers(),
             EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified)
@@ -1750,11 +1740,7 @@ mod tests {
 
         let cuda = EmbeddingProducerSet::singleton(EmbeddingProducer::Cuda);
         index
-            .upsert_retrievable_with_producers(
-                cpu_key,
-                &[0.0, 0.0, 1.0, 0.0],
-                &cuda,
-            )
+            .upsert_retrievable_with_producers(cpu_key, &[0.0, 0.0, 1.0, 0.0], &cuda)
             .unwrap();
         expected.extend(&cuda);
         assert_eq!(
@@ -1816,8 +1802,7 @@ mod tests {
             .unwrap();
         let mut producers = cpu;
         producers.extend(&metal);
-        let mut reverse_insertion =
-            EmbeddingProducerSet::singleton(EmbeddingProducer::Metal);
+        let mut reverse_insertion = EmbeddingProducerSet::singleton(EmbeddingProducer::Metal);
         reverse_insertion.insert(EmbeddingProducer::Cpu);
         assert_eq!(
             encode_unsigned_producer_trailer(17, &producers).unwrap(),
@@ -1850,11 +1835,7 @@ mod tests {
         let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
         let expected_descriptor = descriptor("released-parser-model", "released-parser-root");
         index
-            .upsert_retrievable_with_producers(
-                key,
-                &[1.0, 0.0, 0.0, 0.0],
-                &producers,
-            )
+            .upsert_retrievable_with_producers(key, &[1.0, 0.0, 0.0, 0.0], &producers)
             .unwrap();
         index.set_descriptor(expected_descriptor.clone());
         index.save(&path).unwrap();
@@ -1979,69 +1960,83 @@ mod tests {
         let canonical = encode_unsigned_producer_trailer(base_end as u64, &producers).unwrap();
         let mut future_version = canonical.clone();
         future_version[8..12].copy_from_slice(&2u32.to_le_bytes());
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &future_version,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base,
+                &future_version,
+            ))
+            .is_err()
+        );
 
         let mut duplicate = canonical.clone();
         duplicate[PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES..].copy_from_slice(&[1, 1]);
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &duplicate,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base, &duplicate,
+            ))
+            .is_err()
+        );
 
         let mut descending = canonical.clone();
         descending[PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES..].copy_from_slice(&[2, 1]);
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &descending,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base,
+                &descending,
+            ))
+            .is_err()
+        );
 
         let mut unknown = canonical.clone();
         unknown[PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES + 1] = 9;
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &unknown,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base, &unknown,
+            ))
+            .is_err()
+        );
 
         let mut wrong_base_len = canonical.clone();
         wrong_base_len[12..20].copy_from_slice(&((base_end as u64) + 1).to_le_bytes());
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &wrong_base_len,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base,
+                &wrong_base_len,
+            ))
+            .is_err()
+        );
 
         let mut wrong_count = canonical.clone();
         wrong_count[20] = 1;
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &wrong_count,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base,
+                &wrong_count,
+            ))
+            .is_err()
+        );
 
         let mut wrong_magic = canonical.clone();
         wrong_magic[0] ^= 0x01;
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            base,
-            &wrong_magic,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                base,
+                &wrong_magic,
+            ))
+            .is_err()
+        );
 
         let mut junk_base = base.to_vec();
         junk_base.push(0x00);
         let junk_unsigned =
             encode_unsigned_producer_trailer(junk_base.len() as u64, &producers).unwrap();
-        assert!(VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
-            &junk_base,
-            &junk_unsigned,
-        ))
-        .is_err());
+        assert!(
+            VectorIndex::producer_provenance_from_bytes(&bind_test_unsigned_trailer(
+                &junk_base,
+                &junk_unsigned,
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2057,7 +2052,11 @@ mod tests {
         let base_end = kvec_v2_payload_end(&bytes).unwrap().unwrap();
         let base = &bytes[..base_end];
 
-        for (offset, value) in [(16usize, u64::MAX), (24usize, u64::MAX), (32usize, u64::MAX)] {
+        for (offset, value) in [
+            (16usize, u64::MAX),
+            (24usize, u64::MAX),
+            (32usize, u64::MAX),
+        ] {
             let mut malformed = base.to_vec();
             malformed[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
             assert!(
@@ -2086,18 +2085,14 @@ mod tests {
             .unwrap();
         let captured = std::sync::Mutex::new(None);
         index
-            .save_with_provenance(
-                &path,
-                Some(descriptor("model-A@1", "root-1")),
-                |receipt| {
-                    assert!(
-                        !path.exists(),
-                        "metadata callback must run before final index promotion"
-                    );
-                    *captured.lock().unwrap() = Some(receipt.clone());
-                    Ok(())
-                },
-            )
+            .save_with_provenance(&path, Some(descriptor("model-A@1", "root-1")), |receipt| {
+                assert!(
+                    !path.exists(),
+                    "metadata callback must run before final index promotion"
+                );
+                *captured.lock().unwrap() = Some(receipt.clone());
+                Ok(())
+            })
             .unwrap();
         assert!(path.exists());
         let receipt = captured.lock().unwrap().clone().unwrap();
@@ -2137,11 +2132,7 @@ mod tests {
         let cpu = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
         let metal = EmbeddingProducerSet::singleton(EmbeddingProducer::Metal);
         index
-            .upsert_retrievable_with_producers(
-                cpu_key,
-                &[1.0, 0.0, 0.0, 0.0],
-                &cpu,
-            )
+            .upsert_retrievable_with_producers(cpu_key, &[1.0, 0.0, 0.0, 0.0], &cpu)
             .unwrap();
 
         let entered = std::sync::Arc::new(std::sync::Barrier::new(2));

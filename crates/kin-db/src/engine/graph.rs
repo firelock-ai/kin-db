@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
-use crate::embed::EmbeddingProducerSet;
 #[cfg(any(feature = "embeddings", feature = "vector"))]
 use crate::embed::EmbeddingProducer;
+use crate::embed::EmbeddingProducerSet;
 use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
@@ -5058,8 +5058,7 @@ impl InMemoryGraph {
         };
 
         let embedder = self.get_embedder()?;
-        let mut produced =
-            embedder.embed_query_batch_with_producers(&[query.to_string()])?;
+        let mut produced = embedder.embed_query_batch_with_producers(&[query.to_string()])?;
         let vector = produced.vectors.pop().ok_or_else(|| {
             KinDbError::IndexError("query embedding returned empty result".to_string())
         })?;
@@ -6160,10 +6159,7 @@ impl InMemoryGraph {
         let persist_result = self
             .embed_stage_timings
             .time(crate::embed::EmbedStage::Persist, || {
-                vi.upsert_retrievable_batch_with_producers(
-                    embedded.items,
-                    &embedded.producers,
-                )
+                vi.upsert_retrievable_batch_with_producers(embedded.items, &embedded.producers)
             });
         if let Err(err) = persist_result {
             self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
@@ -6308,11 +6304,9 @@ impl InMemoryGraph {
             for (item_idx, ((_, key, _), vector)) in
                 chunk.iter().zip(produced.vectors.iter()).enumerate()
             {
-                if let Err(err) = vi.upsert_retrievable_with_producers(
-                    *key,
-                    vector,
-                    &produced.producers,
-                ) {
+                if let Err(err) =
+                    vi.upsert_retrievable_with_producers(*key, vector, &produced.producers)
+                {
                     let mut remaining_ids: Vec<ArtifactId> = chunk[item_idx..]
                         .iter()
                         .map(|(artifact_id, _, _)| *artifact_id)
@@ -6631,9 +6625,7 @@ impl InMemoryGraph {
             return;
         }
         let vector_index = self.vector_index.lock().clone();
-        let carried_producers = vector_index
-            .as_ref()
-            .map(|index| index.actual_producers());
+        let carried_producers = vector_index.as_ref().map(|index| index.actual_producers());
         let mut carried = 0usize;
         // Decide against the index first and take the queue lock once at the
         // end. Holding the queue across index calls would be the only place in
@@ -19026,8 +19018,7 @@ mod tests {
         let entity = test_entity("query_provenance", "src/query.rs");
         graph.upsert_entity(&entity).unwrap();
 
-        let index_producers =
-            EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        let index_producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
         let index = VectorIndex::new(2).unwrap();
         index
             .upsert_retrievable_with_producers(
@@ -19046,9 +19037,7 @@ mod tests {
         ));
         *graph.embedder.lock() = Some(embedder);
 
-        let single = graph
-            .semantic_search_with_producers("query", 1)
-            .unwrap();
+        let single = graph.semantic_search_with_producers("query", 1).unwrap();
         assert_eq!(single.matches[0].0, RetrievalKey::from(entity.id));
         assert_eq!(
             single.query_producers,

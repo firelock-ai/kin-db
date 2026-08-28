@@ -85,7 +85,11 @@ fn metal_oom_degrades_to_cpu_twin_and_returns_correct_vectors() {
         EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
         "the OOM retry must attest the CPU model that actually returned the vector"
     );
-    assert_eq!(degraded_batch.vectors.len(), 1, "expected exactly one vector");
+    assert_eq!(
+        degraded_batch.vectors.len(),
+        1,
+        "expected exactly one vector"
+    );
     let degraded = &degraded_batch.vectors[0];
 
     assert_eq!(

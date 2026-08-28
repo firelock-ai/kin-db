@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::engine::{InMemoryGraph, PersistenceEpoch};
 #[cfg(feature = "vector")]
 use crate::embed::EmbeddingProducerSet;
+use crate::engine::{InMemoryGraph, PersistenceEpoch};
 use crate::error::KinDbError;
+use crate::storage::backend::{Generation, GENERATION_INIT};
 #[cfg(feature = "vector")]
 use crate::storage::backend::{VectorArtifact, MAX_VECTOR_ARTIFACT_METADATA_BYTES};
-use crate::storage::backend::{Generation, GENERATION_INIT};
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
 use crate::storage::local_journal::{
@@ -1381,9 +1381,7 @@ fn run_vector_sidecar_before_attach_hook() {
 }
 
 #[cfg(feature = "vector")]
-fn read_vector_index_metadata_for_load(
-    path: &Path,
-) -> Result<VectorIndexMetadataRead, KinDbError> {
+fn read_vector_index_metadata_for_load(path: &Path) -> Result<VectorIndexMetadataRead, KinDbError> {
     if !path.exists() {
         return Ok(VectorIndexMetadataRead::Missing);
     }
@@ -1451,8 +1449,7 @@ fn validate_hosted_vector_producer_set(
         || (indexed > 0 && !producers.is_fully_attributed())
     {
         return Err(KinDbError::StorageError(
-            "hosted vector artifact contains non-attributable actual-producer evidence"
-                .to_string(),
+            "hosted vector artifact contains non-attributable actual-producer evidence".to_string(),
         ));
     }
     Ok(())
@@ -1470,16 +1467,16 @@ fn decode_hosted_vector_artifact_producers(
             metadata.graph_root_hash, expected_authority
         )));
     }
-    let (producers, index_binding_sha256) = match
-        crate::vector::VectorIndex::current_producer_binding_from_bytes(&artifact.index)?
-    {
-        Some(binding) => binding,
-        None => {
-            return Err(KinDbError::StorageError(
-                "hosted vector artifact index has no current actual-producer binding".to_string(),
-            ))
-        }
-    };
+    let (producers, index_binding_sha256) =
+        match crate::vector::VectorIndex::current_producer_binding_from_bytes(&artifact.index)? {
+            Some(binding) => binding,
+            None => {
+                return Err(KinDbError::StorageError(
+                    "hosted vector artifact index has no current actual-producer binding"
+                        .to_string(),
+                ))
+            }
+        };
     if metadata.actual_producers != producers {
         return Err(KinDbError::StorageError(format!(
             "hosted vector artifact metadata producers {:?} do not match index-bound producers {:?}",
@@ -1629,11 +1626,11 @@ fn write_vector_index_metadata(
             .create_new(true)
             .open(&tmp_path)
             .map_err(|err| {
-            KinDbError::StorageError(format!(
-                "failed to create vector index metadata temp {}: {err}",
-                tmp_path.display()
-            ))
-        })?;
+                KinDbError::StorageError(format!(
+                    "failed to create vector index metadata temp {}: {err}",
+                    tmp_path.display()
+                ))
+            })?;
         tmp.write_all(&encoded).map_err(|err| {
             KinDbError::StorageError(format!(
                 "failed to write vector index metadata {}: {err}",
@@ -7079,12 +7076,8 @@ mod tests {
         // Persist a valid candidate whose exact binding matches its v4
         // metadata. This is the detached index the loader will inspect.
         let candidate = VectorIndex::new(4).unwrap();
-        candidate
-            .upsert(first.id, &[0.0, 1.0, 0.0, 0.0])
-            .unwrap();
-        candidate
-            .upsert(second.id, &[1.0, 0.0, 0.0, 0.0])
-            .unwrap();
+        candidate.upsert(first.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        candidate.upsert(second.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         install_current_test_vector_index(graph.as_ref(), &candidate, &vector_path);
         mgr.save().unwrap();
         let metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
@@ -7092,12 +7085,8 @@ mod tests {
         // Keep a different sentinel index serving the live graph. A refusal
         // after detached validation must not replace this handle.
         let sentinel = VectorIndex::new(4).unwrap();
-        sentinel
-            .upsert(first.id, &[1.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        sentinel
-            .upsert(second.id, &[0.0, 1.0, 0.0, 0.0])
-            .unwrap();
+        sentinel.upsert(first.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        sentinel.upsert(second.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         install_current_test_vector_index(graph.as_ref(), &sentinel, &sentinel_path);
         let before = graph
             .search_loaded_vector_index_for_test(&[1.0, 0.0, 0.0, 0.0], 1)
@@ -7109,9 +7098,7 @@ mod tests {
         // ambient path after detached validation must be caught by the exact
         // binding recheck rather than attached or archived.
         let replacement = VectorIndex::new(4).unwrap();
-        replacement
-            .upsert(first.id, &[0.0, 0.0, 1.0, 0.0])
-            .unwrap();
+        replacement.upsert(first.id, &[0.0, 0.0, 1.0, 0.0]).unwrap();
         replacement
             .upsert(second.id, &[1.0, 0.0, 0.0, 0.0])
             .unwrap();
@@ -7175,18 +7162,14 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let old_index = VectorIndex::new(4).unwrap();
-        old_index
-            .upsert(entity.id, &[1.0, 0.0, 0.0, 0.0])
-            .unwrap();
+        old_index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         install_current_test_vector_index(graph.as_ref(), &old_index, &vector_path);
         mgr.save().unwrap();
         let old_bytes = std::fs::read(&vector_path).unwrap();
         let old_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
 
         let new_index = VectorIndex::new(4).unwrap();
-        new_index
-            .upsert(entity.id, &[0.0, 1.0, 0.0, 0.0])
-            .unwrap();
+        new_index.upsert(entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         install_current_test_vector_index(graph.as_ref(), &new_index, &vector_path);
         mgr.save().unwrap();
         let new_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
@@ -7194,7 +7177,10 @@ mod tests {
         assert_eq!(old_metadata.dimensions, new_metadata.dimensions);
         assert_eq!(old_metadata.indexed, new_metadata.indexed);
         assert_eq!(old_metadata.actual_producers, new_metadata.actual_producers);
-        assert_eq!(old_metadata.embedding_model_id, new_metadata.embedding_model_id);
+        assert_eq!(
+            old_metadata.embedding_model_id,
+            new_metadata.embedding_model_id
+        );
         assert_eq!(old_metadata.graph_root_hash, new_metadata.graph_root_hash);
         assert_ne!(
             old_metadata.index_binding_sha256, new_metadata.index_binding_sha256,
@@ -8202,7 +8188,10 @@ mod tests {
         value.as_object_mut().unwrap().remove("actual_producers");
         assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
         let mut value = serde_json::to_value(&metadata).unwrap();
-        value.as_object_mut().unwrap().remove("index_binding_sha256");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("index_binding_sha256");
         assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
         assert!(
             matches!(
@@ -8242,7 +8231,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&malformed).unwrap()).unwrap();
         let error = read_vector_index_metadata_for_load(&path)
             .expect_err("a malformed current version is corrupt, not legacy");
-        assert!(error.to_string().contains("missing or is not an unsigned integer"));
+        assert!(error
+            .to_string()
+            .contains("missing or is not an unsigned integer"));
     }
 
     #[test]
@@ -8287,8 +8278,7 @@ mod tests {
             ),
         ];
         for (indexed, producers) in cases {
-            let mut metadata =
-                current_vector_metadata([1u8; 32], 4, indexed, "sha256-aabbcc");
+            let mut metadata = current_vector_metadata([1u8; 32], 4, indexed, "sha256-aabbcc");
             metadata.actual_producers = producers.clone();
             let decoded = decode_vector_index_metadata(
                 &serde_json::to_vec(&metadata).unwrap(),
@@ -8299,8 +8289,7 @@ mod tests {
             assert_eq!(decoded.indexed, indexed);
         }
 
-        let mut empty_nonempty =
-            current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc");
+        let mut empty_nonempty = current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc");
         empty_nonempty.actual_producers = EmbeddingProducerSet::new();
         assert!(decode_vector_index_metadata(
             &serde_json::to_vec(&empty_nonempty).unwrap(),
@@ -8308,13 +8297,9 @@ mod tests {
         )
         .is_err());
 
-        let mut unknown = serde_json::to_value(current_vector_metadata(
-            [1u8; 32],
-            4,
-            1,
-            "sha256-aabbcc",
-        ))
-        .unwrap();
+        let mut unknown =
+            serde_json::to_value(current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc"))
+                .unwrap();
         unknown["actual_producers"] = serde_json::json!(["future_accelerator"]);
         assert!(decode_vector_index_metadata(
             &serde_json::to_vec(&unknown).unwrap(),
@@ -8326,8 +8311,7 @@ mod tests {
     #[test]
     #[cfg(feature = "vector")]
     fn hosted_policy_rejects_unspecified_even_for_an_empty_index() {
-        let unspecified =
-            EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Unspecified);
+        let unspecified = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Unspecified);
         assert!(validate_hosted_vector_producer_set(0, &unspecified).is_err());
         assert!(validate_hosted_vector_producer_set(1, &unspecified).is_err());
         assert!(validate_hosted_vector_producer_set(0, &EmbeddingProducerSet::new()).is_ok());
@@ -8365,10 +8349,9 @@ mod tests {
         old_index.set_descriptor(descriptor.clone());
         old_index.save(&vector_path).unwrap();
         let old_bytes = std::fs::read(&vector_path).unwrap();
-        let (_, old_binding) =
-            VectorIndex::current_producer_binding_from_bytes(&old_bytes)
-                .unwrap()
-                .unwrap();
+        let (_, old_binding) = VectorIndex::current_producer_binding_from_bytes(&old_bytes)
+            .unwrap()
+            .unwrap();
 
         let new_index = VectorIndex::new(4).unwrap();
         new_index
@@ -8393,7 +8376,10 @@ mod tests {
             "the old final index must remain when metadata durability is unproven"
         );
         let written_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
-        assert_ne!(written_metadata.index_binding_sha256, hex::encode(old_binding));
+        assert_ne!(
+            written_metadata.index_binding_sha256,
+            hex::encode(old_binding)
+        );
         let stranded: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -8483,7 +8469,9 @@ mod tests {
         mismatched.metadata = serde_json::to_vec(&mismatched_metadata).unwrap();
         let mismatch_error = validate_hosted_vector_artifact_inner(&mismatched, 4, 2)
             .expect_err("metadata producer evidence must equal the index trailer exactly");
-        assert!(mismatch_error.to_string().contains("do not match index-bound"));
+        assert!(mismatch_error
+            .to_string()
+            .contains("do not match index-bound"));
 
         let mut wrong_binding_metadata = metadata.clone();
         wrong_binding_metadata.index_binding_sha256 = hex::encode([7u8; 32]);
@@ -8537,10 +8525,9 @@ mod tests {
             .unwrap();
         mixed_index.save(&mixed_path).unwrap();
         let mixed_bytes = std::fs::read(&mixed_path).unwrap();
-        let (_, mixed_binding) =
-            VectorIndex::current_producer_binding_from_bytes(&mixed_bytes)
-                .unwrap()
-                .unwrap();
+        let (_, mixed_binding) = VectorIndex::current_producer_binding_from_bytes(&mixed_bytes)
+            .unwrap()
+            .unwrap();
         let mut mixed_metadata = current_vector_metadata(root, 4, 2, "mixed-hosted");
         mixed_metadata.actual_producers = mixed.clone();
         mixed_metadata.index_binding_sha256 = hex::encode(mixed_binding);
@@ -8554,14 +8541,12 @@ mod tests {
             metadata: serde_json::to_vec(&mixed_metadata).unwrap(),
             index: mixed_bytes,
         };
-        let mixed_error = validate_hosted_vector_artifact_inner_for_producers(
-            &mixed_artifact,
-            4,
-            2,
-            &cpu,
-        )
-        .expect_err("CPU-only policy must reject a mixed CPU/Metal index");
-        assert!(mixed_error.to_string().contains("outside the permitted set"));
+        let mixed_error =
+            validate_hosted_vector_artifact_inner_for_producers(&mixed_artifact, 4, 2, &cpu)
+                .expect_err("CPU-only policy must reject a mixed CPU/Metal index");
+        assert!(mixed_error
+            .to_string()
+            .contains("outside the permitted set"));
 
         let mut cpu_metadata = mixed_metadata.clone();
         cpu_metadata.actual_producers = cpu.clone();
@@ -8580,8 +8565,7 @@ mod tests {
             VectorIndex::current_producer_binding_from_bytes(&unspecified_bytes)
                 .unwrap()
                 .unwrap();
-        let mut unspecified_metadata =
-            current_vector_metadata(root, 4, 1, "unspecified-hosted");
+        let mut unspecified_metadata = current_vector_metadata(root, 4, 1, "unspecified-hosted");
         unspecified_metadata.index_binding_sha256 = hex::encode(unspecified_binding);
         let unspecified_artifact = VectorArtifact {
             binding: mixed_artifact.binding.clone(),
@@ -8601,7 +8585,9 @@ mod tests {
         legacy.index = raw_base.clone();
         let legacy_error = read_hosted_vector_artifact_actual_producers(&legacy)
             .expect_err("exact raw v2 bytes carry only unknown legacy evidence");
-        assert!(legacy_error.to_string().contains("no current actual-producer binding"));
+        assert!(legacy_error
+            .to_string()
+            .contains("no current actual-producer binding"));
 
         let mut incompatible = legacy;
         incompatible.index = raw_base;
