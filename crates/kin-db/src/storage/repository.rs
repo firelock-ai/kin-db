@@ -13300,6 +13300,283 @@ mod tests {
         );
     }
 
+    /// One ref publication both receivers apply identically, differing only in
+    /// the receiver-local operation id and actor.
+    ///
+    /// `receiver_ref_transaction` cannot be reused on a framed store, because
+    /// `framed_local_repository` bootstraps `refs/heads/main` and the default ref
+    /// already, and that fixture opens both with `MustNotExist`. This one moves a
+    /// branch neither bootstrap created, so the two stores land on equal
+    /// replicated truth with different `ref_log` roots: the two-manager transfer
+    /// shape, on a backend that writes frames.
+    fn mirrored_ref_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        actor: &str,
+    ) -> RepositoryTransaction {
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.actor = AuthorId::new(actor);
+        transaction.reason = "apply equivalent transferred ref authority".to_string();
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"transfer-mirror").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::symbolic(RefName::branch(b"main").unwrap())),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction
+    }
+
+    /// Two receivers commit, drop and reopen, and exact CAS, frame and freeze
+    /// identity survives the round trip.
+    ///
+    /// `equivalent_receivers_reopen_with_the_same_replicated_truth` above proves
+    /// the receipt and snapshot halves of that claim, but it runs on a backend
+    /// that cannot write a frame at all: `MemoryBackend` never overrides
+    /// `supports_authority_frames`, so it takes the trait default `false`,
+    /// `frame_is_candidate` refuses every frame, and each publication there is a
+    /// full snapshot. A frame assertion added to that test would assert nothing.
+    /// This one runs the same two-manager shape on `LocalFileBackend`, which does
+    /// append frames, and covers the three identities that test leaves open.
+    ///
+    /// Every arm separates exact bundle equality from
+    /// `RootBundle::has_same_replicated_truth`, which excludes `generation`,
+    /// `ref_log` and `local_state`. Handing a guard the *other* receiver's bundle
+    /// is the one input that tells those two predicates apart: replicated truth is
+    /// equal, the exact bundle is not, and a guard weakened to replicated truth
+    /// would accept what an exact guard refuses.
+    #[test]
+    fn two_receivers_reopen_with_exact_cas_frame_and_freeze_identity() {
+        let source_directory = TempDir::new().unwrap();
+        let receiver_directory = TempDir::new().unwrap();
+        let (_source_backend, source) = framed_local_repository(&source_directory);
+        let (_receiver_backend, receiver) = framed_local_repository(&receiver_directory);
+
+        // Both bootstraps are full snapshots, so every frame counted below
+        // belongs to the two-manager commit itself.
+        assert_eq!(record_version(&source_directory), 3);
+        assert_eq!(record_version(&receiver_directory), 3);
+        assert_eq!(acknowledged_frame_count(&source_directory), 0);
+        assert_eq!(acknowledged_frame_count(&receiver_directory), 0);
+
+        source
+            .commit_repository_transaction(mirrored_ref_transaction(
+                &source,
+                0xfb01,
+                "framed-transfer-source-receiver",
+            ))
+            .unwrap();
+        receiver
+            .commit_repository_transaction(mirrored_ref_transaction(
+                &receiver,
+                0xfb02,
+                "framed-transfer-destination-receiver",
+            ))
+            .unwrap();
+
+        // FRAME identity before the drop: each receiver's two-manager commit was
+        // carried by an acknowledged frame rather than by a fresh full snapshot.
+        assert_eq!(
+            record_version(&source_directory),
+            4,
+            "the source two-manager commit must publish as a frame journal record"
+        );
+        assert_eq!(
+            record_version(&receiver_directory),
+            4,
+            "the receiver two-manager commit must publish as a frame journal record"
+        );
+        assert_eq!(
+            acknowledged_frame_count(&source_directory),
+            1,
+            "the source two-manager commit must acknowledge exactly one authority frame"
+        );
+        assert_eq!(
+            acknowledged_frame_count(&receiver_directory),
+            1,
+            "the receiver two-manager commit must acknowledge exactly one authority frame"
+        );
+
+        let source_roots = source.read_authority().roots().clone();
+        let receiver_roots = receiver.read_authority().roots().clone();
+        assert!(
+            source_roots.has_same_replicated_truth(&receiver_roots),
+            "the two framed receivers must hold the same replicated truth"
+        );
+        assert_ne!(
+            source_roots, receiver_roots,
+            "the two framed receivers must differ in exact receiver-local identity"
+        );
+        assert_ne!(
+            source_roots.ref_log, receiver_roots.ref_log,
+            "the receiver-local ref_log root is what makes the two bundles differ"
+        );
+
+        drop(source);
+        drop(receiver);
+        let reopened_source = reopen(&source_directory);
+        let reopened_receiver = reopen(&receiver_directory);
+
+        // FRAME identity after the reopen: replaying the frame reconstructs the
+        // exact pre-drop bundle, receiver-local roots included, rather than some
+        // other bundle carrying the same replicated truth.
+        assert_eq!(
+            reopened_source.read_authority().roots(),
+            &source_roots,
+            "the source frame must reopen to its exact pre-drop root bundle"
+        );
+        assert_eq!(
+            reopened_receiver.read_authority().roots(),
+            &receiver_roots,
+            "the receiver frame must reopen to its exact pre-drop root bundle"
+        );
+
+        // Each CAS arm carries a mutation a fresh commit would accept, so the
+        // compare-and-swap is the only ground on which it can be refused. A
+        // mutation-free shell is refused by `validate` first, which would keep
+        // both arms red no matter what the CAS guard did.
+        //
+        // CAS identity, arm one: the other receiver's bundle carries equal
+        // replicated truth and a different ref_log, and its `generation` matches,
+        // so only the exact root-bundle half of the compare-and-swap can refuse
+        // it. A CAS weakened to replicated truth would admit this transaction.
+        let mut cross_receiver = transaction_shell(&reopened_receiver, 0xfb03);
+        cross_receiver.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"cas-probe-cross").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::symbolic(RefName::branch(b"main").unwrap())),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        cross_receiver.expected_roots = source_roots.clone();
+        assert_eq!(
+            cross_receiver.expected_generation, source_roots.generation,
+            "arm one must leave the generation half of the compare-and-swap satisfied"
+        );
+        let error = reopened_receiver
+            .commit_repository_transaction(cross_receiver)
+            .expect_err("exact CAS must refuse another receiver's equally-replicated root bundle");
+        assert!(
+            error
+                .to_string()
+                .contains("authority moved from expected generation/root bundle"),
+            "unexpected cross-receiver CAS error: {error}"
+        );
+
+        // CAS identity, arm two: a stale generation, moved in both fields at
+        // once, which is the only stale-generation shape a transaction can carry.
+        //
+        // The generation half of that guard cannot be isolated, and saying so is
+        // part of the proof. `RepositoryTransaction::validate` refuses any
+        // transaction whose `expected_generation` disagrees with
+        // `expected_roots.generation`, and `RepositoryAuthorityState::generation`
+        // returns `metadata().roots.generation`, the same field `roots()` exposes.
+        // So whenever the generation half trips, the two bundles differ in that
+        // field and the root-bundle half trips with it. Arm two therefore proves
+        // a stale generation is refused; it does not claim to isolate the half of
+        // the condition that refuses it.
+        let mut stale_generation = transaction_shell(&reopened_receiver, 0xfb04);
+        stale_generation.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"cas-probe-generation").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::symbolic(RefName::branch(b"main").unwrap())),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        stale_generation.expected_generation += 1;
+        stale_generation.expected_roots.generation += 1;
+        let error = reopened_receiver
+            .commit_repository_transaction(stale_generation)
+            .expect_err("exact CAS must refuse a stale expected generation");
+        assert!(
+            error
+                .to_string()
+                .contains("authority moved from expected generation/root bundle"),
+            "unexpected stale-generation CAS error: {error}"
+        );
+
+        // CAS identity, arm three: the inconsistent pair arm two cannot use. This
+        // is the guard that makes the generation half unreachable on its own, so
+        // pinning its message here keeps arm two's comment honest: if this ever
+        // stops refusing, arm two's reasoning changes and a caller can present a
+        // stale generation beside an exact root bundle.
+        let mut inconsistent_pair = transaction_shell(&reopened_receiver, 0xfb06);
+        inconsistent_pair.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"cas-probe-inconsistent").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::symbolic(RefName::branch(b"main").unwrap())),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        inconsistent_pair.expected_generation += 1;
+        assert_eq!(
+            inconsistent_pair.expected_roots, receiver_roots,
+            "arm three leaves the root bundle exact and moves only the scalar"
+        );
+        let error = reopened_receiver
+            .commit_repository_transaction(inconsistent_pair)
+            .expect_err("a transaction must not carry a generation its root bundle contradicts");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match root bundle generation"),
+            "unexpected inconsistent-pair error: {error}"
+        );
+
+        assert_eq!(
+            reopened_receiver.read_authority().roots(),
+            &receiver_roots,
+            "no refused compare-and-swap may publish anything"
+        );
+
+        // FREEZE identity: the reopened receiver freezes on its own exact bundle
+        // and refuses the other receiver's, which differs only in receiver-local
+        // roots. The guard is dropped before anything else touches the store,
+        // because it holds the per-repository lock.
+        let frozen = reopened_receiver
+            .freeze_current_authority(&receiver_roots)
+            .expect("the reopened receiver must freeze on its own exact root bundle");
+        assert_eq!(
+            frozen.roots(),
+            &receiver_roots,
+            "the freeze must reload the receiver's exact root bundle"
+        );
+        drop(frozen);
+
+        let error = reopened_receiver
+            .freeze_current_authority(&source_roots)
+            .expect_err(
+                "exact freeze must refuse another receiver's equally-replicated root bundle",
+            );
+        assert!(
+            error
+                .to_string()
+                .contains("published authority moved from the expected root bundle"),
+            "unexpected cross-receiver freeze error: {error}"
+        );
+
+        // Control: the reopened receiver still commits, and still frames, when
+        // nothing is perturbed. Without this the three refusals above would also
+        // be satisfied by a manager that had simply stopped working.
+        reopened_receiver
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        reopened_receiver
+            .commit_repository_transaction(overlay_publication(&reopened_receiver, 0xfb05, 0x5b))
+            .expect("an unperturbed transaction must still commit after the reopen");
+        assert_eq!(
+            acknowledged_frame_count(&receiver_directory),
+            2,
+            "the post-reopen control commit must acknowledge a second authority frame"
+        );
+        let advanced_roots = reopened_receiver.read_authority().roots().clone();
+        assert_ne!(
+            advanced_roots, receiver_roots,
+            "the control commit must actually move the receiver's root bundle"
+        );
+        assert_eq!(
+            reopen(&receiver_directory).read_authority().roots(),
+            &advanced_roots,
+            "the second frame must reopen to its exact root bundle too"
+        );
+    }
+
     #[test]
     fn local_only_operations_do_not_perturb_replicated_roots() {
         let backend_a = Arc::new(MemoryBackend::default());
