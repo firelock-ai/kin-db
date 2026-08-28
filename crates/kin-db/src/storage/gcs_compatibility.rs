@@ -109,145 +109,366 @@ mod tests {
     #[test]
     fn gcs_codec_has_one_public_version_authority() {
         let source = include_str!("gcs.rs");
+        let sanitized = sanitize_rust_source(source).unwrap();
+        let production_end = production_end(&sanitized.code).unwrap();
+        let production_code = &sanitized.code[..production_end];
+        let writer_range = function_body_range(
+            production_code,
+            "fn encode_full_snapshot_authority(",
+        )
+        .unwrap();
+        let retained_writer = compact_rust_code(&production_code[writer_range]);
+        assert!(
+            retained_writer.contains("letmutencoded=Vec::with_capacity")
+                && retained_writer
+                    .contains("encoded.extend_from_slice(&full_authority_envelope_magic("),
+            "the lexical scan must retain the actual encoder body"
+        );
         assert_codec_source_is_bound(source).unwrap();
 
+        let writer_binding = concat!(
+            "full_authority_envelope_magic(",
+            "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,",
+            ")"
+        );
         let copied_writer = source.replacen(
             "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,",
             "2,",
             1,
         );
-        let copied_writer_with_comment_decoy = copied_writer.replacen(
-            "#[cfg(test)]",
-            "// GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,\n#[cfg(test)]",
-            1,
-        );
-        assert!(assert_codec_source_is_bound(&copied_writer_with_comment_decoy).is_err());
-        let copied_writer_with_block_comment_decoy = copied_writer.replacen(
-            "#[cfg(test)]",
-            "/* GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version, */\n#[cfg(test)]",
-            1,
-        );
-        assert!(assert_codec_source_is_bound(&copied_writer_with_block_comment_decoy).is_err());
+        for (class, decoy) in [
+            ("line comment", format!("// {writer_binding}")),
+            ("nested block comment", format!("/* outer /* {writer_binding} */ outer */")),
+            (
+                "ordinary string",
+                format!("const WRITER_DECOY: &str = \"{writer_binding}\";"),
+            ),
+            (
+                "raw string",
+                format!("const WRITER_RAW_DECOY: &str = r#\"{writer_binding}\"#;"),
+            ),
+            (
+                "unrelated dead function",
+                format!("fn unrelated_writer_decoy() {{ let _ = {writer_binding}; }}"),
+            ),
+        ] {
+            let poisoned = insert_before_test_module(&copied_writer, &decoy);
+            assert!(
+                assert_codec_source_is_bound(&poisoned).is_err(),
+                "accepted a copied writer hidden by a {class} decoy"
+            );
+        }
 
+        let reader_binding = "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)";
         let copied_reader = source.replacen(
-            "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)",
+            reader_binding,
             "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(2)",
             1,
         );
-        let copied_reader_with_comment_decoy = copied_reader.replacen(
-            "#[cfg(test)]",
-            "// GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)\n#[cfg(test)]",
-            1,
-        );
-        assert!(assert_codec_source_is_bound(&copied_reader_with_comment_decoy).is_err());
-        let copied_reader_with_block_comment_decoy = copied_reader.replacen(
-            "#[cfg(test)]",
-            "/* GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version) */\n#[cfg(test)]",
-            1,
-        );
-        assert!(assert_codec_source_is_bound(&copied_reader_with_block_comment_decoy).is_err());
+        for (class, decoy) in [
+            ("line comment", format!("// {reader_binding}")),
+            ("nested block comment", format!("/* outer /* {reader_binding} */ outer */")),
+            (
+                "ordinary string",
+                format!("const READER_DECOY: &str = \"{reader_binding}\";"),
+            ),
+            (
+                "raw string",
+                format!("const READER_RAW_DECOY: &str = r#\"{reader_binding}\"#;"),
+            ),
+            (
+                "unrelated dead function",
+                format!(
+                    "fn unrelated_reader_decoy(version: u32) {{ let _ = {reader_binding}; }}"
+                ),
+            ),
+        ] {
+            let poisoned = insert_before_test_module(&copied_reader, &decoy);
+            assert!(
+                assert_codec_source_is_bound(&poisoned).is_err(),
+                "accepted a copied reader hidden by a {class} decoy"
+            );
+        }
+
+        for (class, decoy) in [
+            (
+                "ordinary string",
+                "const TEST_MARKER_DECOY: &str = \"#[cfg(test)]\";",
+            ),
+            (
+                "nested block comment",
+                "/* outer /* #[cfg(test)] */ outer */",
+            ),
+        ] {
+            let source_with_early_marker = source.replacen(
+                "impl GcsBackend {",
+                &format!("{decoy}\nimpl GcsBackend {{"),
+                1,
+            );
+            assert_codec_source_is_bound(&source_with_early_marker)
+                .unwrap_or_else(|error| panic!("{class} test-marker decoy changed the scan: {error}"));
+        }
+    }
+
+    fn insert_before_test_module(source: &str, decoy: &str) -> String {
+        source.replacen("#[cfg(test)]", &format!("{decoy}\n#[cfg(test)]"), 1)
     }
 
     fn assert_codec_source_is_bound(source: &str) -> Result<(), String> {
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the production source precedes its test module");
-        let uncommented = strip_rust_comments(production)?;
-        let compact = uncommented
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
+        let sanitized = sanitize_rust_source(source)?;
+        let production_end = production_end(&sanitized.code)?;
+        let production_code = &sanitized.code[..production_end];
+        let production_uncommented = &sanitized.uncommented[..production_end];
 
-        if compact.contains("KNGCSF02") {
+        if production_uncommented.contains("KNGCSF02") {
             return Err("production GCS codec restored a hard-coded current magic".to_string());
         }
-        let writer = concat!(
+        let writer_binding = concat!(
             "full_authority_envelope_magic(",
             "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,",
             ")"
         );
-        if compact.matches(writer).count() != 1 {
+        let writer_range = function_body_range(
+            production_code,
+            "fn encode_full_snapshot_authority(",
+        )?;
+        let writer_body = compact_rust_code(&production_code[writer_range]);
+        if writer_body.matches("full_authority_envelope_magic(").count() != 1
+            || writer_body.matches(writer_binding).count() != 1
+        {
             return Err(
-                "writer is not bound exactly once to the public current version".to_string(),
+                "the live writer is not bound exactly once to the public current version"
+                    .to_string(),
             );
         }
-        let reader = "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)";
-        if compact.matches(reader).count() != 1 {
-            return Err("reader is not bound exactly once to the public range".to_string());
+        let reader_binding = "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)";
+        let reader_range = function_body_range(
+            production_code,
+            "fn decode_full_snapshot_authority(",
+        )?;
+        let reader_body = compact_rust_code(&production_code[reader_range]);
+        if reader_body
+            .matches("GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(")
+            .count()
+            != 1
+            || reader_body.matches(reader_binding).count() != 1
+        {
+            return Err(
+                "the live reader is not bound exactly once to the public range".to_string(),
+            );
         }
         Ok(())
     }
 
-    fn strip_rust_comments(source: &str) -> Result<String, String> {
-        let mut characters = source.chars().peekable();
-        let mut uncommented = String::with_capacity(source.len());
+    fn production_end(source: &str) -> Result<usize, String> {
+        let test_module = "pub(crate) mod tests";
+        if source.matches(test_module).count() != 1 {
+            return Err("GCS codec must contain exactly one production test module boundary".into());
+        }
+        Ok(source
+            .find(test_module)
+            .expect("the exact test module boundary was counted once"))
+    }
 
-        while let Some(character) = characters.next() {
-            if character == '"' {
-                uncommented.push(character);
-                let mut escaped = false;
-                let mut closed = false;
-                for string_character in characters.by_ref() {
-                    uncommented.push(string_character);
-                    if escaped {
-                        escaped = false;
-                    } else if string_character == '\\' {
-                        escaped = true;
-                    } else if string_character == '"' {
-                        closed = true;
-                        break;
+    fn compact_rust_code(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    fn function_body_range(
+        source: &str,
+        signature: &str,
+    ) -> Result<std::ops::Range<usize>, String> {
+        if source.matches(signature).count() != 1 {
+            return Err(format!(
+                "GCS codec must contain exactly one {signature} definition"
+            ));
+        }
+        let signature_start = source
+            .find(signature)
+            .expect("the exact function signature was counted once");
+        let body_start = signature_start
+            + source[signature_start..]
+                .find('{')
+                .ok_or_else(|| format!("{signature} has no function body"))?;
+        let mut depth = 0_usize;
+        for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        return Err(format!("{signature} has an unmatched closing brace"));
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(body_start..body_start + offset + 1);
                     }
                 }
-                if !closed {
-                    return Err("unterminated string while inspecting GCS codec source".to_string());
-                }
-                continue;
-            }
-
-            if character != '/' {
-                uncommented.push(character);
-                continue;
-            }
-
-            match characters.peek().copied() {
-                Some('/') => {
-                    characters.next();
-                    for comment_character in characters.by_ref() {
-                        if comment_character == '\n' {
-                            uncommented.push('\n');
-                            break;
-                        }
-                    }
-                }
-                Some('*') => {
-                    characters.next();
-                    let mut depth = 1_u32;
-                    while depth > 0 {
-                        let Some(comment_character) = characters.next() else {
-                            return Err(
-                                "unterminated block comment while inspecting GCS codec source"
-                                    .to_string(),
-                            );
-                        };
-                        match (comment_character, characters.peek().copied()) {
-                            ('/', Some('*')) => {
-                                characters.next();
-                                depth += 1;
-                            }
-                            ('*', Some('/')) => {
-                                characters.next();
-                                depth -= 1;
-                            }
-                            ('\n', _) => uncommented.push('\n'),
-                            _ => {}
-                        }
-                    }
-                }
-                _ => uncommented.push(character),
+                _ => {}
             }
         }
+        Err(format!("{signature} has an unterminated function body"))
+    }
 
-        Ok(uncommented)
+    struct SanitizedRustSource {
+        uncommented: String,
+        code: String,
+    }
+
+    fn sanitize_rust_source(source: &str) -> Result<SanitizedRustSource, String> {
+        let bytes = source.as_bytes();
+        let mut uncommented = bytes.to_vec();
+        let mut code = bytes.to_vec();
+        let mut index = 0_usize;
+
+        while index < bytes.len() {
+            if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'/' {
+                let start = index;
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                blank_non_newlines(&mut uncommented, start..index);
+                blank_non_newlines(&mut code, start..index);
+                continue;
+            }
+
+            if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+                let start = index;
+                index += 2;
+                let mut depth = 1_usize;
+                while depth > 0 {
+                    if index + 1 >= bytes.len() {
+                        return Err(
+                            "unterminated block comment while inspecting GCS codec source"
+                                .to_string(),
+                        );
+                    }
+                    if bytes[index] == b'/' && bytes[index + 1] == b'*' {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+                blank_non_newlines(&mut uncommented, start..index);
+                blank_non_newlines(&mut code, start..index);
+                continue;
+            }
+
+            if let Some((opening_quote, hash_count)) = raw_string_open(bytes, index) {
+                let mut closing_quote = opening_quote + 1;
+                let closing_quote = loop {
+                    if closing_quote >= bytes.len() {
+                        return Err(
+                            "unterminated raw string while inspecting GCS codec source".to_string(),
+                        );
+                    }
+                    let closes = bytes[closing_quote] == b'"'
+                        && closing_quote + 1 + hash_count <= bytes.len()
+                        && bytes[closing_quote + 1..closing_quote + 1 + hash_count]
+                            .iter()
+                            .all(|byte| *byte == b'#');
+                    if closes {
+                        break closing_quote;
+                    }
+                    closing_quote += 1;
+                };
+                blank_non_newlines(&mut code, opening_quote + 1..closing_quote);
+                index = closing_quote + 1 + hash_count;
+                continue;
+            }
+
+            if bytes[index] == b'"' {
+                let opening_quote = index;
+                index += 1;
+                let closing_quote = loop {
+                    if index >= bytes.len() {
+                        return Err(
+                            "unterminated string while inspecting GCS codec source".to_string(),
+                        );
+                    }
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        break index;
+                    } else {
+                        index += 1;
+                    }
+                };
+                blank_non_newlines(&mut code, opening_quote + 1..closing_quote);
+                index = closing_quote + 1;
+                continue;
+            }
+
+            if bytes[index] == b'\'' {
+                if let Some(closing_quote) = char_literal_end(source, index) {
+                    blank_non_newlines(&mut code, index + 1..closing_quote);
+                    index = closing_quote + 1;
+                    continue;
+                }
+            }
+
+            index += 1;
+        }
+
+        let uncommented = String::from_utf8(uncommented)
+            .map_err(|error| format!("comment sanitizer produced invalid UTF-8: {error}"))?;
+        let code = String::from_utf8(code)
+            .map_err(|error| format!("string sanitizer produced invalid UTF-8: {error}"))?;
+        Ok(SanitizedRustSource { uncommented, code })
+    }
+
+    fn raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+        let mut cursor = match *bytes.get(start)? {
+            b'r' => start + 1,
+            b'b' | b'c' if bytes.get(start + 1) == Some(&b'r') => start + 2,
+            _ => return None,
+        };
+        let hash_start = cursor;
+        while bytes.get(cursor) == Some(&b'#') {
+            cursor += 1;
+        }
+        (bytes.get(cursor) == Some(&b'"')).then_some((cursor, cursor - hash_start))
+    }
+
+    fn char_literal_end(source: &str, start: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let mut cursor = start + 1;
+        if bytes.get(cursor) == Some(&b'\\') {
+            cursor += 1;
+            match *bytes.get(cursor)? {
+                b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                    cursor += 2;
+                    while bytes.get(cursor) != Some(&b'}') {
+                        cursor += 1;
+                        bytes.get(cursor)?;
+                    }
+                    cursor += 1;
+                }
+                b'x' => cursor += 3,
+                _ => cursor += 1,
+            }
+        } else {
+            let character = source.get(cursor..)?.chars().next()?;
+            if matches!(character, '\n' | '\r' | '\'') {
+                return None;
+            }
+            cursor += character.len_utf8();
+        }
+        (bytes.get(cursor) == Some(&b'\'')).then_some(cursor)
+    }
+
+    fn blank_non_newlines(bytes: &mut [u8], range: std::ops::Range<usize>) {
+        for byte in &mut bytes[range] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
     }
 }
