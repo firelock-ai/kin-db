@@ -112,11 +112,8 @@ mod tests {
         let sanitized = sanitize_rust_source(source).unwrap();
         let production_end = production_end(&sanitized.code).unwrap();
         let production_code = &sanitized.code[..production_end];
-        let writer_range = function_body_range(
-            production_code,
-            "fn encode_full_snapshot_authority(",
-        )
-        .unwrap();
+        let writer_range =
+            function_body_range(production_code, "fn encode_full_snapshot_authority(").unwrap();
         let retained_writer = compact_rust_code(&production_code[writer_range]);
         assert!(
             retained_writer.contains("letmutencoded=Vec::with_capacity")
@@ -138,7 +135,10 @@ mod tests {
         );
         for (class, decoy) in [
             ("line comment", format!("// {writer_binding}")),
-            ("nested block comment", format!("/* outer /* {writer_binding} */ outer */")),
+            (
+                "nested block comment",
+                format!("/* outer /* {writer_binding} */ outer */"),
+            ),
             (
                 "ordinary string",
                 format!("const WRITER_DECOY: &str = \"{writer_binding}\";"),
@@ -167,7 +167,10 @@ mod tests {
         );
         for (class, decoy) in [
             ("line comment", format!("// {reader_binding}")),
-            ("nested block comment", format!("/* outer /* {reader_binding} */ outer */")),
+            (
+                "nested block comment",
+                format!("/* outer /* {reader_binding} */ outer */"),
+            ),
             (
                 "ordinary string",
                 format!("const READER_DECOY: &str = \"{reader_binding}\";"),
@@ -178,9 +181,7 @@ mod tests {
             ),
             (
                 "unrelated dead function",
-                format!(
-                    "fn unrelated_reader_decoy(version: u32) {{ let _ = {reader_binding}; }}"
-                ),
+                format!("fn unrelated_reader_decoy(version: u32) {{ let _ = {reader_binding}; }}"),
             ),
         ] {
             let poisoned = insert_before_test_module(&copied_reader, &decoy);
@@ -205,8 +206,9 @@ mod tests {
                 &format!("{decoy}\nimpl GcsBackend {{"),
                 1,
             );
-            assert_codec_source_is_bound(&source_with_early_marker)
-                .unwrap_or_else(|error| panic!("{class} test-marker decoy changed the scan: {error}"));
+            assert_codec_source_is_bound(&source_with_early_marker).unwrap_or_else(|error| {
+                panic!("{class} test-marker decoy changed the scan: {error}")
+            });
         }
     }
 
@@ -228,12 +230,13 @@ mod tests {
             "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,",
             ")"
         );
-        let writer_range = function_body_range(
-            production_code,
-            "fn encode_full_snapshot_authority(",
-        )?;
+        let writer_range =
+            function_body_range(production_code, "fn encode_full_snapshot_authority(")?;
         let writer_body = compact_rust_code(&production_code[writer_range]);
-        if writer_body.matches("full_authority_envelope_magic(").count() != 1
+        if writer_body
+            .matches("full_authority_envelope_magic(")
+            .count()
+            != 1
             || writer_body.matches(writer_binding).count() != 1
         {
             return Err(
@@ -242,10 +245,8 @@ mod tests {
             );
         }
         let reader_binding = "GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version)";
-        let reader_range = function_body_range(
-            production_code,
-            "fn decode_full_snapshot_authority(",
-        )?;
+        let reader_range =
+            function_body_range(production_code, "fn decode_full_snapshot_authority(")?;
         let reader_body = compact_rust_code(&production_code[reader_range]);
         if reader_body
             .matches("GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(")
@@ -263,7 +264,9 @@ mod tests {
     fn production_end(source: &str) -> Result<usize, String> {
         let test_module = "pub(crate) mod tests";
         if source.matches(test_module).count() != 1 {
-            return Err("GCS codec must contain exactly one production test module boundary".into());
+            return Err(
+                "GCS codec must contain exactly one production test module boundary".into(),
+            );
         }
         Ok(source
             .find(test_module)
@@ -366,7 +369,7 @@ mod tests {
                 let closing_quote = loop {
                     if closing_quote >= bytes.len() {
                         return Err(
-                            "unterminated raw string while inspecting GCS codec source".to_string(),
+                            "unterminated raw string while inspecting GCS codec source".to_string()
                         );
                     }
                     let closes = bytes[closing_quote] == b'"'
@@ -390,7 +393,7 @@ mod tests {
                 let closing_quote = loop {
                     if index >= bytes.len() {
                         return Err(
-                            "unterminated string while inspecting GCS codec source".to_string(),
+                            "unterminated string while inspecting GCS codec source".to_string()
                         );
                     }
                     if bytes[index] == b'\\' {
