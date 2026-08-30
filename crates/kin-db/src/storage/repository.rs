@@ -4818,10 +4818,18 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 // `ResolvedAdmissionMatcher::compile(overlay.case, rule_sets)`
                 // where `rule_sets` includes the SHARED sources, so the case
                 // decides how the repository's own policy matches every path.
-                // It is carried from the publisher rather than chosen here, and
-                // there is no safe default to choose: folding makes exclusion
-                // rules match more paths but makes their negations match more
-                // too, so neither case is uniformly stricter.
+                //
+                // The RECEIVER supplies it, and it is its own: every other
+                // admission decision this replica makes already runs under that
+                // case, and a transfer deciding differently would leave one
+                // store enforcing two rules depending on whether content
+                // arrived locally or over the wire. There is no safe default to
+                // pick on its behalf either, because folding makes exclusion
+                // rules match more paths AND makes their negations match more,
+                // so neither case is uniformly stricter; the test
+                // `a_negation_makes_folding_permissive_where_the_tidy_story_says_strict`
+                // is that pair.
+                //
                 // Required exactly when it can change an answer, which is when
                 // the shared policy has sources for the matcher to compile.
                 let case = match (case, policy.sources.is_empty()) {
@@ -4832,10 +4840,11 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                     (None, false) => {
                         return Err(ModelError::InvalidOperation(format!(
                             "native change {} arrived by transfer against a shared admission \
-                             policy with {} rule source(s), and the publisher's admission case \
-                             did not travel with it; the same policy bytes decide differently \
-                             under case-sensitive and ASCII-folded matching, so this replica \
-                             will not choose one on the publisher's behalf",
+                             policy with {} rule source(s), and its receiver named no admission \
+                             case to decide under; the same policy bytes admit different paths \
+                             under case-sensitive and ASCII-folded matching, and neither is \
+                             uniformly stricter, so a receiver that cannot name its own case \
+                             cannot admit this",
                             change.id,
                             policy.sources.len()
                         ))
@@ -20478,12 +20487,13 @@ mod native_admission_lineage {
             .expect_err("a rule-carrying policy must refuse a transfer with no case")
             .to_string();
         assert!(
-            error.contains("the publisher's admission case did not travel with it"),
+            error.contains("its receiver named no admission case to decide under"),
             "the refusal must name the missing case: {error}"
         );
         assert!(
-            error.contains("will not choose one on the publisher's behalf"),
-            "the refusal must say the replica declined to guess: {error}"
+            error.contains("neither is uniformly stricter"),
+            "the refusal must say WHY it declines to guess, since a reader who thinks one case \
+             is the safe default will read this as pedantry: {error}"
         );
         // The rule deliberately matches nothing, so this cannot be the artifact
         // being excluded. It is the missing case alone.
