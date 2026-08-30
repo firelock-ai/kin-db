@@ -15516,6 +15516,193 @@ mod tests {
         assert_eq!(viewed.external_references, replayed.external_references);
     }
 
+    use crate::storage::format::MATERIALIZED_GRAPH_SCHEMA_VERSION;
+
+    /// Resolve one workspace base and report which arm answered.
+    ///
+    /// The counters are read as the endpoints of a span rather than as running
+    /// totals, because open-time and admission validation resolve bases too.
+    fn resolve_base_counting_arms(
+        snapshot: &GraphSnapshot,
+        metadata: &PersistedRepositoryAuthority,
+        workspace: &WorkspaceState,
+    ) -> (GraphSnapshot, usize, usize) {
+        let served_before = BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get());
+        let folded_before = BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get());
+        let base = resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Carried(None),
+        )
+        .expect("a synthetic workspace base resolves");
+        let served = BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get()) - served_before;
+        let folded = BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get()) - folded_before;
+        (base, served, folded)
+    }
+
+    /// Compare two resolved bases over the REAL SET rather than by counting.
+    ///
+    /// Counting entities would pass for a section that answered the right
+    /// number of the wrong ones, so this reads what one side actually produced
+    /// and requires the other to hold each of those, by id and by value.
+    fn assert_same_resolved_graph(left: &GraphSnapshot, right: &GraphSnapshot) {
+        assert_eq!(
+            left.entities.keys().collect::<BTreeSet<_>>(),
+            right.entities.keys().collect::<BTreeSet<_>>(),
+            "the two paths must resolve the same entity ids"
+        );
+        for (id, entity) in &left.entities {
+            assert_eq!(
+                Some(entity),
+                right.entities.get(id),
+                "entity {id} differs between the section and the fold"
+            );
+        }
+        assert_eq!(
+            left.relations.keys().collect::<BTreeSet<_>>(),
+            right.relations.keys().collect::<BTreeSet<_>>(),
+            "the two paths must resolve the same relation ids"
+        );
+        for (id, relation) in &left.relations {
+            assert_eq!(
+                Some(relation),
+                right.relations.get(id),
+                "relation {id} differs between the section and the fold"
+            );
+        }
+        assert_eq!(left.entity_revisions, right.entity_revisions);
+        assert_eq!(left.resolved_tree, right.resolved_tree);
+        assert_eq!(left.external_references, right.external_references);
+        assert_eq!(left.outgoing, right.outgoing);
+        assert_eq!(left.incoming, right.incoming);
+    }
+
+    /// A synthetic store, its workspace, and the change its base names.
+    fn synthetic_base_fixture() -> (
+        GraphSnapshot,
+        PersistedRepositoryAuthority,
+        WorkspaceState,
+        SemanticChangeId,
+    ) {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let lease = store.manager.read_authority();
+        let snapshot = lease.snapshot().clone();
+        let metadata = lease.metadata().clone();
+        let workspace = metadata.workspaces[0].clone();
+        let change_id = lease
+            .resolve_target_change_id(
+                workspace
+                    .base_target
+                    .as_ref()
+                    .expect("a synthetic workspace bases at head"),
+            )
+            .expect("the base target names a change");
+        drop(lease);
+        (snapshot, metadata, workspace, change_id)
+    }
+
+    #[test]
+    fn a_store_with_no_section_folds_its_base_out_of_history() {
+        // The control for every arm below. Without it, a zero on the fold
+        // counter in the served test would be satisfied by an instrument that
+        // never counts at all.
+        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        assert!(snapshot.materialized_graph.is_none());
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "there is no section to serve");
+        assert_eq!(folded, 1, "so the base must be folded out of history");
+        assert!(
+            !base.entities.is_empty(),
+            "the fixture must resolve a non-empty graph, or every comparison below is vacuous"
+        );
+    }
+
+    #[test]
+    fn a_store_with_a_section_serves_its_base_without_folding_history() {
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, folded_first) =
+            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(folded_first, 1, "the first pass must be the fold");
+
+        let state = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at: change_id,
+            state,
+        });
+
+        let (served_base, served, folded) =
+            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 1, "the section must answer");
+        assert_eq!(
+            folded, 0,
+            "and nothing may fold the history behind its back"
+        );
+        assert_same_resolved_graph(&served_base, &folded_base);
+    }
+
+    #[test]
+    fn a_section_resolving_at_another_change_is_refused_and_the_history_answers() {
+        // The mutation this catches is a reader that uses the section without
+        // validating it. That reader passes the test above, because there the
+        // section is correct; only a WRONG section separates the two.
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+
+        let mut wrong = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        // Empty it, so a reader that serves this section without checking gives
+        // an answer that cannot be mistaken for the right one.
+        wrong.entities.clear();
+        wrong.relations.clear();
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at: SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32])),
+            state: wrong,
+        });
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "a section for another change must not answer");
+        assert_eq!(folded, 1, "the history must answer instead");
+        assert_same_resolved_graph(&base, &folded_base);
+    }
+
+    #[test]
+    fn a_section_of_an_unknown_schema_is_refused_and_the_history_answers() {
+        // Separate from the target arm because the two can hide each other. A
+        // validator that dropped the schema check entirely would still pass
+        // the target test.
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+
+        let mut wrong = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        wrong.entities.clear();
+        wrong.relations.clear();
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION + 1,
+            resolved_at: change_id,
+            state: wrong,
+        });
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "an unknown schema must not answer");
+        assert_eq!(folded, 1, "the history must answer instead");
+        assert_same_resolved_graph(&base, &folded_base);
+    }
+
     #[test]
     fn authority_history_view_fails_closed_outside_replay() {
         let changes = HashMap::new();
