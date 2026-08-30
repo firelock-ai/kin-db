@@ -19854,6 +19854,62 @@ mod native_admission_lineage {
         change
     }
 
+    /// A Git-origin sibling of `native_change`, for the arm that has to NOT be
+    /// admission-checked.
+    ///
+    /// Everything else is identical, deliberately: the only variable between the
+    /// two arms below is the origin, so an outcome that differs can only be the
+    /// origin deciding it.
+    fn git_change(
+        index: usize,
+        parent: Option<SemanticChangeId>,
+        shared: &SharedAdmissionPolicy,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit {
+                oid: kin_model::GitObjectId::sha1([0x70 + index as u8; 20]),
+            },
+            parents: parent.into_iter().collect(),
+            timestamp: fixed_timestamp(),
+            author: AuthorId::new("native-admission-lineage"),
+            message: format!("synthetic git change {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: (parent.is_none())
+                .then(|| AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        change
+    }
+
+    /// `CHANGES` chained GIT-origin changes, the head carrying `tree`.
+    fn git_history(
+        shared: &SharedAdmissionPolicy,
+        tree: &[TreeDelta],
+    ) -> Vec<kin_model::SemanticChange> {
+        let mut chain = Vec::with_capacity(CHANGES);
+        let mut parent = None;
+        for index in 0..CHANGES {
+            let deltas = if index + 1 == CHANGES {
+                tree.to_vec()
+            } else {
+                Vec::new()
+            };
+            let change = git_change(index, parent, shared, deltas);
+            parent = Some(change.id);
+            chain.push(change);
+        }
+        chain
+    }
+
     /// `CHANGES` chained Native changes, the head carrying `tree`.
     fn chained_history(
         shared: &SharedAdmissionPolicy,
@@ -20439,6 +20495,83 @@ mod native_admission_lineage {
         assert!(
             refusal.contains("*.LOG"),
             "the refusal must name the rule that decided, not only that one did: {refusal}"
+        );
+    }
+
+    /// A FORGED Git-origin label cannot skip admission, and this is the pair
+    /// that proves it rather than trusting the filter's shape.
+    ///
+    /// `verify_native_change_admission` filters to `ChangeOrigin::Native` and
+    /// returns `Ok` when none remain, which the comment there says is exactly
+    /// what a Git import is. Read alone that looks like a hole: label a Native
+    /// change as Git-origin and the shared policy never runs.
+    ///
+    /// It is not a hole, and the reason is one layer up. A transaction carrying
+    /// a Git-origin change must also carry that commit's RAW OBJECT and its
+    /// final alias binding the oid to the change, so the label costs a git
+    /// object the forger does not have. This arm pays the label and is refused
+    /// for the object, by name.
+    ///
+    /// The control is the same artifact on a Native change, refused by the
+    /// shared policy. Without it, a refusal in the forged arm could be the
+    /// policy biting rather than the object check, and the two are different
+    /// claims.
+    ///
+    /// What this pair deliberately does NOT cover is a REAL Git import being
+    /// admitted without an admission check, which is the brownfield behaviour a
+    /// conversion depends on. That was measured end to end on 2026-08-30 through
+    /// a real hosted transfer, where a file git tracked only because it was
+    /// force-added past its own `*.log` rule survived `kin init`, the wire and
+    /// the projection. Constructing it here needs external object records and
+    /// aliases rather than a synthesised oid, and the end state it argues for is
+    /// filed as FIR-2981.
+    #[test]
+    fn a_forged_git_origin_change_cannot_skip_admission() {
+        let arm = |forge_git_origin: bool| {
+            let (_directory, manager, tree_deltas) = transfer_fixture_holding("keep.log");
+            let shared = policy_with_rules(&manager, &["*.log"]);
+            let changes = if forge_git_origin {
+                git_history(&shared, &tree_deltas)
+            } else {
+                chained_history(&shared, &tree_deltas)
+            };
+            let transaction = transaction_shell(&manager, 3, changes);
+            manager
+                .commit_transferred_repository_transaction(
+                    transaction,
+                    Some(crate::admission::AdmissionCase::Sensitive),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+
+        let native_refusal = arm(false).expect_err(
+            "the control must refuse: a Native change introducing keep.log against a policy that \
+             excludes *.log is exactly what the shared-policy check is for, and if this admits \
+             then the forged arm proves nothing",
+        );
+        assert!(
+            native_refusal.contains("excluded by the exact graph-owned admission policy"),
+            "the control must refuse by POLICY, not for some unrelated reason: {native_refusal}"
+        );
+        assert!(
+            native_refusal.contains("keep.log"),
+            "the control's refusal must name the artifact: {native_refusal}"
+        );
+
+        let forged_refusal = arm(true).expect_err(
+            "a forged Git-origin label must NOT be admitted; if it is, relabelling a Native change \
+             is a way past the shared admission policy",
+        );
+        assert!(
+            forged_refusal.contains("lacks raw commit object"),
+            "the forged arm must be refused for the git object it cannot produce, which is what \
+             makes the label cost something: {forged_refusal}"
+        );
+        assert!(
+            !forged_refusal.contains("excluded by the exact graph-owned admission policy"),
+            "the forged arm must NOT be refused by the policy, or this test is measuring the \
+             control twice and says nothing about the label: {forged_refusal}"
         );
     }
 
