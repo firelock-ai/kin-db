@@ -4624,6 +4624,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
                 tracked: tracked.contains(&artifact.artifact_id),
                 gitlink_is_admitted,
                 label: "workspace",
+                case: overlay.case,
             },
         )?;
     }
@@ -4909,6 +4910,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                     tracked: workspace_tracked.contains(&artifact.artifact_id),
                     gitlink_is_admitted,
                     label: &format!("native change {}", change.id),
+                    case: overlay.case,
                 },
             )?;
         }
@@ -5064,6 +5066,52 @@ struct ArtifactAdmissionContext<'a> {
     tracked: bool,
     gitlink_is_admitted: bool,
     label: &'a str,
+    /// The case the matcher was compiled under, carried so a refusal can name
+    /// it. `ResolvedAdmissionMatcher` keeps its own copy private and lives in
+    /// another crate, and the overlay that supplied it is in scope at both call
+    /// sites, so this reads it from there rather than widening kin-model's API.
+    case: crate::admission::AdmissionCase,
+}
+
+/// Name the rule that decided an exclusion.
+///
+/// A refusal that says only "excluded by the exact graph-owned admission policy"
+/// tells a reader that something matched and not what, so the next step is to
+/// guess. `AdmissionDecisionReason` already carries the source, the line, the
+/// pattern and whether it was negated; this renders them.
+fn describe_admission_exclusion(reason: &crate::admission::AdmissionDecisionReason) -> String {
+    fn source_name(source: &ResolvedAdmissionRuleSource) -> String {
+        match source {
+            ResolvedAdmissionRuleSource::Shared { source_path } => source_path.to_string(),
+            ResolvedAdmissionRuleSource::GlobalExclude => "the global excludes".to_string(),
+            ResolvedAdmissionRuleSource::InfoExclude => "the info excludes".to_string(),
+            ResolvedAdmissionRuleSource::KinLocal { ordinal } => {
+                format!("local rule set {ordinal}")
+            }
+            ResolvedAdmissionRuleSource::CommandLine { ordinal } => {
+                format!("command-line rule set {ordinal}")
+            }
+        }
+    }
+    fn rule(provenance: &crate::admission::AdmissionRuleProvenance) -> String {
+        format!(
+            "{}pattern {:?} at {} line {}",
+            if provenance.negated { "negated " } else { "" },
+            String::from_utf8_lossy(&provenance.pattern),
+            source_name(&provenance.source),
+            provenance.line
+        )
+    }
+    match reason {
+        crate::admission::AdmissionDecisionReason::Rule(provenance) => rule(provenance),
+        crate::admission::AdmissionDecisionReason::IgnoredAncestor {
+            ancestor,
+            rule: provenance,
+        } => format!("ancestor {ancestor} excluded by {}", rule(provenance)),
+        // These three ADMIT, so reaching them behind `is_ignored()` means the
+        // decision and its reason disagree. Say that rather than invent a rule.
+        other => format!("no rule recorded, which disagrees with the decision: {other:?}"),
+    }
 }
 
 /// Judge one proposed artifact against the exact rules that bind it.
@@ -5085,9 +5133,19 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 ) -> Result<(), KinDbError> {
     let decision = matcher.decide(&artifact.path, false, context.tracked);
     if decision.is_ignored() {
+        let (applied, other) = match context.case {
+            crate::admission::AdmissionCase::Sensitive => ("case-sensitive", "ASCII-folded"),
+            crate::admission::AdmissionCase::FoldAscii => ("ASCII-folded", "case-sensitive"),
+        };
         return Err(ModelError::InvalidOperation(format!(
-            "{} artifact {} is excluded by the exact graph-owned admission policy",
-            context.label, artifact.path
+            "{} artifact {} is excluded by the exact graph-owned admission policy: {}, matched \
+             under {} matching, which is the case this replica admits under; {} matching can \
+             decide the same policy bytes differently",
+            context.label,
+            artifact.path,
+            describe_admission_exclusion(&decision.reason),
+            applied,
+            other
         ))
         .into());
     }
@@ -19720,6 +19778,44 @@ mod native_admission_lineage {
         (deltas, blobs)
     }
 
+    /// A tree holding exactly one artifact, at a path the caller chooses.
+    ///
+    /// `head_tree` fixes its paths at `src/module_N.rs`, which cannot exercise a
+    /// rule whose whole point is the spelling of the path it matches.
+    fn named_tree(path: &str) -> (Vec<TreeDelta>, Vec<(Hash256, Vec<u8>)>) {
+        let body = format!("contents of {path}\n").into_bytes();
+        let hash = digest(&body);
+        let deltas = vec![TreeDelta::Added {
+            artifact_id: ArtifactId(Uuid::from_u128(9_100_000)),
+            new: LocatedEntry::new(
+                RepoPath::from_bytes(path.as_bytes().to_vec()).expect("synthetic path is valid"),
+                TreeEntry::blob(hash, false),
+            ),
+        }];
+        (deltas, vec![(hash, body)])
+    }
+
+    /// `transfer_fixture`, but the transferred head holds one named artifact.
+    fn transfer_fixture_holding(
+        path: &str,
+    ) -> (
+        tempfile::TempDir,
+        RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        Vec<TreeDelta>,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+        let (tree_deltas, blobs) = named_tree(path);
+        for (hash, body) in &blobs {
+            manager.save_source_blob(*hash, body).expect("save blob");
+        }
+        (directory, manager, tree_deltas)
+    }
+
     /// One Native change, content-addressed exactly as a real one is.
     fn native_change(
         index: usize,
@@ -20018,7 +20114,23 @@ mod native_admission_lineage {
         manager: &RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
         pattern: &str,
     ) -> SharedAdmissionPolicy {
-        let body = format!("{pattern}\n").into_bytes();
+        policy_with_rules(manager, &[pattern])
+    }
+
+    /// A shared policy carrying several rule lines in one source, in order.
+    ///
+    /// Order is the point for a negation: gitignore semantics let a later `!`
+    /// line re-admit what an earlier line excluded, and that pair is the only
+    /// place the two admission cases disagree in the permissive direction.
+    fn policy_with_rules(
+        manager: &RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        patterns: &[&str],
+    ) -> SharedAdmissionPolicy {
+        let body = patterns
+            .iter()
+            .map(|pattern| format!("{pattern}\n"))
+            .collect::<String>()
+            .into_bytes();
         let hash = digest(&body);
         manager
             .save_source_blob(hash, &body)
@@ -20200,12 +20312,17 @@ mod native_admission_lineage {
     ///
     /// The rule is spelled in upper case and the artifact in lower. Under
     /// `FoldAscii` the shared rule matches and the receiver refuses; under
-    /// `Sensitive` it does not match and the receiver admits. So a receiver that
-    /// invented a case would be deciding another replica's policy by its own
-    /// rules, which is why `commit_transferred_repository_transaction` makes the
-    /// caller supply it and never defaults.
+    /// `Sensitive` it does not match and the receiver admits.
+    ///
+    /// Which case a receiver supplies is settled elsewhere and is its OWN: kin
+    /// reads it from the overlay of the workspace its daemon pinned at startup,
+    /// and a replica with no overlay admits under `Sensitive` because byte-exact
+    /// object storage is what it stores into. What this test pins is the half
+    /// that belongs here, that the supplied case reaches the shared matcher and
+    /// decides, so `commit_transferred_repository_transaction` is right to make
+    /// the caller supply one and never default.
     #[test]
-    fn the_publishers_case_decides_the_shared_policy_on_the_receiver() {
+    fn the_supplied_case_decides_the_shared_policy_on_the_receiver() {
         let folded = {
             let (_directory, manager, tree_deltas) = transfer_fixture();
             let shared = policy_excluding(&manager, "SRC/MODULE_0.RS");
@@ -20243,6 +20360,76 @@ mod native_admission_lineage {
         sensitive.expect(
             "the same rule must NOT match under Sensitive, so this must be admitted; if it \
              refuses, the case is not reaching the shared matcher and carrying it buys nothing",
+        );
+    }
+
+    /// FOLDING IS NOT STRICTER, and this is the pair that proves it.
+    ///
+    /// The tidy story is that ASCII-folded matching admits less, because an
+    /// exclusion rule matches more paths under it. That is only half of it: a
+    /// NEGATION folds too, so a `!` line re-admits more paths as well, and the
+    /// two cases disagree in both directions depending on which line wins.
+    ///
+    /// `*.LOG` then `!keep.log`, against an artifact spelled `keep.LOG`:
+    ///
+    /// - `FoldAscii`: `*.LOG` matches, then `!keep.log` folds onto `keep.LOG`
+    ///   and re-admits it. ADMITTED.
+    /// - `Sensitive`: `*.LOG` matches exactly, and `!keep.log` does not match
+    ///   `keep.LOG` at all, so nothing re-admits it. REFUSED.
+    ///
+    /// So the folded case is the PERMISSIVE one here, which is the opposite of
+    /// what the tidy story predicts, and it is why no receiver can pick a case
+    /// as the safe default. Rare, since rules and paths are usually lowercase,
+    /// and real, which is the only reason it needs a test rather than a
+    /// sentence.
+    ///
+    /// It matters now in a way it did not before: a receiver applies its own
+    /// case, so a `FoldAscii` publisher pushing `keep.LOG` to a replica that
+    /// admits under `Sensitive`, which is every hosted replica, lands exactly
+    /// here.
+    #[test]
+    fn a_negation_makes_folding_permissive_where_the_tidy_story_says_strict() {
+        let outcome = |case: crate::admission::AdmissionCase| {
+            let (_directory, manager, tree_deltas) = transfer_fixture_holding("keep.LOG");
+            let shared = policy_with_rules(&manager, &["*.LOG", "!keep.log"]);
+            let changes = chained_history(&shared, &tree_deltas);
+            let transaction = transaction_shell(&manager, 3, changes);
+            manager
+                .commit_transferred_repository_transaction(transaction, Some(case))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+
+        let folded = outcome(crate::admission::AdmissionCase::FoldAscii);
+        let sensitive = outcome(crate::admission::AdmissionCase::Sensitive);
+
+        assert_ne!(
+            folded.is_ok(),
+            sensitive.is_ok(),
+            "the two cases must decide this pair differently, or the fixture is not exercising \
+             the negation at all: folded={folded:?} sensitive={sensitive:?}"
+        );
+        folded.expect(
+            "under FoldAscii the negation !keep.log folds onto keep.LOG and re-admits it, so this \
+             must be ADMITTED; a refusal here means folding is stricter in both directions, which \
+             is the claim this test exists to refute",
+        );
+        let refusal = sensitive.expect_err(
+            "under Sensitive the negation does not match keep.LOG, so nothing re-admits what \
+             *.LOG excluded and this must be REFUSED",
+        );
+        assert!(
+            refusal.contains("excluded by the exact graph-owned admission policy"),
+            "the Sensitive arm must refuse by policy: {refusal}"
+        );
+        assert!(
+            refusal.contains("case-sensitive"),
+            "the refusal must name the case it matched under, so a reader can tell this apart \
+             from the same policy deciding the other way: {refusal}"
+        );
+        assert!(
+            refusal.contains("*.LOG"),
+            "the refusal must name the rule that decided, not only that one did: {refusal}"
         );
     }
 
