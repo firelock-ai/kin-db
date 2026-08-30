@@ -336,38 +336,56 @@ pub const MATERIALIZED_GRAPH_SCHEMA_VERSION: u32 = 1;
 /// `ChangeStore::resolve_graph_at`. This section is that fold, written once by
 /// the publish that produced it and read directly afterwards.
 ///
-/// It is derived state, not authority, and the distinction is load-bearing in
-/// both directions. Nothing here is hashed into [`RootBundle`], because the
-/// authority over a graph is the change map it comes from; and every read
-/// checks this section against that change map's own root before trusting it,
-/// so a section that does not belong to these bytes is ignored rather than
-/// served.
+/// It is derived state, not authority, and the distinction is load-bearing.
+/// Nothing here is hashed into any authority root, because the authority over a
+/// graph is the change it resolves at; adding a section therefore leaves a
+/// repository's roots, and so its replicated identity, byte for byte what they
+/// were. Every read checks the section against the change the caller wants
+/// before trusting it, so a section that is not this caller's answer is ignored
+/// rather than served.
 ///
 /// `outgoing` and `incoming` are deliberately absent. Workspace
 /// materialization rebuilds adjacency from `relations` already, so persisting
 /// them would enlarge the section for no reader.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedGraphSection {
     /// Schema of this section. See [`MATERIALIZED_GRAPH_SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// The change this graph is the resolution AT.
+    /// The change this graph is the resolution AT, and the whole binding.
     ///
-    /// `None` is the unborn repository's empty graph, which is a real answer
-    /// and not an absence, so it is distinguished from an absent section by
-    /// the enclosing `Option` rather than by this field.
-    pub resolved_at: Option<SemanticChangeId>,
-    /// `RootBundle::history` as it stood over the change map this was folded
-    /// from.
+    /// `kin_model::compute_semantic_change_id` hashes every immutable field of
+    /// a change except `id` itself, and `parents` is one of them, so the change
+    /// DAG is a Merkle DAG and an id determines its complete ancestry together
+    /// with every delta in it. `resolve_graph_at` folds exactly that ancestry
+    /// and reads nothing else. So naming the change names the graph: no other
+    /// history can produce this id, and a reader that matches this against the
+    /// target it wants has matched the content.
     ///
-    /// This is the whole validation. The root is a SHA-256 over the entire
-    /// change map, it is recomputed and compared against that map on every
-    /// validated publish, and it sits in the authority envelope, so a reader
-    /// can compare the two without decoding a single change.
-    pub history_root: Hash256,
-    pub entities: HashMap<EntityId, Entity>,
-    pub relations: HashMap<RelationId, Relation>,
-    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    /// An earlier draft also carried `RootBundle::history`, a hash over the
+    /// WHOLE change map. It was dropped rather than kept as defence in depth,
+    /// because it is not a weaker version of this check, it is a wrong one: a
+    /// change appended anywhere moves that root while leaving the graph at this
+    /// change identical, so a section that is still exactly correct would be
+    /// refused after every commit and after every authority frame. A check that
+    /// refuses correct answers is worse than no check when the remaining check
+    /// is complete.
+    ///
+    /// Not an `Option`. A repository with no base target resolves to five
+    /// empty maps and a default tree, which costs nothing to compute, so there
+    /// is nothing there worth memoizing and no case where an absent section
+    /// and an empty one have to be told apart.
+    pub resolved_at: SemanticChangeId,
+    /// Exactly what `ChangeStore::resolve_graph_at(resolved_at)` returns.
+    ///
+    /// Held whole rather than field by field so that the read path is a
+    /// substitution rather than a reconstruction: whatever that call produces
+    /// is what this carries, and a domain added to `ResolvedGraphState` later
+    /// is carried here without anyone remembering to add it. Tombstones and
+    /// entity revisions come along for the same reason, and the revisions
+    /// matter on their own, since a graph built over a base with none re-derives
+    /// a revision timeline across the whole history.
+    pub state: ResolvedGraphState,
 }
 
 /// Why a persisted section was not used, named one reason at a time.
@@ -380,8 +398,6 @@ pub enum MaterializedGraphRefusal {
     Absent,
     /// The section names a schema this binary does not know.
     Schema { held: u32, found: u32 },
-    /// The section was folded from a different change map.
-    History,
     /// The section resolves at a different change than the caller asked for.
     Target,
 }
@@ -393,7 +409,6 @@ impl std::fmt::Display for MaterializedGraphRefusal {
             Self::Schema { held, found } => {
                 write!(formatter, "schema (holding {held}, section names {found})")
             }
-            Self::History => formatter.write_str("history_root"),
             Self::Target => formatter.write_str("resolved_at"),
         }
     }
@@ -1753,39 +1768,31 @@ pub struct AuthorityEnvelopeSnapshot {
 impl AuthorityEnvelopeSnapshot {
     /// The section this envelope carries, or the reason it cannot be used.
     ///
-    /// `resolved_at` is the change the caller intends to resolve the graph at.
-    /// It is checked because [`RootBundle::history`] covers the whole change
-    /// map and says nothing about WHICH change you resolve at, so two
-    /// workspaces at different heads share a history root and need different
-    /// graphs. Without this check the section would answer the wrong graph
-    /// under a correct hash, which is the failure this design most has to
-    /// avoid.
+    /// `resolved_at` is the change the caller intends to resolve the graph at,
+    /// which for a workspace is its `base_target`. Matching it is what makes
+    /// the answer this section's own, and the Merkle change id is what makes
+    /// matching it sufficient.
     pub fn materialized_graph_for(
         &self,
-        resolved_at: Option<&SemanticChangeId>,
+        resolved_at: &SemanticChangeId,
     ) -> Result<&MaterializedGraphSection, MaterializedGraphRefusal> {
-        let authority = self
-            .repository_authority
-            .as_ref()
-            .ok_or(MaterializedGraphRefusal::Absent)?;
         let section = self
             .materialized_graph
             .as_ref()
             .ok_or(MaterializedGraphRefusal::Absent)?;
-        section.validate_for(authority.roots.history.hash, resolved_at)?;
+        section.validate_for(resolved_at)?;
         Ok(section)
     }
 }
 
 impl MaterializedGraphSection {
-    /// Whether this section may answer for `history_root` at `resolved_at`.
+    /// Whether this section may answer for the graph at `resolved_at`.
     ///
     /// Every arm returns a DIFFERENT refusal, so a falsification can read which
     /// check answered rather than only that one did.
     pub fn validate_for(
         &self,
-        history_root: Hash256,
-        resolved_at: Option<&SemanticChangeId>,
+        resolved_at: &SemanticChangeId,
     ) -> Result<(), MaterializedGraphRefusal> {
         if self.schema_version != MATERIALIZED_GRAPH_SCHEMA_VERSION {
             return Err(MaterializedGraphRefusal::Schema {
@@ -1793,10 +1800,7 @@ impl MaterializedGraphSection {
                 found: self.schema_version,
             });
         }
-        if self.history_root != history_root {
-            return Err(MaterializedGraphRefusal::History);
-        }
-        if self.resolved_at.as_ref() != resolved_at {
+        if &self.resolved_at != resolved_at {
             return Err(MaterializedGraphRefusal::Target);
         }
         Ok(())
