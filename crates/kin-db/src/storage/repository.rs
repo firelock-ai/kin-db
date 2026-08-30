@@ -14226,12 +14226,12 @@ mod tests {
     /// applies once. A second valid transaction is real work and no test in
     /// this file does it.
     ///
-    /// So the FRAME WALK has no unit test, and that gap is named here rather
-    /// than left for a reader to discover. What exercises it is a real
-    /// converted store, whose authority sits at generation 2 over a base of 1,
-    /// where the daemon's own `repository authority envelope read` line reports
-    /// a non-zero frame count. Closing this properly means a fixture that can
-    /// commit twice, and it is the first thing to add here.
+    /// The frame WALK is held by
+    /// `native_admission_lineage::the_envelope_walk_reaches_the_envelope_a_full_open_reaches`,
+    /// which lives in that module because its `transaction_shell` can build a
+    /// valid second transaction and this module's bootstrap helper cannot. The
+    /// two tests are the two arms of the same read and neither covers the
+    /// other's.
     #[test]
     fn the_envelope_read_answers_what_the_full_open_answers() {
         let directory = TempDir::new().unwrap();
@@ -20036,6 +20036,77 @@ mod native_admission_lineage {
             Vec::new(),
         )
         .expect("a one-source shared policy is valid")
+    }
+
+    /// The journal WALK reaches the envelope a full open reaches.
+    ///
+    /// This is the arm the sibling test in the outer module cannot hold. Every
+    /// live store takes this path, because a store's acknowledged head moves
+    /// past its snapshot base the first time its daemon writes anything, and a
+    /// walk that builds a wrong envelope gives wrong workspace answers with no
+    /// error on the daemon's primary read.
+    ///
+    /// It lives here because this module already has what the outer one does
+    /// not: `transaction_shell` reads `expected_generation` and
+    /// `expected_roots` off the current lease and mutates no refs, so a second
+    /// call after the first commit is a valid successor. Three attempts to
+    /// build this out of the outer module's bootstrap helper failed on the
+    /// fixture rather than on the code, the last of them on
+    /// `ref refs/heads/main already exists`.
+    ///
+    /// The assertion is the JOIN, against what the full open produces, because
+    /// a hardcoded expectation passes with both sides wrong. The control above
+    /// it is what makes the join mean anything: without a frame past the base
+    /// the read takes its early return, and this test would pass with the walk
+    /// deleted.
+    #[test]
+    fn the_envelope_walk_reaches_the_envelope_a_full_open_reaches() {
+        let (directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+
+        let first = chained_history(&shared, &tree_deltas);
+        let tail = first.last().expect("the chain is not empty").id;
+        manager
+            .commit_repository_transaction(transaction_shell(&manager, 3, first))
+            .expect("the fixture's first commit must land");
+
+        let follow = vec![native_change(CHANGES, Some(tail), &shared, Vec::new())];
+        manager
+            .commit_repository_transaction(transaction_shell(&manager, 4, follow))
+            .expect("the fixture's second commit must land");
+
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+
+        // THE CONTROL. A fixture whose base already is its head exercises the
+        // early return, and this test would then pass with the walk deleted.
+        let persisted = backend
+            .load_snapshot_authority(repository().as_str())
+            .expect("the authority loads")
+            .expect("the fixture wrote an authority");
+        assert!(
+            persisted.snapshot_generation < persisted.head_generation,
+            "this fixture must carry an acknowledged frame past its base, or the walk is not \
+             under test: base {} head {}",
+            persisted.snapshot_generation,
+            persisted.head_generation
+        );
+
+        let envelope =
+            RepositoryAuthorityMetadata::open(repository(), std::sync::Arc::clone(&backend))
+                .expect("the envelope read must not error")
+                .expect("the envelope read must answer over a journal, not decline");
+        assert_eq!(
+            envelope.generation(),
+            manager.read_authority().generation(),
+            "the walked envelope must reach the acknowledged head"
+        );
+        assert_eq!(
+            envelope.metadata(),
+            manager.read_authority().metadata(),
+            "the walked envelope must equal the one a full open produces, field for field"
+        );
     }
 
     /// Call the transferred-commit entry through a GENERIC bound.
