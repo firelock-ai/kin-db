@@ -3772,8 +3772,7 @@ mod tests {
         assert_eq!(
             envelope
                 .materialized_graph_for(&a_change_id(0x11))
-                .err()
-                .expect("no section means a refusal"),
+                .expect_err("no section means a refusal"),
             MaterializedGraphRefusal::Absent
         );
     }
