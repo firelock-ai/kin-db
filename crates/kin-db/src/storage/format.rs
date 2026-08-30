@@ -2355,7 +2355,7 @@ mod tests {
         let body = rmp_serde::to_vec(snapshot).unwrap();
         let mut bytes = Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN);
         bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&snapshot.wire_version().to_le_bytes());
         bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&body);
         bytes.extend_from_slice(&Sha256::digest(&body));
@@ -3011,7 +3011,11 @@ mod tests {
         let mut buf =
             Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN + trailer_len);
         buf.extend_from_slice(&GraphSnapshot::MAGIC);
-        buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        // The version a frame carries is what its CONTENTS serialize as, which
+        // is what the shipped assembly writes. Hardcoding the constant here
+        // made this reference disagree with the shipped path the moment the
+        // two stopped being the same thing.
+        buf.extend_from_slice(&snapshot.wire_version().to_le_bytes());
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend(&body);
         let body_checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -3176,17 +3180,22 @@ mod tests {
         let e = test_entity("fast_path");
         snap.entities.insert(e.id, e);
 
-        assert_eq!(snap.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(snap.version, snap.wire_version());
         assert!(snap.to_bytes().is_ok());
 
         snap.version = 1;
-        let error = snap.to_bytes().unwrap_err();
-        // Derived from the constant rather than typed, because a hardcoded
-        // version in an assertion goes stale on exactly the commit that most
-        // needs the assertion to still mean something.
-        assert!(error
-            .to_string()
-            .contains(&format!("exactly v{}", GraphSnapshot::CURRENT_VERSION)));
+        let error = snap.to_bytes().unwrap_err().to_string();
+        // Both halves derived from the constants rather than typed. This
+        // snapshot carries no section, so what its contents serialize as is the
+        // minimum supported version, and the refusal has to name both.
+        assert!(
+            error.contains("declares v1 ")
+                && error.contains(&format!(
+                    "serialize as v{}",
+                    GraphSnapshot::MIN_SUPPORTED_VERSION
+                )),
+            "unexpected refusal: {error}"
+        );
     }
 
     #[test]
@@ -3195,7 +3204,7 @@ mod tests {
 
         let bytes = snap.to_bytes().unwrap();
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
         assert!(loaded.entities.is_empty());
     }
 
@@ -3226,8 +3235,8 @@ mod tests {
         snap.version = 1;
         let error = snap.to_bytes_pre_validated().unwrap_err();
         assert!(
-            error.to_string().contains("exactly v"),
-            "the version gate must keep running on the pre-validated path"
+            error.to_string().contains("declares v1 "),
+            "the version gate must keep running on the pre-validated path, got: {error}"
         );
     }
 
@@ -3359,9 +3368,11 @@ mod tests {
         // Total should be header + body + 32-byte checksum
         assert_eq!(bytes.len(), 16 + body_len + GraphSnapshot::CHECKSUM_LEN);
 
-        // Version in header should match the current format version.
+        // The header version is what the CONTENTS serialize as, not what the
+        // binary can write. This fixture carries no section, so it is the
+        // minimum supported version.
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        assert_eq!(version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(version, GraphSnapshot::MIN_SUPPORTED_VERSION);
     }
 
     #[test]
@@ -3756,43 +3767,42 @@ mod tests {
     }
 
     #[test]
-    fn this_build_writes_v13_for_a_snapshot_with_no_section() {
-        // The reader-before-writer split, asserted on the bytes rather than on
-        // the constant. This build READS v14 and must keep WRITING v13, so that
-        // a store it touches still opens under a binary that knows only v13.
-        let snapshot = GraphSnapshot::empty();
-        assert!(snapshot.materialized_graph.is_none());
-        let bytes = snapshot.to_bytes().expect("an empty snapshot serializes");
-
+    fn the_written_version_is_decided_by_the_contents_not_by_the_binary() {
+        // The property that keeps a store readable by older binaries for as
+        // long as it gains nothing: a snapshot is written at v14 only when it
+        // carries the one thing v13 cannot represent. Both arms go through the
+        // real writer, and each is the other's control: a writer that always
+        // wrote v13 would fail the second, and one that always wrote v14 the
+        // first.
+        let without = GraphSnapshot::empty();
+        assert!(without.materialized_graph.is_none());
         assert_eq!(
-            frame_shape(&bytes),
+            frame_shape(&without.to_bytes().expect("serializes")),
             (
                 GraphSnapshot::MIN_SUPPORTED_VERSION,
                 GRAPH_SNAPSHOT_V13_FIELD_COUNT
             ),
-            "a snapshot with no section must write as v13 with 35 elements"
+            "no section means v13 and 35 elements"
         );
-        // The control, and it is the half that makes the assertion above mean
-        // something. This build must REFUSE to write a section rather than
-        // quietly drop it, or "writes v13" would be satisfied by a writer that
-        // silently downgrades a store.
-        let error = a_v14_snapshot("served")
-            .to_bytes_pre_validated()
-            .expect_err("this build must refuse to write a section")
-            .to_string();
-        assert!(
-            error.contains("refusing to serialize a materialized graph section"),
-            "the refusal must name what it refused, got: {error}"
-        );
-        let with_section = v14_frame(&a_v14_snapshot("served"));
+
+        let with = a_v14_snapshot("served");
         assert_eq!(
-            frame_shape(&with_section),
+            frame_shape(&with.to_bytes_pre_validated().expect("serializes")),
             (
                 GraphSnapshot::MAX_SUPPORTED_VERSION,
                 GRAPH_SNAPSHOT_FIELD_COUNT
             ),
-            "the fixture a future writer will produce is v14 with 36 elements"
+            "a section means v14 and 36 elements"
         );
+
+        // And the writer refuses rather than silently correcting a snapshot
+        // whose declared version contradicts its contents, in both directions.
+        let mut lying_low = a_v14_snapshot("served");
+        lying_low.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
+        assert!(lying_low.to_bytes_pre_validated().is_err());
+        let mut lying_high = GraphSnapshot::empty();
+        lying_high.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        assert!(lying_high.to_bytes().is_err());
     }
 
     #[test]
@@ -3866,7 +3876,7 @@ mod tests {
         );
 
         let mut wide = a_v14_snapshot("served");
-        wide.version = GraphSnapshot::CURRENT_VERSION;
+        wide.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
         let wide_body = rmp_serde::to_vec(&wide).expect("serializes");
         assert_eq!(encoded_field_count(&wide_body), GRAPH_SNAPSHOT_FIELD_COUNT);
         assert!(
@@ -4066,10 +4076,10 @@ mod tests {
         );
         assert_eq!(
             GraphSnapshot::CURRENT_VERSION,
-            GraphSnapshot::MIN_SUPPORTED_VERSION,
-            "this binary still WRITES the older of the two, which is the whole \
-             reader-before-writer ordering; the change that starts writing \
-             sections is the change that moves this constant"
+            GraphSnapshot::MAX_SUPPORTED_VERSION,
+            "the writer has landed, so the newest version this binary can write \
+             is the newest it can read; which version a given body gets is \
+             decided by `wire_version` from its contents, not by this constant"
         );
     }
 }

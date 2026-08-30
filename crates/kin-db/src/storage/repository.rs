@@ -5965,10 +5965,6 @@ mod captured_base_graph {
             Self { resolved_at, state }
         }
 
-        pub(super) fn resolved_at(&self) -> &SemanticChangeId {
-            &self.resolved_at
-        }
-
         /// The section these bytes become.
         pub(super) fn into_section(self) -> MaterializedGraphSection {
             MaterializedGraphSection {
@@ -15758,12 +15754,134 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_carries_tombstones_the_base_would_have_dropped() {
+        // The reason the capture is a type with one constructor rather than a
+        // convention. `resolve_workspace_base_graph_snapshot` moves five of the
+        // seven domains into the base it returns and DROPS both tombstone maps,
+        // so a section reassembled from that base would carry empty tombstones
+        // and look exactly like a complete one.
+        //
+        // Built by hand rather than from a store, deliberately: the synthetic
+        // fixture commits no removals, so its tombstones are empty and an
+        // equality over them would be two empty maps agreeing. This arm is
+        // where a NON-empty pair is exercised.
+        let removed = semantic_test_entity("src/gone.rs", "gone", LanguageId::Rust, 0x5e);
+        let removing_change = SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32]));
+        let mut state = ResolvedGraphState::default();
+        state
+            .entity_tombstones
+            .insert(removed.id, (removed.clone(), removing_change));
+        assert_eq!(state.entity_tombstones.len(), 1, "the fixture is not empty");
+
+        let at = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let section = CapturedBaseGraph::capture(at, state).into_section();
+
+        assert_eq!(section.resolved_at, at);
+        assert_eq!(
+            section.state.entity_tombstones.len(),
+            1,
+            "a capture that dropped tombstones would look complete and be wrong"
+        );
+        let (carried, by_change) = section
+            .state
+            .entity_tombstones
+            .get(&removed.id)
+            .expect("the tombstone survives by id");
+        assert_eq!(carried, &removed);
+        assert_eq!(by_change, &removing_change);
+    }
+
+    #[test]
+    fn a_publish_stamps_a_section_at_the_workspace_base_it_resolved() {
+        // The writer, end to end. The synthetic store is built by real
+        // publishes, so if the stamp works this snapshot arrives carrying a
+        // section, and it names the change the workspace bases at.
+        let (snapshot, _, workspace, change_id) = synthetic_base_fixture();
+        let section = snapshot
+            .materialized_graph
+            .as_ref()
+            .expect("a publish that moved a workspace stamps a section");
+        assert_eq!(
+            section.resolved_at, change_id,
+            "the section must name the change the workspace bases at, or it answers for another"
+        );
+        assert_eq!(section.schema_version, MATERIALIZED_GRAPH_SCHEMA_VERSION);
+        assert!(
+            !section.state.entities.is_empty(),
+            "an empty section would make every comparison below vacuous"
+        );
+        assert_eq!(
+            snapshot.version,
+            GraphSnapshot::MAX_SUPPORTED_VERSION,
+            "a snapshot carrying a section is a v14 snapshot and must say so"
+        );
+        let _ = workspace;
+    }
+
+    #[test]
+    fn the_section_a_publish_wrote_is_what_the_history_folds_to() {
+        // The writer's own obligation, and the one no read-time check can make
+        // cheaply: the memo equals the call. Compared over the real set rather
+        // than by counting, because the right number of the wrong entities
+        // passes a count.
+        let (snapshot, _, _, change_id) = synthetic_base_fixture();
+        let section = snapshot
+            .materialized_graph
+            .as_ref()
+            .expect("a publish stamps a section");
+        let folded = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+
+        assert_eq!(
+            section.state.entities.keys().collect::<BTreeSet<_>>(),
+            folded.entities.keys().collect::<BTreeSet<_>>()
+        );
+        for (id, entity) in &folded.entities {
+            assert_eq!(Some(entity), section.state.entities.get(id));
+        }
+        assert_eq!(
+            section.state.relations.keys().collect::<BTreeSet<_>>(),
+            folded.relations.keys().collect::<BTreeSet<_>>()
+        );
+        for (id, relation) in &folded.relations {
+            assert_eq!(Some(relation), section.state.relations.get(id));
+        }
+        assert_eq!(section.state.entity_revisions, folded.entity_revisions);
+        assert_eq!(section.state.tree, folded.tree);
+        assert_eq!(
+            section.state.external_references,
+            folded.external_references
+        );
+        // The two domains the base snapshot drops, which is the whole reason
+        // the capture is taken before it. Both are empty on this fixture, which
+        // is stated rather than left to read as coverage: what this arm pins is
+        // that the section carries the SAME tombstone maps the fold produced,
+        // and `the_capture_carries_tombstones_the_base_would_have_dropped`
+        // below is where a non-empty pair is exercised.
+        assert_eq!(
+            section.state.entity_tombstones.len(),
+            folded.entity_tombstones.len()
+        );
+        assert_eq!(
+            section.state.relation_tombstones.len(),
+            folded.relation_tombstones.len()
+        );
+    }
+
+    #[test]
     fn a_store_with_no_section_folds_its_base_out_of_history() {
-        // The control for every arm below. Without it, a zero on the fold
-        // counter in the served test would be satisfied by an instrument that
-        // never counts at all.
-        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
-        assert!(snapshot.materialized_graph.is_none());
+        // The control for every arm below. The fixture now ARRIVES with a
+        // section, because the writer landed, so the no-section case is
+        // constructed by clearing it rather than by finding it.
+        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        assert!(
+            snapshot.materialized_graph.take().is_some(),
+            "the fixture is expected to carry a section; clearing nothing would make this arm \
+             agree with the served arm for the wrong reason"
+        );
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "there is no section to serve");
@@ -15776,27 +15894,22 @@ mod tests {
 
     #[test]
     fn a_store_with_a_section_serves_its_base_without_folding_history() {
-        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
-        let (folded_base, _, folded_first) =
-            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
-        assert_eq!(folded_first, 1, "the first pass must be the fold");
+        // End to end: the section this serves was written by a publish, not
+        // stamped by the test. The folded arm is the same store with the
+        // section cleared, so the only difference between them is the section.
+        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        assert!(snapshot.materialized_graph.is_some());
 
-        let state = AuthorityHistoryView {
-            changes: &snapshot.changes,
-        }
-        .resolve_graph_at(&change_id)
-        .expect("the head resolves");
-        snapshot.materialized_graph = Some(MaterializedGraphSection {
-            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
-            resolved_at: change_id,
-            state,
-        });
+        let mut without = snapshot.clone();
+        without.materialized_graph = None;
+        let (folded_base, _, folded) = resolve_base_counting_arms(&without, &metadata, &workspace);
+        assert_eq!(folded, 1, "the control arm must be the fold");
 
-        let (served_base, served, folded) =
+        let (served_base, served, folded_none) =
             resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 1, "the section must answer");
         assert_eq!(
-            folded, 0,
+            folded_none, 0,
             "and nothing may fold the history behind its back"
         );
         assert_same_resolved_graph(&served_base, &folded_base);
@@ -15807,23 +15920,21 @@ mod tests {
         // The mutation this catches is a reader that uses the section without
         // validating it. That reader passes the test above, because there the
         // section is correct; only a WRONG section separates the two.
-        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
-        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        let mut without = snapshot.clone();
+        without.materialized_graph = None;
+        let (folded_base, _, _) = resolve_base_counting_arms(&without, &metadata, &workspace);
 
-        let mut wrong = AuthorityHistoryView {
-            changes: &snapshot.changes,
-        }
-        .resolve_graph_at(&change_id)
-        .expect("the head resolves");
-        // Empty it, so a reader that serves this section without checking gives
-        // an answer that cannot be mistaken for the right one.
-        wrong.entities.clear();
-        wrong.relations.clear();
-        snapshot.materialized_graph = Some(MaterializedGraphSection {
-            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
-            resolved_at: SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32])),
-            state: wrong,
-        });
+        let mut wrong = snapshot
+            .materialized_graph
+            .clone()
+            .expect("a publish stamps a section");
+        // Emptied, so a reader that serves without checking gives an answer
+        // that cannot be mistaken for the right one.
+        wrong.state.entities.clear();
+        wrong.state.relations.clear();
+        wrong.resolved_at = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
+        snapshot.materialized_graph = Some(wrong);
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "a section for another change must not answer");
@@ -15836,21 +15947,19 @@ mod tests {
         // Separate from the target arm because the two can hide each other. A
         // validator that dropped the schema check entirely would still pass
         // the target test.
-        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
-        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        let mut without = snapshot.clone();
+        without.materialized_graph = None;
+        let (folded_base, _, _) = resolve_base_counting_arms(&without, &metadata, &workspace);
 
-        let mut wrong = AuthorityHistoryView {
-            changes: &snapshot.changes,
-        }
-        .resolve_graph_at(&change_id)
-        .expect("the head resolves");
-        wrong.entities.clear();
-        wrong.relations.clear();
-        snapshot.materialized_graph = Some(MaterializedGraphSection {
-            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION + 1,
-            resolved_at: change_id,
-            state: wrong,
-        });
+        let mut wrong = snapshot
+            .materialized_graph
+            .clone()
+            .expect("a publish stamps a section");
+        wrong.state.entities.clear();
+        wrong.state.relations.clear();
+        wrong.schema_version = MATERIALIZED_GRAPH_SCHEMA_VERSION + 1;
+        snapshot.materialized_graph = Some(wrong);
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "an unknown schema must not answer");
