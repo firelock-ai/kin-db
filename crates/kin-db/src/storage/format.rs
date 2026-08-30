@@ -995,7 +995,7 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
             Self::decode_frame(data, verify_checksum)?
         };
-        let mut snapshot = match frame.version {
+        let snapshot = match frame.version {
             Self::MIN_SUPPORTED_VERSION..=Self::MAX_SUPPORTED_VERSION => {
                 Self::decode_current_snapshot(frame.body)?
             }
