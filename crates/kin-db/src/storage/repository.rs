@@ -19438,8 +19438,68 @@ mod fir2334_attribution {
         }
         .resolve_graph_at(&change_id)
         .expect("resolve the head");
-        snapshot.materialized_graph =
-            Some(CapturedBaseGraph::capture(change_id, state).into_section());
+        let section = CapturedBaseGraph::capture(change_id, state).into_section();
+        // What the section costs, in the units the memory guards price in. The
+        // publish path holds this beside the base it was captured from, so this
+        // is the peak a capture adds.
+        let enc = |label: &str, bytes: usize, count: usize| {
+            println!("[cost] {label} bytes={bytes} count={count}");
+        };
+        enc(
+            "whole_section",
+            rmp_serde::to_vec(&section).expect("encodes").len(),
+            1,
+        );
+        enc(
+            "entities",
+            rmp_serde::to_vec(&section.state.entities)
+                .expect("encodes")
+                .len(),
+            section.state.entities.len(),
+        );
+        enc(
+            "relations",
+            rmp_serde::to_vec(&section.state.relations)
+                .expect("encodes")
+                .len(),
+            section.state.relations.len(),
+        );
+        enc(
+            "entity_revisions",
+            rmp_serde::to_vec(&section.state.entity_revisions)
+                .expect("encodes")
+                .len(),
+            section.state.entity_revisions.len(),
+        );
+        enc(
+            "entity_tombstones",
+            rmp_serde::to_vec(&section.state.entity_tombstones)
+                .expect("encodes")
+                .len(),
+            section.state.entity_tombstones.len(),
+        );
+        enc(
+            "relation_tombstones",
+            rmp_serde::to_vec(&section.state.relation_tombstones)
+                .expect("encodes")
+                .len(),
+            section.state.relation_tombstones.len(),
+        );
+        enc(
+            "tree",
+            rmp_serde::to_vec(&section.state.tree)
+                .expect("encodes")
+                .len(),
+            0,
+        );
+        enc(
+            "external_references",
+            rmp_serde::to_vec(&section.state.external_references)
+                .expect("encodes")
+                .len(),
+            section.state.external_references.len(),
+        );
+        snapshot.materialized_graph = Some(section);
 
         // AFTER: the same resolution, served.
         PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
