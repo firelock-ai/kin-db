@@ -2834,7 +2834,13 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
 
     let lap = tracing::info_span!("kindb.prepare.admission_verify").entered();
     verify_transaction_admission(
-        backend, current, &replay, &snapshot, &metadata, transaction, source,
+        backend,
+        current,
+        &replay,
+        &snapshot,
+        &metadata,
+        transaction,
+        source,
     )?;
     let admission_verify_ms = timer.lap_ms();
     drop(lap);
@@ -4531,13 +4537,9 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 // there is no safe default to choose: folding makes exclusion
                 // rules match more paths but makes their negations match more
                 // too, so neither case is uniformly stricter.
-                transfer_overlay = FrozenLocalOverlay::new(
-                    WorkspaceId(uuid::Uuid::nil()),
-                    0,
-                    case,
-                    Vec::new(),
-                )
-                .map_err(KinDbError::from)?;
+                transfer_overlay =
+                    FrozenLocalOverlay::new(WorkspaceId(uuid::Uuid::nil()), 0, case, Vec::new())
+                        .map_err(KinDbError::from)?;
                 (None, &transfer_overlay)
             }
         };
@@ -19738,6 +19740,75 @@ mod native_admission_lineage {
         sensitive.expect(
             "the same rule must NOT match under Sensitive, so this must be admitted; if it \
              refuses, the case is not reaching the shared matcher and carrying it buys nothing",
+        );
+    }
+
+    /// What the receiver-side sensitive check costs on a realistic first push.
+    ///
+    /// A receiver has no previous workspace, so nothing is skipped as
+    /// already-tracked and `verify_artifact_admission` loads every introduced
+    /// artifact's body. That is stricter than a local publish and it is not
+    /// free, so the cost is measured here rather than argued about.
+    ///
+    /// Ignored because it builds and commits a pack in the thousands of files.
+    /// Run it deliberately:
+    ///   cargo test -p kin-db --lib transferred_first_push_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement: builds a multi-thousand-file pack"]
+    fn transferred_first_push_cost() {
+        const REALISTIC_FILES: usize = 2_000;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+
+        // Bodies sized like real source rather than like a fixture: a few KB of
+        // plausible text each, so the per-artifact read is not measuring an
+        // empty file.
+        let mut deltas = Vec::with_capacity(REALISTIC_FILES);
+        let mut total_bytes = 0usize;
+        for file in 0..REALISTIC_FILES {
+            let path = format!("src/pkg_{}/module_{file}.rs", file % 40);
+            let body = format!(
+                "// module {file}\npub struct Item{file} {{ id: u64, name: String }}\n\n\
+                 impl Item{file} {{\n    pub fn new(id: u64) -> Self {{\n        \
+                 Self {{ id, name: format!(\"item-{{id}}\") }}\n    }}\n}}\n{}",
+                "// filler to reach a realistic body size\n".repeat(60)
+            )
+            .into_bytes();
+            total_bytes += body.len();
+            let hash = digest(&body);
+            manager.save_source_blob(hash, &body).expect("save blob");
+            deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(2_000_000 + file as u128)),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(path.into_bytes()).expect("path is valid"),
+                    TreeEntry::blob(hash, false),
+                ),
+            });
+        }
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let change = native_change(0, None, &shared, deltas);
+        let transaction = transaction_shell(&manager, 9, vec![change]);
+
+        let started = std::time::Instant::now();
+        let receipt = manager
+            .commit_transferred_repository_transaction(
+                transaction,
+                crate::admission::AdmissionCase::Sensitive,
+            )
+            .expect("a realistic first push must be admitted");
+        let elapsed = started.elapsed();
+
+        assert_eq!(receipt.generation, 1);
+        println!(
+            "MEASURED transferred first push: files={REALISTIC_FILES} bytes={total_bytes} \
+             elapsed_ms={} per_artifact_us={}",
+            elapsed.as_millis(),
+            elapsed.as_micros() / REALISTIC_FILES as u128
         );
     }
 }
