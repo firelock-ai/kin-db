@@ -19373,6 +19373,103 @@ mod fir2334_attribution {
         });
     }
 
+    /// Before and after, on one real store, in one process.
+    ///
+    /// The store is NOT rewritten. A section is built in memory from the same
+    /// `resolve_graph_at` a publish would capture, and the second arm resolves
+    /// against that. Rewriting the snapshot file to carry a section would
+    /// invalidate the durable validation record, which binds the snapshot's
+    /// sha256, and the next open would replay the whole history: the after arm
+    /// would then measure a store whose fast path is gone and present as a
+    /// regression this change did not cause.
+    ///
+    /// Both arms resolve the same workspace base at the same change through the
+    /// same function, so the only difference between them is whether a section
+    /// is present.
+    #[test]
+    #[ignore = "needs KIN_FIR2334_STORE naming a real kindb directory"]
+    fn measure_a_base_resolution_with_and_without_a_section() {
+        let store = std::env::var("KIN_FIR2334_STORE")
+            .expect("set KIN_FIR2334_STORE to a <repo>/.kin/kindb directory");
+        let repo = std::env::var("KIN_FIR2334_REPO")
+            .expect("set KIN_FIR2334_REPO to the repository id under that directory");
+        let repository_id = RepositoryId::new(&repo).expect("repository id");
+        let backend = Arc::new(crate::storage::backend::LocalFileBackend::new(&store));
+        let manager = RepositoryAuthorityManager::open(repository_id, backend)
+            .expect("open repository authority");
+        let lease = manager.read_authority();
+        let metadata = lease.metadata().clone();
+        let workspace = metadata.workspaces[0].clone();
+        let mut snapshot = lease.snapshot().clone();
+        drop(lease);
+
+        let change_id = target_change_id(
+            &metadata,
+            workspace
+                .base_target
+                .as_ref()
+                .expect("the workspace bases at a change"),
+        )
+        .expect("the base target names a change");
+
+        println!(
+            "[subject] changes={} section_present={}",
+            snapshot.changes.len(),
+            snapshot.materialized_graph.is_some()
+        );
+
+        // BEFORE: no section, so the base is folded out of history.
+        snapshot.materialized_graph = None;
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+        let started = std::time::Instant::now();
+        let folded = resolve_workspace_base_graph_snapshot(
+            &snapshot,
+            &metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )
+        .expect("fold the base");
+        println!("[TERM] before_resolve_ms={}", started.elapsed().as_millis());
+        print_phase_log("before");
+
+        // The section a publish would have written, from the same call.
+        let state = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("resolve the head");
+        snapshot.materialized_graph =
+            Some(CapturedBaseGraph::capture(change_id, state).into_section());
+
+        // AFTER: the same resolution, served.
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+        let started = std::time::Instant::now();
+        let served = resolve_workspace_base_graph_snapshot(
+            &snapshot,
+            &metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )
+        .expect("serve the base");
+        println!("[TERM] after_resolve_ms={}", started.elapsed().as_millis());
+        print_phase_log("after");
+
+        // The measurement is worth nothing if the two answers differ, so this
+        // is asserted rather than reported.
+        assert_eq!(folded.entities, served.entities, "entities");
+        assert_eq!(folded.relations, served.relations, "relations");
+        assert_eq!(folded.resolved_tree, served.resolved_tree, "resolved_tree");
+        assert_eq!(
+            folded.entity_revisions, served.entity_revisions,
+            "entity_revisions"
+        );
+        println!(
+            "[equal] entities={} relations={}",
+            served.entities.len(),
+            served.relations.len()
+        );
+    }
+
     #[test]
     #[ignore = "needs KIN_FIR2334_STORE naming a real kindb directory"]
     fn attribute_one_successor_preparation() {
