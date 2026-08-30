@@ -14236,8 +14236,14 @@ mod tests {
         manager
             .commit_repository_transaction(arbitrary_repository_transaction(&manager))
             .expect("the fixture's first commit must land");
+        // The second transaction needs its own operation id. The fixture helper
+        // mints a fixed one, and committing it twice is refused as "operation
+        // ... was already committed with a different transaction hash", which
+        // CI reported before this line existed.
+        let mut second = arbitrary_repository_transaction(&manager);
+        second.operation_id = OperationId::from_uuid(Uuid::from_u128(0x5eed_0002));
         manager
-            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .commit_repository_transaction(second)
             .expect("the fixture's second commit must land");
 
         // The control that makes this test about the journal walk, and the one
