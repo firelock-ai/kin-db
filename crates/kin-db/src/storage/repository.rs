@@ -19571,6 +19571,19 @@ mod fir2334_attribution {
             "[TERM] graph_build_without_revisions_ms={}",
             started.elapsed().as_millis()
         );
+        // READ THESE TWO NUMBERS ACROSS ARMS BEFORE SUBTRACTING THEM.
+        //
+        // Measured 2026-08-30 on the converted psf/requests store: the deltas
+        // over three arms were 36, 1,373 and 1,185 ms, while the spread of the
+        // `with` measurement ALONE across the same three arms was 1,397 ms. The
+        // noise is larger than the signal, so this difference is not resolvable
+        // at this precision, and a single arm reported 4,102 ms, outside even
+        // that range. One reading of it was published as a finding and had to be
+        // retracted.
+        //
+        // The line below is the one that repeats: it read 4,693 against 5,979
+        // and `false` in every arm, character for character, because it is not a
+        // timing.
 
         // And the correctness half: a re-derived timeline has to be the one the
         // section would have carried, or the narrowing is not a trade, it is a
