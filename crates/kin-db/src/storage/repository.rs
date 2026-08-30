@@ -5946,6 +5946,18 @@ fn resolve_workspace_base_graph_snapshot(
                     Ok(state) => {
                         #[cfg(test)]
                         BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.set(count.get() + 1));
+                        // Both paths are timed by the same `history_resolve_ms`
+                        // below, and a served base makes it small. Without a
+                        // line here a reader sees a small number and no way to
+                        // tell whether the fold got faster or never ran, which
+                        // is a measurement surface that cannot be read. Every
+                        // outcome now says which path produced the timing.
+                        tracing::debug!(
+                            change = %change_id,
+                            entities = state.entities.len(),
+                            relations = state.relations.len(),
+                            "served the workspace base from a materialized graph section"
+                        );
                         state
                     }
                     Err(refusal) => {
