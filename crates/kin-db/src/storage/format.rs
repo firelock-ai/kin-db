@@ -311,6 +311,92 @@ pub(crate) struct GraphSnapshotRoundTripProof {
     pub(crate) entity_revisions: DrainMap<EntityId, Vec<EntityRevision>>,
     pub(crate) repository_authority: Option<PersistedRepositoryAuthority>,
     pub(crate) external_references: DrainMap<ExternalReferenceId, ExternalReference>,
+    /// Mirrors the appended v14 field, with the same `default` so this proof
+    /// reads a v13 body exactly as the real decoder does.
+    #[serde(default)]
+    pub(crate) materialized_graph: Option<MaterializedGraphSection>,
+}
+
+/// Schema of [`MaterializedGraphSection`] itself.
+///
+/// Separate from the snapshot format version because the two move for
+/// different reasons. The snapshot version changes when the positional body
+/// changes width; this changes when what a field inside the section MEANS
+/// moves. A section whose schema this binary does not know is ignored and the
+/// graph is replayed, which is always available, so an unknown schema costs
+/// time and never correctness.
+pub const MATERIALIZED_GRAPH_SCHEMA_VERSION: u32 = 1;
+
+/// The resolved graph at one change, persisted beside the history it was
+/// folded from.
+///
+/// A converted repository's snapshot IS its history: the `changes` map is
+/// most of the body, while the entities and relations a daemon actually serves
+/// are absent from the file and folded out of that history at every open by
+/// `ChangeStore::resolve_graph_at`. This section is that fold, written once by
+/// the publish that produced it and read directly afterwards.
+///
+/// It is derived state, not authority, and the distinction is load-bearing in
+/// both directions. Nothing here is hashed into [`RootBundle`], because the
+/// authority over a graph is the change map it comes from; and every read
+/// checks this section against that change map's own root before trusting it,
+/// so a section that does not belong to these bytes is ignored rather than
+/// served.
+///
+/// `outgoing` and `incoming` are deliberately absent. Workspace
+/// materialization rebuilds adjacency from `relations` already, so persisting
+/// them would enlarge the section for no reader.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedGraphSection {
+    /// Schema of this section. See [`MATERIALIZED_GRAPH_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The change this graph is the resolution AT.
+    ///
+    /// `None` is the unborn repository's empty graph, which is a real answer
+    /// and not an absence, so it is distinguished from an absent section by
+    /// the enclosing `Option` rather than by this field.
+    pub resolved_at: Option<SemanticChangeId>,
+    /// `RootBundle::history` as it stood over the change map this was folded
+    /// from.
+    ///
+    /// This is the whole validation. The root is a SHA-256 over the entire
+    /// change map, it is recomputed and compared against that map on every
+    /// validated publish, and it sits in the authority envelope, so a reader
+    /// can compare the two without decoding a single change.
+    pub history_root: Hash256,
+    pub entities: HashMap<EntityId, Entity>,
+    pub relations: HashMap<RelationId, Relation>,
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+}
+
+/// Why a persisted section was not used, named one reason at a time.
+///
+/// A refusal is a diagnosis rather than a shrug, in the shape
+/// `PreparedWorkspaceGraphCache` already uses for the same class of decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedGraphRefusal {
+    /// The snapshot carries no section. Every v13 store lands here.
+    Absent,
+    /// The section names a schema this binary does not know.
+    Schema { held: u32, found: u32 },
+    /// The section was folded from a different change map.
+    History,
+    /// The section resolves at a different change than the caller asked for.
+    Target,
+}
+
+impl std::fmt::Display for MaterializedGraphRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Schema { held, found } => {
+                write!(formatter, "schema (holding {held}, section names {found})")
+            }
+            Self::History => formatter.write_str("history_root"),
+            Self::Target => formatter.write_str("resolved_at"),
+        }
+    }
 }
 
 /// The serializable snapshot of the entire graph state.
@@ -369,6 +455,19 @@ pub struct GraphSnapshot {
     /// this struct positionally. Reordering an existing field would reinterpret
     /// persisted bytes instead of failing closed at the v13 format boundary.
     pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    /// The resolved graph at one change, or `None` to derive it by replay.
+    ///
+    /// Appended after every v13 field, for the reason the field above records:
+    /// MessagePack encodes this struct positionally, so appending fails closed
+    /// at a format boundary while reordering would reinterpret persisted bytes.
+    ///
+    /// `serde(default)` is what lets ONE decoder read a v13 body and a v14
+    /// body: the v13 array runs out of elements here and the field takes
+    /// `None`. Nothing is skipped on serialize, so a v14 body is always 36
+    /// elements wide and width stays a function of version alone, which is the
+    /// property both partial decoders below use as their discriminator.
+    #[serde(default)]
+    pub materialized_graph: Option<MaterializedGraphSection>,
 }
 
 fn deserialize_required_repository_authority<'de, D>(
@@ -447,10 +546,22 @@ pub(crate) struct LocateGraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 13;
+    ///
+    /// v14 APPENDS one element to the positional body, `materialized_graph`,
+    /// and moves nothing. That is the whole reason the bump is cheap: a v13
+    /// body is a v14 body with its last element missing, and the field's
+    /// `serde(default)` supplies it, so one decoder reads both widths and no
+    /// second copy of the field list exists to drift.
+    pub const CURRENT_VERSION: u32 = 14;
 
-    /// The only on-disk format version this pre-release binary accepts.
-    pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
+    /// The oldest on-disk format version this binary opens.
+    ///
+    /// Deliberately a literal rather than `Self::CURRENT_VERSION`. While the
+    /// two were one constant, every bump made every existing store unopenable
+    /// on the same commit, which is the wrong price for a change that only
+    /// appends a field. A store any shipped version wrote still opens here and
+    /// still derives its graph by replay.
+    pub const MIN_SUPPORTED_VERSION: u32 = 13;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -465,6 +576,7 @@ impl GraphSnapshot {
 
     pub fn empty() -> Self {
         Self {
+            materialized_graph: None,
             version: Self::CURRENT_VERSION,
             entities: HashMap::new(),
             relations: HashMap::new(),
@@ -821,10 +933,29 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
             Self::decode_frame(data, verify_checksum)?
         };
-        let snapshot = match frame.version {
-            Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
+        let mut snapshot = match frame.version {
+            Self::MIN_SUPPORTED_VERSION..=Self::CURRENT_VERSION => {
+                Self::decode_current_snapshot(frame.body)?
+            }
             _ => unreachable!("decode_frame validates supported versions"),
         };
+        // The header and the body both carry a version and nothing made them
+        // agree. While there was one supported version the question could not
+        // arise; with two it can, and a decoder that dispatches on the header
+        // while trusting the body's own claim is a check that cannot fail.
+        if snapshot.version != frame.version {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "snapshot header declares v{} but its body declares v{}",
+                frame.version, snapshot.version
+            )));
+        }
+        // An older body decodes into the current in-memory shape with its
+        // appended field defaulted, so the value this returns IS a v14
+        // snapshot and says so. Leaving 13 here would make the very next
+        // `to_bytes` refuse its own decoded object. No root hashes the version,
+        // so raising it moves no authority: checked against every one of the
+        // six root functions, none reads `snapshot.version`.
+        snapshot.version = Self::CURRENT_VERSION;
         if validate_storage_admission {
             snapshot.validate_storage_admission()?;
         }
@@ -881,10 +1012,16 @@ impl GraphSnapshot {
         let body = &data[16..body_end];
 
         match version {
-            Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v13")?;
+            // Every version in the supported range shares one frame layout;
+            // they differ only in how wide the MessagePack body array is. The
+            // label is derived from the version rather than written as a
+            // literal, because a hardcoded "v13" in a v14 refusal names the
+            // wrong format at exactly the moment a reader needs the right one.
+            Self::MIN_SUPPORTED_VERSION..=Self::CURRENT_VERSION => {
+                let label = format!("v{version}");
+                let checksum_end = Self::require_checksum_slot(data, body_len, &label)?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v13")?)
+                    Some(Self::verify_checksum(data, body_len, &label)?)
                 } else {
                     None
                 };
@@ -1477,12 +1614,21 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     });
                 }
 
-                if seq.size_hint() != Some(35) {
-                    return Err(serde::de::Error::invalid_length(
-                        seq.size_hint().unwrap_or_default(),
-                        &self,
-                    ));
-                }
+                // The canonical body is 35 elements at v13 and 36 at v14; the
+                // appended element is the materialized graph, which locate does
+                // not read. This used to be a bare `35`, which would have made
+                // every v14 store fail here with `invalid_length` while the
+                // named constant one screen up said 36.
+                let width = match seq.size_hint() {
+                    Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    other => {
+                        return Err(serde::de::Error::invalid_length(
+                            other.unwrap_or_default(),
+                            &self,
+                        ))
+                    }
+                };
 
                 let version = seq
                     .next_element()?
@@ -1542,6 +1688,11 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let external_references = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
+                if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                    let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
+                    })?;
+                }
 
                 Ok(LocateGraphSnapshot {
                     version,
@@ -1590,6 +1741,66 @@ pub struct AuthorityEnvelopeSnapshot {
     pub version: u32,
     /// The envelope. `None` is a legacy graph-only snapshot with no authority.
     pub repository_authority: Option<PersistedRepositoryAuthority>,
+    /// The resolved graph these bytes carry, if any.
+    ///
+    /// Read here rather than through a third partial decoder on purpose. A
+    /// second copy of a 36-element field list is only ever wrong in a way that
+    /// looks like a passing run, and this reader already walks past the section
+    /// to reach the envelope, so keeping it costs one more element.
+    pub materialized_graph: Option<MaterializedGraphSection>,
+}
+
+impl AuthorityEnvelopeSnapshot {
+    /// The section this envelope carries, or the reason it cannot be used.
+    ///
+    /// `resolved_at` is the change the caller intends to resolve the graph at.
+    /// It is checked because [`RootBundle::history`] covers the whole change
+    /// map and says nothing about WHICH change you resolve at, so two
+    /// workspaces at different heads share a history root and need different
+    /// graphs. Without this check the section would answer the wrong graph
+    /// under a correct hash, which is the failure this design most has to
+    /// avoid.
+    pub fn materialized_graph_for(
+        &self,
+        resolved_at: Option<&SemanticChangeId>,
+    ) -> Result<&MaterializedGraphSection, MaterializedGraphRefusal> {
+        let authority = self
+            .repository_authority
+            .as_ref()
+            .ok_or(MaterializedGraphRefusal::Absent)?;
+        let section = self
+            .materialized_graph
+            .as_ref()
+            .ok_or(MaterializedGraphRefusal::Absent)?;
+        section.validate_for(authority.roots.history.hash, resolved_at)?;
+        Ok(section)
+    }
+}
+
+impl MaterializedGraphSection {
+    /// Whether this section may answer for `history_root` at `resolved_at`.
+    ///
+    /// Every arm returns a DIFFERENT refusal, so a falsification can read which
+    /// check answered rather than only that one did.
+    pub fn validate_for(
+        &self,
+        history_root: Hash256,
+        resolved_at: Option<&SemanticChangeId>,
+    ) -> Result<(), MaterializedGraphRefusal> {
+        if self.schema_version != MATERIALIZED_GRAPH_SCHEMA_VERSION {
+            return Err(MaterializedGraphRefusal::Schema {
+                held: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+                found: self.schema_version,
+            });
+        }
+        if self.history_root != history_root {
+            return Err(MaterializedGraphRefusal::History);
+        }
+        if self.resolved_at.as_ref() != resolved_at {
+            return Err(MaterializedGraphRefusal::Target);
+        }
+        Ok(())
+    }
 }
 
 impl AuthorityEnvelopeSnapshot {
@@ -1635,12 +1846,23 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // `LocateGraphSnapshot`. The eleven-field locate projection
                 // carries no envelope at all, so it is refused by name here
                 // rather than silently decoding as an absent authority.
-                if seq.size_hint() != Some(GRAPH_SNAPSHOT_FIELD_COUNT) {
-                    return Err(serde::de::Error::invalid_length(
-                        seq.size_hint().unwrap_or_default(),
-                        &self,
-                    ));
-                }
+                // Width is the format discriminator and it is a function of
+                // the snapshot version alone: v13 bodies are 35 elements, v14
+                // bodies are 36, and nothing is skipped on serialize so the
+                // width never varies within a version. The eleven-field locate
+                // projection carries no envelope at all, so it is refused by
+                // width here rather than silently decoding as an absent
+                // authority.
+                let width = match seq.size_hint() {
+                    Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    other => {
+                        return Err(serde::de::Error::invalid_length(
+                            other.unwrap_or_default(),
+                            &self,
+                        ))
+                    }
+                };
 
                 let version = seq
                     .next_element()?
@@ -1656,10 +1878,18 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
                     serde::de::Error::invalid_length(REPOSITORY_AUTHORITY_FIELD_INDEX + 1, &self)
                 })?;
+                let materialized_graph = if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                    seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
+                    })?
+                } else {
+                    None
+                };
 
                 Ok(AuthorityEnvelopeSnapshot {
                     version,
                     repository_authority,
+                    materialized_graph,
                 })
             }
         }
@@ -1674,8 +1904,15 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
 /// round-trip proof have to agree about the same array, and a field appended to
 /// `GraphSnapshot` moves the envelope. `the_envelope_index_names_the_authority`
 /// pins both against the struct itself.
-pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 35;
+pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 36;
+/// The v13 body's width, which is the current width minus the appended field.
+///
+/// Kept as its own constant rather than as `FIELD_COUNT - 1` so that a future
+/// append has to state what the older widths were instead of silently
+/// redefining one of them.
+pub(crate) const GRAPH_SNAPSHOT_V13_FIELD_COUNT: usize = 35;
 pub(crate) const REPOSITORY_AUTHORITY_FIELD_INDEX: usize = 33;
+pub(crate) const MATERIALIZED_GRAPH_FIELD_INDEX: usize = 35;
 
 struct SnapshotFrame<'a> {
     version: u32,
@@ -1742,10 +1979,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 35 fields in the same order as GraphSnapshot's
-        // derive(Serialize).  rmp_serde serializes structs as arrays, so
-        // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 35)?;
+        // Must produce exactly GRAPH_SNAPSHOT_FIELD_COUNT fields in the same
+        // order as GraphSnapshot's derive(Serialize).  rmp_serde serializes
+        // structs as arrays, so position (not name) determines the mapping.
+        let mut state = serializer.serialize_struct("GraphSnapshot", GRAPH_SNAPSHOT_FIELD_COUNT)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1829,6 +2066,12 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         )?;
         // 35. Resolved external symbols (append-only v13 field).
         state.serialize_field("external_references", self.external_references)?;
+        // 36. A live mutable graph is not a published repository authority, so
+        // it has no history root to bind a section to and never carries one.
+        state.serialize_field(
+            "materialized_graph",
+            &Option::<MaterializedGraphSection>::None,
+        )?;
         state.end()
     }
 }
