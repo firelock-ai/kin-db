@@ -3135,7 +3135,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // `changes` is final once admission above returns, and the steps below
     // mutate only the detached metadata. One shared decode serves them all.
     let replay = SharedReplayGraph::new(&snapshot);
-    let captured_base = apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
+    apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
     let workspace_ms = timer.lap_ms();
     drop(lap);
 
@@ -3213,31 +3213,11 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     let roots_ms = timer.lap_ms();
     drop(lap);
 
-    // The section is stamped AFTER the roots, deliberately. No root function
-    // reads it, checked against all six, so a store's roots and therefore its
-    // replicated identity are byte for byte what they would be without one;
-    // stamping before would still be correct today and would silently stop
-    // being so the first time a root learns to read this field.
-    //
-    // `None` when the publish moved no workspace, or when the resolution it did
-    // perform could not be captured whole. A publish that cannot produce a
-    // complete section writes none: the next open folds, which is what it would
-    // have done anyway, and a partial section would be a claim about tombstones
-    // it did not earn.
-    snapshot.materialized_graph = captured_base.map(CapturedBaseGraph::into_section);
-    if let Some(section) = snapshot.materialized_graph.as_ref() {
-        tracing::debug!(
-            repository = %transaction.repository_id,
-            generation = next_generation,
-            change = %section.resolved_at,
-            entities = section.state.entities.len(),
-            relations = section.state.relations.len(),
-            "stamped a materialized graph section onto the successor snapshot"
-        );
-    }
-    // Version and contents are one fact, so the successor declares the version
-    // its own bytes will serialize as. Leaving this at the base's version would
-    // make `to_bytes` refuse the successor it just built.
+    // A publish carries whatever section its base already had, or none, and
+    // never writes one: see the note in `apply_workspace`. The version still
+    // has to follow the contents, because a successor built from a base that
+    // carried a section is itself a v14 snapshot and `to_bytes` refuses any
+    // snapshot whose declared version disagrees with what it holds.
     snapshot.version = snapshot.wire_version();
 
     let lap = tracing::info_span!("kindb.prepare.storage_admission").entered();
@@ -4392,12 +4372,9 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
-) -> Result<Option<CapturedBaseGraph>, KinDbError> {
+) -> Result<(), KinDbError> {
     let Some(mutation) = &transaction.workspace_mutation else {
-        // No workspace moved, so no base was resolved and there is nothing to
-        // persist. The successor keeps whatever section it inherited, which is
-        // either still correct for its workspace's base or refused by name.
-        return Ok(None);
+        return Ok(());
     };
     let mut workspaces: BTreeMap<WorkspaceId, WorkspaceState> = metadata
         .workspaces
@@ -4428,19 +4405,28 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // this whole lap. The lap is the largest single term in a full-history
     // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    // The one Retain in the tree. This resolution is at
-    // `mutation.new_base_target`, and the successor's own check below refuses
-    // unless its base target is that same target, so the state captured here is
-    // the resolution at exactly the change a section names. No other resolution
-    // is asked to capture, and none of them pays for one.
-    let (next_base, captured_base) = {
+    // Deliberately NOT capturing here, and the reason is measured rather than
+    // stylistic. This resolution is at exactly the change a section names, so
+    // capturing it is tempting and was tried; it holds the resolved state as a
+    // second copy for the rest of the mutation, and
+    // `a_workspace_mutation_does_not_hold_the_whole_history_four_times` read
+    // 7.17 copies of the history against a ceiling of 4.4 and an intact reading
+    // of 4.08. That guard is calibrated and its ceiling is not the thing to
+    // move: the section is 185 MiB on a converted store, of which
+    // `entity_revisions` is 173.8 MiB, and it cannot be narrowed because a base
+    // with empty revisions is a DIFFERENT answer (FIR-3048).
+    //
+    // So a publish does not write sections. An explicit materialize operation
+    // does, where paying one graph copy is the point of the command rather than
+    // a tax on every commit, and where a store that never runs it simply keeps
+    // folding.
+    let next_base = {
         let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
-        resolve_workspace_base_graph_snapshot_capturing(
+        resolve_workspace_base_graph_snapshot(
             snapshot,
             metadata,
             mutation.new_base_target.as_ref(),
             WorkspaceBaseHistory::Omitted,
-            WorkspaceBaseCapture::Retain,
         )?
     };
 
@@ -4543,11 +4529,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     WORKSPACE_MUTATION_BASE_CHANGES.with(|count| {
         count.set(WORKSPACE_BASE_CHANGES.with(|total| total.get()) - base_changes_before)
     });
-    // Handed up rather than stamped here, because the snapshot this belongs on
-    // is the successor `prepare_successor` is still assembling, and stamping it
-    // before the roots are computed would put a section inside the state the
-    // roots are computed over.
-    Ok(captured_base)
+    Ok(())
 }
 
 /// Recompute repository admission from the successor authority itself.
@@ -15792,49 +15774,59 @@ mod tests {
     }
 
     #[test]
-    fn a_publish_stamps_a_section_at_the_workspace_base_it_resolved() {
-        // The writer, end to end. The synthetic store is built by real
-        // publishes, so if the stamp works this snapshot arrives carrying a
-        // section, and it names the change the workspace bases at.
-        let (snapshot, _, workspace, change_id) = synthetic_base_fixture();
-        let section = snapshot
-            .materialized_graph
-            .as_ref()
-            .expect("a publish that moved a workspace stamps a section");
-        assert_eq!(
-            section.resolved_at, change_id,
-            "the section must name the change the workspace bases at, or it answers for another"
-        );
-        assert_eq!(section.schema_version, MATERIALIZED_GRAPH_SCHEMA_VERSION);
+    fn a_publish_writes_no_section_and_that_is_deliberate() {
+        // A guard on a decision, not on an accident. Capturing the resolved
+        // state at `next_base` costs a second copy for the rest of a workspace
+        // mutation, and `a_workspace_mutation_does_not_hold_the_whole_history_four_times`
+        // read 7.17 copies of the history against a 4.4 ceiling when it was
+        // tried. Sections are written by an explicit operation instead, so this
+        // test exists to make a future re-introduction on the publish path
+        // visible rather than merely slow.
+        let (snapshot, _, _, _) = synthetic_base_fixture();
         assert!(
-            !section.state.entities.is_empty(),
-            "an empty section would make every comparison below vacuous"
+            snapshot.materialized_graph.is_none(),
+            "a publish must not write a materialized graph section; see the note in \
+             apply_workspace and the memory guard it names"
         );
-        assert_eq!(
-            snapshot.version,
-            GraphSnapshot::MAX_SUPPORTED_VERSION,
-            "a snapshot carrying a section is a v14 snapshot and must say so"
-        );
-        let _ = workspace;
+    }
+
+    /// A section stamped by hand, standing in for what the materialize
+    /// operation will write.
+    ///
+    /// Built through `CapturedBaseGraph` rather than by assembling a
+    /// `MaterializedGraphSection` literal, so these tests exercise the same
+    /// one-constructor path the real writer uses and cannot accidentally build
+    /// a section no producer could.
+    fn stamp_a_section(snapshot: &mut GraphSnapshot, change_id: SemanticChangeId) {
+        let state = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        snapshot.materialized_graph =
+            Some(CapturedBaseGraph::capture(change_id, state).into_section());
+        snapshot.version = snapshot.wire_version();
     }
 
     #[test]
-    fn the_section_a_publish_wrote_is_what_the_history_folds_to() {
-        // The writer's own obligation, and the one no read-time check can make
+    fn a_stamped_section_is_what_the_history_folds_to() {
+        // The writer's obligation, and the one no read-time check can make
         // cheaply: the memo equals the call. Compared over the real set rather
         // than by counting, because the right number of the wrong entities
         // passes a count.
-        let (snapshot, _, _, change_id) = synthetic_base_fixture();
+        let (mut snapshot, _, _, change_id) = synthetic_base_fixture();
+        stamp_a_section(&mut snapshot, change_id);
         let section = snapshot
             .materialized_graph
             .as_ref()
-            .expect("a publish stamps a section");
+            .expect("the stamp put one there");
         let folded = AuthorityHistoryView {
             changes: &snapshot.changes,
         }
         .resolve_graph_at(&change_id)
         .expect("the head resolves");
 
+        assert_eq!(section.resolved_at, change_id);
         assert_eq!(
             section.state.entities.keys().collect::<BTreeSet<_>>(),
             folded.entities.keys().collect::<BTreeSet<_>>()
@@ -15855,33 +15847,17 @@ mod tests {
             section.state.external_references,
             folded.external_references
         );
-        // The two domains the base snapshot drops, which is the whole reason
-        // the capture is taken before it. Both are empty on this fixture, which
-        // is stated rather than left to read as coverage: what this arm pins is
-        // that the section carries the SAME tombstone maps the fold produced,
-        // and `the_capture_carries_tombstones_the_base_would_have_dropped`
-        // below is where a non-empty pair is exercised.
-        assert_eq!(
-            section.state.entity_tombstones.len(),
-            folded.entity_tombstones.len()
-        );
-        assert_eq!(
-            section.state.relation_tombstones.len(),
-            folded.relation_tombstones.len()
+        assert!(
+            !section.state.entities.is_empty(),
+            "an empty section would make every comparison above vacuous"
         );
     }
 
     #[test]
     fn a_store_with_no_section_folds_its_base_out_of_history() {
-        // The control for every arm below. The fixture now ARRIVES with a
-        // section, because the writer landed, so the no-section case is
-        // constructed by clearing it rather than by finding it.
-        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
-        assert!(
-            snapshot.materialized_graph.take().is_some(),
-            "the fixture is expected to carry a section; clearing nothing would make this arm \
-             agree with the served arm for the wrong reason"
-        );
+        // The control for every arm below.
+        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        assert!(snapshot.materialized_graph.is_none());
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "there is no section to serve");
@@ -15894,22 +15870,17 @@ mod tests {
 
     #[test]
     fn a_store_with_a_section_serves_its_base_without_folding_history() {
-        // End to end: the section this serves was written by a publish, not
-        // stamped by the test. The folded arm is the same store with the
-        // section cleared, so the only difference between them is the section.
-        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
-        assert!(snapshot.materialized_graph.is_some());
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, folded_first) =
+            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(folded_first, 1, "the first pass must be the fold");
 
-        let mut without = snapshot.clone();
-        without.materialized_graph = None;
-        let (folded_base, _, folded) = resolve_base_counting_arms(&without, &metadata, &workspace);
-        assert_eq!(folded, 1, "the control arm must be the fold");
-
-        let (served_base, served, folded_none) =
+        stamp_a_section(&mut snapshot, change_id);
+        let (served_base, served, folded) =
             resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 1, "the section must answer");
         assert_eq!(
-            folded_none, 0,
+            folded, 0,
             "and nothing may fold the history behind its back"
         );
         assert_same_resolved_graph(&served_base, &folded_base);
@@ -15920,15 +15891,14 @@ mod tests {
         // The mutation this catches is a reader that uses the section without
         // validating it. That reader passes the test above, because there the
         // section is correct; only a WRONG section separates the two.
-        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
-        let mut without = snapshot.clone();
-        without.materialized_graph = None;
-        let (folded_base, _, _) = resolve_base_counting_arms(&without, &metadata, &workspace);
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
 
+        stamp_a_section(&mut snapshot, change_id);
         let mut wrong = snapshot
             .materialized_graph
             .clone()
-            .expect("a publish stamps a section");
+            .expect("the stamp put one there");
         // Emptied, so a reader that serves without checking gives an answer
         // that cannot be mistaken for the right one.
         wrong.state.entities.clear();
@@ -15947,15 +15917,14 @@ mod tests {
         // Separate from the target arm because the two can hide each other. A
         // validator that dropped the schema check entirely would still pass
         // the target test.
-        let (mut snapshot, metadata, workspace, _) = synthetic_base_fixture();
-        let mut without = snapshot.clone();
-        without.materialized_graph = None;
-        let (folded_base, _, _) = resolve_base_counting_arms(&without, &metadata, &workspace);
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
 
+        stamp_a_section(&mut snapshot, change_id);
         let mut wrong = snapshot
             .materialized_graph
             .clone()
-            .expect("a publish stamps a section");
+            .expect("the stamp put one there");
         wrong.state.entities.clear();
         wrong.state.relations.clear();
         wrong.schema_version = MATERIALIZED_GRAPH_SCHEMA_VERSION + 1;
