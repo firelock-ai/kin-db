@@ -19528,6 +19528,61 @@ mod fir2334_attribution {
             served.entities.len(),
             served.relations.len()
         );
+
+        // THE THIRD ARM. `entity_revisions` is 94 percent of a section's bytes,
+        // so the obvious narrowing is to leave it out. What that costs is not
+        // obvious: on the read path the base carries the change map, and
+        // `InMemoryGraph::from_snapshot` re-derives the revision timeline when
+        // it arrives empty and changes do not, which this crate calls the
+        // largest thing a conversion's workspace lap does. So the saving may be
+        // handed straight back here, and this arm is the only way to know.
+        //
+        // The base is resolved CARRYING the history, because that is the shape
+        // the read path uses and the shape in which the re-derivation can fire
+        // at all.
+        let carried = resolve_workspace_base_graph_snapshot(
+            &snapshot,
+            &metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Carried(None),
+        )
+        .expect("resolve carrying the history");
+        println!(
+            "[carried] changes={} revisions={}",
+            carried.changes.len(),
+            carried.entity_revisions.len()
+        );
+
+        let mut without_revisions = carried.clone();
+        without_revisions.entity_revisions.clear();
+
+        let started = std::time::Instant::now();
+        let with_graph = InMemoryGraph::from_snapshot_without_text_index(carried)
+            .expect("build over a base that carries its revisions");
+        println!(
+            "[TERM] graph_build_with_revisions_ms={}",
+            started.elapsed().as_millis()
+        );
+
+        let started = std::time::Instant::now();
+        let without_graph = InMemoryGraph::from_snapshot_without_text_index(without_revisions)
+            .expect("build over a base whose revisions were left out");
+        println!(
+            "[TERM] graph_build_without_revisions_ms={}",
+            started.elapsed().as_millis()
+        );
+
+        // And the correctness half: a re-derived timeline has to be the one the
+        // section would have carried, or the narrowing is not a trade, it is a
+        // different answer.
+        let with_snapshot = with_graph.to_snapshot();
+        let without_snapshot = without_graph.to_snapshot();
+        println!(
+            "[revisions] carried={} rederived={} equal={}",
+            with_snapshot.entity_revisions.len(),
+            without_snapshot.entity_revisions.len(),
+            with_snapshot.entity_revisions == without_snapshot.entity_revisions
+        );
     }
 
     #[test]
