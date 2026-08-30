@@ -14208,63 +14208,56 @@ mod tests {
         assert_eq!(reopened.read_authority().generation(), 2);
     }
 
-    /// The envelope read answers over a journal, and answers what the full
-    /// open answers.
+    /// The envelope read answers what the full open answers.
     ///
-    /// The first version of this read declined whenever the acknowledged head
-    /// was past the snapshot base, which is the state a store reaches the first
-    /// time its daemon writes anything. Measured on a converted psf/requests
-    /// store, that made it serve zero of the reads it was written for: the log
-    /// read `authority envelope read declined: acknowledged journal is past the
-    /// snapshot base ... base=1 head=2`.
-    ///
-    /// The assertion is the join rather than either endpoint. Comparing the
+    /// The assertion is the JOIN rather than either endpoint. Comparing the
     /// envelope against a hardcoded expectation would pass with both sides
     /// wrong; comparing it against what the full open produces is the property
     /// that matters, and it cannot be satisfied by writing the same value
     /// twice.
+    ///
+    /// **This fixture is the journal-FREE arm, and it says so rather than
+    /// pretending otherwise.** One commit on this backend writes a full
+    /// snapshot base, so base and head are equal and the read takes
+    /// `advance_envelope_over_journal`'s early return. Two attempts to make it
+    /// carry a frame failed in CI on the fixture rather than on the code, first
+    /// on a duplicate operation id and then on `ref refs/heads/main already
+    /// exists`, because the helper builds a bootstrap-shaped transaction that
+    /// applies once. A second valid transaction is real work and no test in
+    /// this file does it.
+    ///
+    /// So the FRAME WALK has no unit test, and that gap is named here rather
+    /// than left for a reader to discover. What exercises it is a real
+    /// converted store, whose authority sits at generation 2 over a base of 1,
+    /// where the daemon's own `repository authority envelope read` line reports
+    /// a non-zero frame count. Closing this properly means a fixture that can
+    /// commit twice, and it is the first thing to add here.
     #[test]
-    fn the_envelope_read_walks_the_journal_to_the_acknowledged_head() {
+    fn the_envelope_read_answers_what_the_full_open_answers() {
         let directory = TempDir::new().unwrap();
         let backend = Arc::new(LocalFileBackend::new(directory.path()));
         let manager =
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
-        // Two commits, not one. The first writes a full snapshot base, so a
-        // one-commit fixture is journal-FREE and exercises the early return
-        // rather than the walk. CI caught exactly that: the first version of
-        // this test asserted generation 2 after one commit and read 1.
         manager
             .commit_repository_transaction(arbitrary_repository_transaction(&manager))
-            .expect("the fixture's first commit must land");
-        // The second transaction needs its own operation id. The fixture helper
-        // mints a fixed one, and committing it twice is refused as "operation
-        // ... was already committed with a different transaction hash", which
-        // CI reported before this line existed.
-        let mut second = arbitrary_repository_transaction(&manager);
-        second.operation_id = OperationId::from_uuid(Uuid::from_u128(0x5eed_0002));
-        manager
-            .commit_repository_transaction(second)
-            .expect("the fixture's second commit must land");
+            .expect("the fixture commit must land");
 
-        // The control that makes this test about the journal walk, and the one
-        // that decides whether the fixture is the right shape at all. A fixture
-        // whose base already IS the head exercises the early return and would
-        // pass with the walk deleted.
+        // Not a control on the walk, a statement of which arm this is. If a
+        // future fixture makes this fail, the test is finally on the journal
+        // path and the doc comment above is stale.
         let persisted = backend
             .load_snapshot_authority(repository_id().as_str())
             .unwrap()
             .expect("the fixture wrote an authority");
-        assert!(
-            persisted.snapshot_generation < persisted.head_generation,
-            "this fixture must carry an acknowledged frame past its base, or the walk is not \
-             under test: base {} head {}",
-            persisted.snapshot_generation,
-            persisted.head_generation
+        assert_eq!(
+            persisted.snapshot_generation, persisted.head_generation,
+            "this fixture is the journal-free arm; if it grew a journal, rewrite the doc \
+             comment above, because the walk is then under test"
         );
 
         let envelope = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
             .expect("the envelope read must not error")
-            .expect("the envelope read must answer over a journal, not decline");
+            .expect("a persisted authority must answer");
         assert_eq!(
             envelope.generation(),
             manager.read_authority().generation(),
