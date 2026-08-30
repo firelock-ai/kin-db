@@ -554,7 +554,10 @@ pub struct PersistedRepositoryAuthority {
 }
 
 impl PersistedRepositoryAuthority {
-    fn empty(repository_id: RepositoryId, snapshot: &GraphSnapshot) -> Result<Self, KinDbError> {
+    pub(crate) fn empty(
+        repository_id: RepositoryId,
+        snapshot: &GraphSnapshot,
+    ) -> Result<Self, KinDbError> {
         let mut authority = Self {
             schema_version: REPOSITORY_AUTHORITY_SCHEMA_VERSION,
             repository_id,
@@ -1899,6 +1902,277 @@ impl StorageBackend for FrozenLocalBodyBackend<'_> {
     }
 }
 
+/// Walk the acknowledged journal forward onto an envelope read on its own.
+///
+/// An authority whose acknowledged head is past its snapshot base has an
+/// envelope that lives partly in frames, and reading the base alone would serve
+/// a superseded envelope as current. The frames are where that is cheap to fix:
+/// on a converted psf/requests store the base snapshot is 1051.5 MiB and one
+/// frame is about a megabyte, so replaying the journal onto the envelope costs
+/// a thousandth of what decoding the base again costs.
+///
+/// `Ok(None)` means this journal cannot be walked cheaply and correctly, and
+/// the caller must open in full. Each such case is named in a log line rather
+/// than silently declined, because an unexplained fallback is indistinguishable
+/// from a fallback that never happens.
+///
+/// The chain rules are the ones recovery applies to the same journal: strictly
+/// ordered generations, no gaps between the base and the head, and entries
+/// staged past the head skipped rather than attached, since a writer that died
+/// before its record rename leaves exactly that. On top of them,
+/// [`AuthorityFrame::apply_to_envelope`] refuses any frame whose `roots_before`
+/// is not the envelope it is being applied to, so a frame walked onto the wrong
+/// base cannot produce a plausible wrong envelope; it refuses.
+fn advance_envelope_over_journal(
+    repository_id: &RepositoryId,
+    mut envelope: PersistedRepositoryAuthority,
+    journal: &[crate::storage::backend::PersistedDelta],
+    base_generation: Generation,
+    head_generation: Generation,
+) -> Result<Option<PersistedRepositoryAuthority>, KinDbError> {
+    if base_generation == head_generation {
+        return Ok(Some(envelope));
+    }
+    if base_generation > head_generation {
+        return Err(storage(format!(
+            "repository {repository_id} snapshot base generation {base_generation} exceeds acknowledged head {head_generation}"
+        )));
+    }
+
+    let mut acknowledged: Vec<(&[u8], Generation)> = Vec::new();
+    let mut expected = base_generation.checked_add(1).ok_or_else(|| {
+        storage(format!(
+            "repository {repository_id} generation counter overflowed walking its journal"
+        ))
+    })?;
+    let mut previous: Option<Generation> = None;
+    for (bytes, generation) in journal {
+        let generation = *generation;
+        if previous.is_some_and(|prev| generation <= prev) {
+            tracing::debug!(
+                repository = %repository_id,
+                generation,
+                "authority envelope read declined: the journal is not strictly ordered"
+            );
+            return Ok(None);
+        }
+        previous = Some(generation);
+        if generation <= base_generation {
+            continue;
+        }
+        if generation > head_generation {
+            // Staged past the head by a writer that did not commit. Recovery
+            // warns and ignores it; so does this.
+            continue;
+        }
+        if generation != expected {
+            tracing::debug!(
+                repository = %repository_id,
+                expected,
+                found = generation,
+                "authority envelope read declined: the journal has a gap"
+            );
+            return Ok(None);
+        }
+        expected = generation.saturating_add(1);
+        acknowledged.push((bytes.as_slice(), generation));
+    }
+
+    let reached = acknowledged
+        .last()
+        .map_or(base_generation, |(_, generation)| *generation);
+    if reached != head_generation {
+        tracing::debug!(
+            repository = %repository_id,
+            reached,
+            head = head_generation,
+            "authority envelope read declined: the journal does not reach the acknowledged head"
+        );
+        return Ok(None);
+    }
+
+    for (bytes, generation) in &acknowledged {
+        if !crate::storage::authority_frame::AuthorityFrame::is_frame_bytes(bytes) {
+            // An envelope-bearing authority advances only through frames, and
+            // recovery refuses the mixed case outright. Declining here hands
+            // that refusal to the full open rather than duplicating it.
+            tracing::debug!(
+                repository = %repository_id,
+                generation,
+                "authority envelope read declined: the journal carries an entry that is not an authority frame"
+            );
+            return Ok(None);
+        }
+        let frame = crate::storage::authority_frame::AuthorityFrame::from_bytes(bytes)
+            .map_err(|error| {
+                storage(format!(
+                    "repository {repository_id} authority frame at generation {generation} is unreadable: {error}"
+                ))
+            })?;
+        envelope = frame.apply_to_envelope(envelope).map_err(|error| {
+            storage(format!(
+                "repository {repository_id} authority frame at generation {generation} does not apply to the envelope: {error}"
+            ))
+        })?;
+    }
+    Ok(Some(envelope))
+}
+
+/// The repository-authority envelope, opened without materializing the history.
+///
+/// A full [`RepositoryAuthorityManager::open`] decodes every domain the
+/// snapshot carries, replays history when no durable validation record covers
+/// the exact bytes, and re-verifies every persisted body against its content
+/// address. On a converted repository that is the whole store: 6493 commits of
+/// psf/requests produce a 1051 MiB snapshot whose `changes` map dominates it.
+///
+/// A caller that reads the envelope and then loads a few bodies by content
+/// address needs none of that. `kin graph status` is the case that forced this
+/// open: it takes one workspace tree out of the envelope and loads the bodies
+/// its structured facets name, and it was paying a whole-store open per cold
+/// request to do it.
+///
+/// What this still proves, so nobody reads it as a weakened boundary:
+///
+/// - The snapshot frame and its checksum are verified exactly as a full decode
+///   verifies them, so tampered or truncated bytes refuse here too.
+/// - The authority digest is checked against the durable authority record by
+///   the backend load this is built on.
+/// - Every body [`Self::load_source_blob`] returns is re-verified against its
+///   own content address at this boundary, byte for byte, by the same code the
+///   manager uses.
+///
+/// What it deliberately does not do is re-verify the bodies nobody asked for.
+/// That sweep is a whole-store integrity audit; it belongs to an open that
+/// intends to serve the store, not to a read of two fields. `open` keeps it,
+/// unconditionally, and so does the freeze path.
+///
+/// This refuses rather than guesses in the one case it cannot answer: an
+/// authority whose acknowledged journal head is past its snapshot base has an
+/// envelope that lives partly in unapplied frames, and reading the base alone
+/// would serve a superseded envelope as current. That returns `None`, which
+/// means "take the full open", never a wrong answer.
+pub struct RepositoryAuthorityMetadata<B: StorageBackend + ?Sized> {
+    repository_id: RepositoryId,
+    backend: Arc<B>,
+    metadata: PersistedRepositoryAuthority,
+    generation: Generation,
+}
+
+impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
+    /// Read the envelope for `repository_id`, or `None` when a full open is
+    /// required to answer correctly.
+    ///
+    /// `None` has exactly three producers and each is a "cannot answer cheaply"
+    /// rather than an error: no persisted authority exists yet, the acknowledged
+    /// journal head is past the snapshot base, or the snapshot carries no v13
+    /// envelope. A caller treats all three the same way, by opening in full.
+    pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Option<Self>, KinDbError> {
+        let started = std::time::Instant::now();
+        let (Some(authority), journal) = backend.load_recovery_state(repository_id.as_str())?
+        else {
+            return Ok(None);
+        };
+        let read_at = started.elapsed();
+        let envelope = crate::storage::format::AuthorityEnvelopeSnapshot::from_bytes(
+            &authority.snapshot_bytes,
+        )?;
+        // The base bytes are the largest thing this function ever holds and
+        // nothing below reads them, so they go here rather than at the end of
+        // the scope. The journal is kept: it is about a megabyte where the base
+        // is about a gigabyte.
+        let base_generation = authority.snapshot_generation;
+        let head_generation = authority.head_generation;
+        drop(authority);
+        let decode_at = started.elapsed();
+        let Some(metadata) = envelope.repository_authority else {
+            return Ok(None);
+        };
+        if metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "snapshot authority belongs to {}, not {}",
+                metadata.repository_id, repository_id
+            )));
+        }
+
+        let Some(metadata) = advance_envelope_over_journal(
+            &repository_id,
+            metadata,
+            &journal,
+            base_generation,
+            head_generation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let frames_at = started.elapsed();
+
+        let generation = metadata.roots.generation;
+        if generation != head_generation {
+            return Err(storage(format!(
+                "repository {repository_id} envelope reached generation {generation}, not the acknowledged head {head_generation}"
+            )));
+        }
+        tracing::debug!(
+            repository = %repository_id,
+            generation,
+            base_generation,
+            frames = head_generation.saturating_sub(base_generation),
+            read_ms = read_at.as_millis(),
+            decode_ms = (decode_at - read_at).as_millis(),
+            frames_ms = (frames_at - decode_at).as_millis(),
+            "repository authority envelope read"
+        );
+        Ok(Some(Self {
+            repository_id,
+            backend,
+            metadata,
+            generation,
+        }))
+    }
+
+    /// The envelope this read resolved.
+    pub const fn metadata(&self) -> &PersistedRepositoryAuthority {
+        &self.metadata
+    }
+
+    /// The authority generation the envelope names.
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Load exact immutable source bytes from repository-owned CAS authority.
+    ///
+    /// Byte for byte the manager's own boundary: bounded, size-validated, and
+    /// re-verified against the requested content address before it returns.
+    pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>, KinDbError> {
+        let Some(data) = self.backend.load_source_blob_bounded(
+            self.repository_id.as_str(),
+            *digest.as_bytes(),
+            MAX_SOURCE_BLOB_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            storage(format!(
+                "immutable source blob {} length does not fit u64",
+                digest
+            ))
+        })?;
+        validate_source_blob_size(
+            byte_len,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        verify_source_blob_digest(
+            *digest.as_bytes(),
+            &data,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        Ok(Some(data))
+    }
+}
+
 impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
     ///
@@ -2361,9 +2635,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             )
         })
     }
-}
 
-impl RepositoryAuthorityManager<LocalFileBackend> {
     /// Commit one complete local repository transaction and return a freeze
     /// that still holds the exact backend lock used for its durable CAS.
     ///
@@ -2372,6 +2644,52 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
     /// published, and the guard is returned while the same OS lock remains
     /// held. An idempotent replay acquires the lock and reloads the exact
     /// current authority before returning its guard.
+    /// Commit a transaction admitted from another replica by exact
+    /// repository-v6 transfer.
+    ///
+    /// Same durable path as `commit_repository_transaction`; the one difference
+    /// is what the Native admission check asks for. A local publish must name
+    /// the workspace it published from, prove that workspace is based on the
+    /// exact change, and prove it holds every introduced artifact. A replica
+    /// admitting a transfer performed no publication, so it is asked for none of
+    /// that, and is held instead to what it can verify for itself: the shared
+    /// admission policy, resolved from the transferred history, applied to every
+    /// introduced artifact with the full sensitive-content check and nothing
+    /// skipped as already-tracked.
+    ///
+    /// `case` is the publisher's matcher semantics. This layer never invents
+    /// one: `resolve_admission_matcher` compiles the SHARED policy under it, so
+    /// a fabricated case would judge another replica's policy by rules this one
+    /// made up. `None` is accepted only where it cannot matter, which is a
+    /// shared policy carrying no rule sources, and is refused by name otherwise.
+    pub fn commit_transferred_repository_transaction(
+        &self,
+        transaction: RepositoryTransaction,
+        case: Option<crate::admission::AdmissionCase>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        let transaction_hash = {
+            let _hash_span =
+                tracing::info_span!("kindb.commit.transaction_hash.transferred").entered();
+            transaction.transaction_hash()?
+        };
+        let repository_id = self.repository_id.clone();
+        let backend = Arc::clone(&self.backend);
+        let source = NativeAdmissionSource::Transfer { case };
+
+        self.publication.commit(|current| {
+            prepare_repository_commit_decision_from(
+                current,
+                &transaction,
+                transaction_hash,
+                &repository_id,
+                backend.as_ref(),
+                source,
+            )
+        })
+    }
+}
+
+impl RepositoryAuthorityManager<LocalFileBackend> {
     pub fn commit_repository_transaction_and_freeze(
         &self,
         transaction: RepositoryTransaction,
@@ -2604,6 +2922,25 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
     backend: &B,
 ) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
 {
+    prepare_repository_commit_decision_from(
+        current,
+        transaction,
+        transaction_hash,
+        repository_id,
+        backend,
+        NativeAdmissionSource::LocalWorkspace,
+    )
+}
+
+fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+    source: NativeAdmissionSource,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
     let metadata = current.metadata();
     if &transaction.repository_id != repository_id {
         return Err(ModelError::InvalidOperation(format!(
@@ -2640,7 +2977,8 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
         .into());
     }
 
-    let (next, receipt) = prepare_successor(current, transaction, transaction_hash, backend)?;
+    let (next, receipt) =
+        prepare_successor(current, transaction, transaction_hash, backend, source)?;
     Ok(AuthorityCommitDecision::Publish {
         next,
         output: receipt,
@@ -2691,11 +3029,17 @@ impl PublicationPhaseTimer {
 /// One prepared successor is slow enough to name its phase breakdown loudly.
 const SLOW_PUBLICATION_PHASE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Prepare the successor authority state for one transaction.
+///
+/// `source` says whether the Native changes were published by a workspace on
+/// this replica or admitted from another by transfer, which is the only thing
+/// the admission check treats differently.
 fn prepare_successor<B: StorageBackend + ?Sized>(
     current: &RepositoryAuthorityState,
     transaction: &RepositoryTransaction,
     transaction_hash: Hash256,
     backend: &B,
+    source: NativeAdmissionSource,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     // Every lap below runs inside its own span as well as reporting its
     // milliseconds, and the two must not drift apart: a profiler reads spans and
@@ -2764,7 +3108,15 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.admission_verify").entered();
-    verify_transaction_admission(backend, current, &replay, &snapshot, &metadata, transaction)?;
+    verify_transaction_admission(
+        backend,
+        current,
+        &replay,
+        &snapshot,
+        &metadata,
+        transaction,
+        source,
+    )?;
     let admission_verify_ms = timer.lap_ms();
     drop(lap);
 
@@ -4128,9 +4480,10 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
+    source: NativeAdmissionSource,
 ) -> Result<(), KinDbError> {
     verify_workspace_admission(backend, current, replay, snapshot, metadata, transaction)?;
-    verify_native_change_admission(backend, current, replay, metadata, transaction)
+    verify_native_change_admission(backend, current, replay, metadata, transaction, source)
 }
 
 /// The exclusion-rule generation that judges what a transaction introduces.
@@ -4277,12 +4630,52 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     Ok(())
 }
 
+/// How a Native change that introduces artifacts reached this replica.
+///
+/// The v3 contract binds one Native admission to the workspace that publishes
+/// it, and that binding is right for a local publish: it is what proves an
+/// artifact entering repository authority is exactly what a real workspace held,
+/// judged by the policy in force and that workspace's overlay.
+///
+/// A replica admitting a transfer performed no such publication. It has no
+/// successor workspace, and asking it to produce one would have it vouch for an
+/// admission it did not make. So a transfer is a distinct source rather than a
+/// missing workspace, and it is checked by what a receiver can actually verify:
+/// the shared policy, resolved from the transferred history, applied to every
+/// introduced artifact with the full sensitive-content check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAdmissionSource {
+    /// Published by a workspace on this replica. Every leg of the v3 binding
+    /// applies.
+    LocalWorkspace,
+    /// Admitted from another replica by exact repository-v6 transfer.
+    ///
+    /// `case` is the publisher's matcher semantics. `AdmissionCase` is authority
+    /// and not a host hint: the same policy bytes decide differently under
+    /// case-sensitive and ASCII-folded matching, so a receiver that invented one
+    /// would be judging another replica's policy by rules it made up.
+    ///
+    /// It is optional, and the rule for when it is required is exact rather than
+    /// cautious. `resolve_admission_matcher` compiles the case together with
+    /// `rule_sets`, and on this path `rule_sets` comes from the shared policy's
+    /// sources alone, because a transfer contributes no local sources. A shared
+    /// policy with NO sources therefore compiles a matcher that matches nothing,
+    /// and a matcher that matches nothing decides identically under either case.
+    /// So a repository with no shared admission rules needs no case and `None`
+    /// invents nothing there; a repository that has them is refused by name until
+    /// the publisher's case travels with the transfer.
+    Transfer {
+        case: Option<crate::admission::AdmissionCase>,
+    },
+}
+
 fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     current: &RepositoryAuthorityState,
     replay: &SharedReplayGraph<'_>,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
+    source: NativeAdmissionSource,
 ) -> Result<(), KinDbError> {
     let native_changes = transaction
         .changes
@@ -4342,49 +4735,9 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
             continue;
         }
 
-        // The current v3 contract binds one Native admission to the workspace
-        // that publishes it. History-only Native imports and multi-change
-        // synthetic batches have no trustworthy local case/overlay context and
-        // therefore fail closed until they gain an explicit graph-native
-        // admission context.
-        let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
-            ModelError::InvalidOperation(format!(
-                "native change {} introduces artifacts without a bound workspace admission context",
-                change.id
-            ))
-        })?;
-        let workspace = metadata
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == mutation.workspace_id)
-            .ok_or_else(|| {
-                storage(format!(
-                    "successor workspace {} is absent during Native admission verification",
-                    mutation.workspace_id
-                ))
-            })?;
-        let base_change = workspace
-            .base_target
-            .as_ref()
-            .map(|target| target_change_id(metadata, target))
-            .transpose()?;
-        if base_change != Some(change.id) {
-            return Err(ModelError::InvalidOperation(format!(
-                "native change {} introduces artifacts but successor workspace {} is not based on that exact change",
-                change.id, workspace.workspace_id
-            ))
-            .into());
-        }
-        for artifact in &introduced {
-            if workspace.tree.get(&artifact.artifact_id) != Some(*artifact) {
-                return Err(ModelError::InvalidOperation(format!(
-                    "native change {} artifact {} is not present exactly in successor workspace {}",
-                    change.id, artifact.path, workspace.workspace_id
-                ))
-                .into());
-            }
-        }
-
+        // The shared policy is the half a receiver can always resolve, because
+        // `admission_policy_delta` rides inside the change itself and
+        // `derive_admission_policies` re-derives it here. Both sources need it.
         let policy = metadata
             .admission_policies
             .iter()
@@ -4396,12 +4749,116 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                     change.id
                 ))
             })?;
-        let overlay = local_overlay_for_workspace(metadata, workspace)?;
-        let previous_workspace = current
-            .metadata()
-            .workspaces
-            .iter()
-            .find(|candidate| candidate.workspace_id == workspace.workspace_id);
+
+        // Held outside the match so the transfer arm's overlay outlives it.
+        let transfer_overlay;
+        let (workspace, overlay) = match source {
+            NativeAdmissionSource::LocalWorkspace => {
+                // The current v3 contract binds one Native admission to the workspace
+                // that publishes it. History-only Native imports and multi-change
+                // synthetic batches have no trustworthy local case/overlay context and
+                // therefore fail closed until they gain an explicit graph-native
+                // admission context.
+                let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+                    ModelError::InvalidOperation(format!(
+                        "native change {} introduces artifacts without a bound workspace admission context",
+                        change.id
+                    ))
+                })?;
+                let workspace = metadata
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == mutation.workspace_id)
+                    .ok_or_else(|| {
+                        storage(format!(
+                            "successor workspace {} is absent during Native admission verification",
+                            mutation.workspace_id
+                        ))
+                    })?;
+                let base_change = workspace
+                    .base_target
+                    .as_ref()
+                    .map(|target| target_change_id(metadata, target))
+                    .transpose()?;
+                if base_change != Some(change.id) {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "native change {} introduces artifacts but successor workspace {} is not based on that exact change",
+                        change.id, workspace.workspace_id
+                    ))
+                    .into());
+                }
+                for artifact in &introduced {
+                    if workspace.tree.get(&artifact.artifact_id) != Some(*artifact) {
+                        return Err(ModelError::InvalidOperation(format!(
+                            "native change {} artifact {} is not present exactly in successor workspace {}",
+                            change.id, artifact.path, workspace.workspace_id
+                        ))
+                        .into());
+                    }
+                }
+                let overlay = local_overlay_for_workspace(metadata, workspace)?;
+                (Some(workspace), overlay)
+            }
+            NativeAdmissionSource::Transfer { case } => {
+                // A transfer performed no publication here, so the three
+                // workspace legs above are not merely unavailable, they are not
+                // this replica's to attest. What IS this replica's to decide is
+                // whether the shared policy admits each artifact, and that is
+                // checked in full below.
+                //
+                // The overlay carries no local rule sources, because the
+                // publisher's personal excludes are already spent: a change
+                // cannot exist on the sender unless it passed this same check
+                // under them, and they are the sender's own file, so they never
+                // bounded a hostile sender in the first place.
+                //
+                // The case is a different thing wearing the same struct.
+                // `resolve_admission_matcher` ends in
+                // `ResolvedAdmissionMatcher::compile(overlay.case, rule_sets)`
+                // where `rule_sets` includes the SHARED sources, so the case
+                // decides how the repository's own policy matches every path.
+                // It is carried from the publisher rather than chosen here, and
+                // there is no safe default to choose: folding makes exclusion
+                // rules match more paths but makes their negations match more
+                // too, so neither case is uniformly stricter.
+                // Required exactly when it can change an answer, which is when
+                // the shared policy has sources for the matcher to compile.
+                let case = match (case, policy.sources.is_empty()) {
+                    (Some(case), _) => case,
+                    // No shared rules, so the matcher matches nothing and both
+                    // cases decide alike. Picking one invents nothing.
+                    (None, true) => crate::admission::AdmissionCase::Sensitive,
+                    (None, false) => {
+                        return Err(ModelError::InvalidOperation(format!(
+                            "native change {} arrived by transfer against a shared admission \
+                             policy with {} rule source(s), and the publisher's admission case \
+                             did not travel with it; the same policy bytes decide differently \
+                             under case-sensitive and ASCII-folded matching, so this replica \
+                             will not choose one on the publisher's behalf",
+                            change.id,
+                            policy.sources.len()
+                        ))
+                        .into());
+                    }
+                };
+                transfer_overlay =
+                    FrozenLocalOverlay::new(WorkspaceId(uuid::Uuid::nil()), 0, case, Vec::new())
+                        .map_err(KinDbError::from)?;
+                (None, &transfer_overlay)
+            }
+        };
+        // A transfer has no workspace here, so it has no previous workspace
+        // either. Everything below reads that as "nothing was tracked", which
+        // is what makes the receiver run the FULL sensitive-content check on
+        // every introduced artifact rather than skipping the ones a local
+        // publish would have already had.
+        let previous_workspace = workspace.and_then(|workspace| {
+            current
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|candidate| candidate.workspace_id == workspace.workspace_id)
+        });
         // The generation in force before this change is its first parent's, and
         // a root change has no parent, so the workspace it is bound to supplies
         // the one that was in force. See `judging_shared_policy`: a change that
@@ -13751,6 +14208,97 @@ mod tests {
         assert_eq!(reopened.read_authority().generation(), 2);
     }
 
+    /// The envelope read answers what the full open answers.
+    ///
+    /// The assertion is the JOIN rather than either endpoint. Comparing the
+    /// envelope against a hardcoded expectation would pass with both sides
+    /// wrong; comparing it against what the full open produces is the property
+    /// that matters, and it cannot be satisfied by writing the same value
+    /// twice.
+    ///
+    /// **This fixture is the journal-FREE arm, and it says so rather than
+    /// pretending otherwise.** One commit on this backend writes a full
+    /// snapshot base, so base and head are equal and the read takes
+    /// `advance_envelope_over_journal`'s early return. Two attempts to make it
+    /// carry a frame failed in CI on the fixture rather than on the code, first
+    /// on a duplicate operation id and then on `ref refs/heads/main already
+    /// exists`, because the helper builds a bootstrap-shaped transaction that
+    /// applies once. A second valid transaction is real work and no test in
+    /// this file does it.
+    ///
+    /// The frame WALK is held by
+    /// `native_admission_lineage::the_envelope_walk_reaches_the_envelope_a_full_open_reaches`,
+    /// which lives in that module because its `transaction_shell` can build a
+    /// valid second transaction and this module's bootstrap helper cannot. The
+    /// two tests are the two arms of the same read and neither covers the
+    /// other's.
+    #[test]
+    fn the_envelope_read_answers_what_the_full_open_answers() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commit must land");
+
+        // Not a control on the walk, a statement of which arm this is. If a
+        // future fixture makes this fail, the test is finally on the journal
+        // path and the doc comment above is stale.
+        let persisted = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the fixture wrote an authority");
+        assert_eq!(
+            persisted.snapshot_generation, persisted.head_generation,
+            "this fixture is the journal-free arm; if it grew a journal, rewrite the doc \
+             comment above, because the walk is then under test"
+        );
+
+        let envelope = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+            .expect("the envelope read must not error")
+            .expect("a persisted authority must answer");
+        assert_eq!(
+            envelope.generation(),
+            manager.read_authority().generation(),
+            "the envelope must reach the generation the full open reaches"
+        );
+        assert_eq!(
+            envelope.metadata(),
+            manager.read_authority().metadata(),
+            "the envelope read must produce the envelope the full open produces, field for field"
+        );
+    }
+
+    /// A repository with no persisted authority declines rather than inventing
+    /// an empty envelope.
+    ///
+    /// The third branch of the read, and the one whose failure mode is quiet:
+    /// an envelope-shaped answer for a repository that has never committed
+    /// would report a real store as empty. `None` sends the caller to the full
+    /// open, which is the only thing that can decide what an uncommitted
+    /// repository is.
+    #[test]
+    fn the_envelope_read_declines_a_repository_with_no_persisted_authority() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let _manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .is_none(),
+            "this fixture must have no persisted authority, or it is a different branch"
+        );
+        assert!(
+            RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+                .expect("the envelope read must not error")
+                .is_none(),
+            "a repository with no persisted authority must decline, not answer empty"
+        );
+    }
+
     #[test]
     fn local_commit_returns_successor_freeze_without_releasing_writer_lock() {
         let directory = TempDir::new().unwrap();
@@ -19443,6 +19991,387 @@ mod native_admission_lineage {
         assert!(
             error.contains("introduces artifacts without a bound workspace admission context"),
             "the refusal must name the missing admission context: {error}"
+        );
+    }
+
+    /// One fresh authority with the head's blobs saved, ready to receive.
+    fn transfer_fixture() -> (
+        tempfile::TempDir,
+        RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        Vec<TreeDelta>,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+        let (tree_deltas, blobs) = head_tree();
+        for (hash, body) in &blobs {
+            manager.save_source_blob(*hash, body).expect("save blob");
+        }
+        (directory, manager, tree_deltas)
+    }
+
+    /// A shared policy carrying one gitignore-shaped rule body.
+    fn policy_excluding(
+        manager: &RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        pattern: &str,
+    ) -> SharedAdmissionPolicy {
+        let body = format!("{pattern}\n").into_bytes();
+        let hash = digest(&body);
+        manager
+            .save_source_blob(hash, &body)
+            .expect("save the rule body");
+        SharedAdmissionPolicy::new(
+            0,
+            vec![kin_model::AdmissionRuleSource {
+                kind: kin_model::AdmissionRuleSourceKind::KinIgnore,
+                path: RepoPath::from_bytes(b".kinignore".to_vec()).expect("rule path"),
+                base_directory: None,
+                body_hash: hash,
+                body_len: body.len() as u64,
+                precedence: 0,
+            }],
+            Vec::new(),
+        )
+        .expect("a one-source shared policy is valid")
+    }
+
+    /// The journal WALK reaches the envelope a full open reaches.
+    ///
+    /// Every live store takes this path, because a store's acknowledged head
+    /// moves past its snapshot base the first time its daemon writes anything,
+    /// and a walk that builds a wrong envelope gives wrong workspace answers
+    /// with no error on the daemon's primary read.
+    ///
+    /// It lives here because this module has the two-commit shape the outer one
+    /// does not. `committed_history(true)` lands the bootstrap through a bound
+    /// workspace, and `transaction_shell` then reads `expected_generation` and
+    /// `expected_roots` off the current lease while mutating no refs, so a
+    /// second call is a valid successor and therefore a frame past the base.
+    ///
+    /// **The follow-on change carries no tree deltas, and that is required
+    /// rather than incidental.** `transaction_shell` sets
+    /// `workspace_mutation: None`, so a change introducing artifacts is refused
+    /// with "introduces artifacts without a bound workspace admission context".
+    /// An earlier version of this test built its own first commit out of
+    /// `transfer_fixture` plus `chained_history` and hit exactly that.
+    ///
+    /// The assertion is the JOIN, against what the full open produces, because
+    /// a hardcoded expectation passes with both sides wrong. The control above
+    /// it is what makes the join mean anything: without a frame past the base
+    /// the read takes its early return and this test passes with the walk
+    /// deleted.
+    #[test]
+    fn the_envelope_walk_reaches_the_envelope_a_full_open_reaches() {
+        let fixture = committed_history(true);
+        let shared = SharedAdmissionPolicy::empty(0);
+        let follow_on = native_change(CHANGES, Some(fixture.head), &shared, Vec::new());
+        let receipt = fixture
+            .manager
+            .commit_repository_transaction(transaction_shell(&fixture.manager, 2, vec![follow_on]))
+            .expect("a follow-on Native change that introduces nothing must commit");
+        assert_eq!(receipt.generation, 2);
+
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            fixture._directory.path(),
+        ));
+
+        // THE CONTROL. A fixture whose base already is its head exercises the
+        // early return, and this test would then pass with the walk deleted.
+        let persisted = backend
+            .load_snapshot_authority(repository().as_str())
+            .expect("the authority loads")
+            .expect("the fixture wrote an authority");
+        assert!(
+            persisted.snapshot_generation < persisted.head_generation,
+            "this fixture must carry an acknowledged frame past its base, or the walk is not \
+             under test: base {} head {}",
+            persisted.snapshot_generation,
+            persisted.head_generation
+        );
+
+        let envelope =
+            RepositoryAuthorityMetadata::open(repository(), std::sync::Arc::clone(&backend))
+                .expect("the envelope read must not error")
+                .expect("the envelope read must answer over a journal, not decline");
+        assert_eq!(
+            envelope.generation(),
+            fixture.manager.read_authority().generation(),
+            "the walked envelope must reach the acknowledged head"
+        );
+        assert_eq!(
+            envelope.metadata(),
+            fixture.manager.read_authority().metadata(),
+            "the walked envelope must equal the one a full open produces, field for field"
+        );
+    }
+
+    /// Call the transferred-commit entry through a GENERIC bound.
+    ///
+    /// This exists because of how 0.7.72 shipped broken. The method landed in
+    /// `impl RepositoryAuthorityManager<LocalFileBackend>` instead of the
+    /// generic impl, so it was reachable only from one concrete backend. Every
+    /// kin-db gate passed: a concrete impl is valid Rust, and every test in this
+    /// module holds a `LocalFileBackend` manager, so none of them could tell the
+    /// difference. kin's receive path is generic over the backend and could not
+    /// see the method at all.
+    ///
+    /// **The guard is that this does not compile if the method is not generic.**
+    /// A monomorphic call site cannot express the requirement; a generic one
+    /// makes the bound itself the assertion, and it fails at build time rather
+    /// than in a consumer's repository one publish later.
+    fn commit_transferred_through_a_generic_bound<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        transaction: RepositoryTransaction,
+        case: Option<crate::admission::AdmissionCase>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        manager.commit_transferred_repository_transaction(transaction, case)
+    }
+
+    /// The transferred-commit entry is reachable from a generic backend.
+    ///
+    /// The assertion that matters is the one the compiler makes on the helper
+    /// above. This test also runs it, so the path is exercised rather than only
+    /// type-checked.
+    #[test]
+    fn the_transferred_commit_entry_is_reachable_from_any_backend() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        commit_transferred_through_a_generic_bound(&manager, transaction, None)
+            .expect("a transferred introduction must be admitted through a generic bound");
+    }
+
+    /// THE PROPERTY. What a local publish is refused for, a transfer is admitted
+    /// for, because the receiver performed no publication and is held instead to
+    /// the shared policy it can resolve from the transferred history.
+    ///
+    /// Its control is `an_unbound_native_introduction_is_still_refused` directly
+    /// above: the same shape, the same transaction, refused on the local path.
+    /// The pair is the whole point, so neither is readable alone.
+    #[test]
+    fn a_transferred_native_introduction_is_admitted_where_a_local_one_is_refused() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        let receipt = manager
+            .commit_transferred_repository_transaction(
+                transaction,
+                Some(crate::admission::AdmissionCase::Sensitive),
+            )
+            .expect("a transferred Native introduction must be admitted");
+        assert_eq!(receipt.generation, 1, "the transfer must move authority");
+    }
+
+    /// The receiver refuses by name what the SHARED policy excludes, so dropping
+    /// the workspace legs did not drop the policy legs with them.
+    #[test]
+    fn a_transferred_introduction_the_shared_policy_excludes_is_refused_by_name() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = policy_excluding(&manager, "src/module_0.rs");
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        let error = manager
+            .commit_transferred_repository_transaction(
+                transaction,
+                Some(crate::admission::AdmissionCase::Sensitive),
+            )
+            .expect_err("an excluded artifact must be refused on the receiver")
+            .to_string();
+        assert!(
+            error.contains("excluded by the exact graph-owned admission policy"),
+            "the refusal must name the policy that excluded it: {error}"
+        );
+        assert!(
+            error.contains("src/module_0.rs"),
+            "the refusal must name the artifact: {error}"
+        );
+    }
+
+    /// THE CASE IS AUTHORITY, and this is what proves it rather than asserting
+    /// it. One policy, one artifact, two cases, opposite outcomes.
+    ///
+    /// The rule is spelled in upper case and the artifact in lower. Under
+    /// `FoldAscii` the shared rule matches and the receiver refuses; under
+    /// `Sensitive` it does not match and the receiver admits. So a receiver that
+    /// invented a case would be deciding another replica's policy by its own
+    /// rules, which is why `commit_transferred_repository_transaction` makes the
+    /// caller supply it and never defaults.
+    #[test]
+    fn the_publishers_case_decides_the_shared_policy_on_the_receiver() {
+        let folded = {
+            let (_directory, manager, tree_deltas) = transfer_fixture();
+            let shared = policy_excluding(&manager, "SRC/MODULE_0.RS");
+            let changes = chained_history(&shared, &tree_deltas);
+            let transaction = transaction_shell(&manager, 3, changes);
+            manager
+                .commit_transferred_repository_transaction(
+                    transaction,
+                    Some(crate::admission::AdmissionCase::FoldAscii),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let sensitive = {
+            let (_directory, manager, tree_deltas) = transfer_fixture();
+            let shared = policy_excluding(&manager, "SRC/MODULE_0.RS");
+            let changes = chained_history(&shared, &tree_deltas);
+            let transaction = transaction_shell(&manager, 3, changes);
+            manager
+                .commit_transferred_repository_transaction(
+                    transaction,
+                    Some(crate::admission::AdmissionCase::Sensitive),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+
+        let folded_error = folded.expect_err(
+            "an upper-case rule must match a lower-case path under FoldAscii, so this must refuse",
+        );
+        assert!(
+            folded_error.contains("excluded by the exact graph-owned admission policy"),
+            "the FoldAscii arm must refuse by policy: {folded_error}"
+        );
+        sensitive.expect(
+            "the same rule must NOT match under Sensitive, so this must be admitted; if it \
+             refuses, the case is not reaching the shared matcher and carrying it buys nothing",
+        );
+    }
+
+    /// A repository with NO shared admission rules needs no case, and this is
+    /// what makes `None` an exact answer rather than a convenient one.
+    ///
+    /// With no shared sources and no local sources, `resolve_admission_matcher`
+    /// compiles a matcher over an empty rule set, which matches nothing and so
+    /// decides identically under either case. Admitting with `None` there
+    /// invents nothing.
+    #[test]
+    fn a_transfer_needs_no_case_when_the_shared_policy_has_no_rules() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+        assert!(
+            shared.sources.is_empty(),
+            "this test is about the no-rules case, so the fixture must have none"
+        );
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        manager
+            .commit_transferred_repository_transaction(transaction, None)
+            .expect("a transfer against a rule-free policy must not require a case");
+    }
+
+    /// And a repository that HAS shared rules is refused by name until the
+    /// publisher's case travels, rather than being decided by a guess.
+    ///
+    /// This is the pair to the test above. Together they say the case is
+    /// required exactly when it can change an answer and not one moment before,
+    /// which is the difference between an exact rule and a cautious one.
+    #[test]
+    fn a_transfer_against_a_rule_carrying_policy_is_refused_without_a_case() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = policy_excluding(&manager, "does/not/match/anything.rs");
+        assert!(
+            !shared.sources.is_empty(),
+            "this test is about the rules-present case"
+        );
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        let error = manager
+            .commit_transferred_repository_transaction(transaction, None)
+            .expect_err("a rule-carrying policy must refuse a transfer with no case")
+            .to_string();
+        assert!(
+            error.contains("the publisher's admission case did not travel with it"),
+            "the refusal must name the missing case: {error}"
+        );
+        assert!(
+            error.contains("will not choose one on the publisher's behalf"),
+            "the refusal must say the replica declined to guess: {error}"
+        );
+        // The rule deliberately matches nothing, so this cannot be the artifact
+        // being excluded. It is the missing case alone.
+        assert!(
+            !error.contains("excluded by the exact graph-owned admission policy"),
+            "the refusal must be about the case, not about an exclusion: {error}"
+        );
+    }
+
+    /// What the receiver-side sensitive check costs on a realistic first push.
+    ///
+    /// A receiver has no previous workspace, so nothing is skipped as
+    /// already-tracked and `verify_artifact_admission` loads every introduced
+    /// artifact's body. That is stricter than a local publish and it is not
+    /// free, so the cost is measured here rather than argued about.
+    ///
+    /// Ignored because it builds and commits a pack in the thousands of files.
+    /// Run it deliberately:
+    ///   cargo test -p kin-db --lib transferred_first_push_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement: builds a multi-thousand-file pack"]
+    fn transferred_first_push_cost() {
+        const REALISTIC_FILES: usize = 2_000;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+
+        // Bodies sized like real source rather than like a fixture: a few KB of
+        // plausible text each, so the per-artifact read is not measuring an
+        // empty file.
+        let mut deltas = Vec::with_capacity(REALISTIC_FILES);
+        let mut total_bytes = 0usize;
+        for file in 0..REALISTIC_FILES {
+            let path = format!("src/pkg_{}/module_{file}.rs", file % 40);
+            let body = format!(
+                "// module {file}\npub struct Item{file} {{ id: u64, name: String }}\n\n\
+                 impl Item{file} {{\n    pub fn new(id: u64) -> Self {{\n        \
+                 Self {{ id, name: format!(\"item-{{id}}\") }}\n    }}\n}}\n{}",
+                "// filler to reach a realistic body size\n".repeat(60)
+            )
+            .into_bytes();
+            total_bytes += body.len();
+            let hash = digest(&body);
+            manager.save_source_blob(hash, &body).expect("save blob");
+            deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(2_000_000 + file as u128)),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(path.into_bytes()).expect("path is valid"),
+                    TreeEntry::blob(hash, false),
+                ),
+            });
+        }
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let change = native_change(0, None, &shared, deltas);
+        let transaction = transaction_shell(&manager, 9, vec![change]);
+
+        let started = std::time::Instant::now();
+        let receipt = manager
+            .commit_transferred_repository_transaction(
+                transaction,
+                Some(crate::admission::AdmissionCase::Sensitive),
+            )
+            .expect("a realistic first push must be admitted");
+        let elapsed = started.elapsed();
+
+        assert_eq!(receipt.generation, 1);
+        println!(
+            "MEASURED transferred first push: files={REALISTIC_FILES} bytes={total_bytes} \
+             elapsed_ms={} per_artifact_us={}",
+            elapsed.as_millis(),
+            elapsed.as_micros() / REALISTIC_FILES as u128
         );
     }
 }
