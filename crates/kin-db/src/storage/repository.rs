@@ -2361,9 +2361,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             )
         })
     }
-}
 
-impl RepositoryAuthorityManager<LocalFileBackend> {
     /// Commit one complete local repository transaction and return a freeze
     /// that still holds the exact backend lock used for its durable CAS.
     ///
@@ -2415,7 +2413,9 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             )
         })
     }
+}
 
+impl RepositoryAuthorityManager<LocalFileBackend> {
     pub fn commit_repository_transaction_and_freeze(
         &self,
         transaction: RepositoryTransaction,
