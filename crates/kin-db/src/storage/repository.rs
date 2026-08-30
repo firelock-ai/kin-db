@@ -3135,7 +3135,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // `changes` is final once admission above returns, and the steps below
     // mutate only the detached metadata. One shared decode serves them all.
     let replay = SharedReplayGraph::new(&snapshot);
-    apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
+    let captured_base = apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
     let workspace_ms = timer.lap_ms();
     drop(lap);
 
@@ -3212,6 +3212,33 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     metadata.roots = compute_roots(&snapshot, &metadata, next_generation)?;
     let roots_ms = timer.lap_ms();
     drop(lap);
+
+    // The section is stamped AFTER the roots, deliberately. No root function
+    // reads it, checked against all six, so a store's roots and therefore its
+    // replicated identity are byte for byte what they would be without one;
+    // stamping before would still be correct today and would silently stop
+    // being so the first time a root learns to read this field.
+    //
+    // `None` when the publish moved no workspace, or when the resolution it did
+    // perform could not be captured whole. A publish that cannot produce a
+    // complete section writes none: the next open folds, which is what it would
+    // have done anyway, and a partial section would be a claim about tombstones
+    // it did not earn.
+    snapshot.materialized_graph = captured_base.map(CapturedBaseGraph::into_section);
+    if let Some(section) = snapshot.materialized_graph.as_ref() {
+        tracing::debug!(
+            repository = %transaction.repository_id,
+            generation = next_generation,
+            change = %section.resolved_at,
+            entities = section.state.entities.len(),
+            relations = section.state.relations.len(),
+            "stamped a materialized graph section onto the successor snapshot"
+        );
+    }
+    // Version and contents are one fact, so the successor declares the version
+    // its own bytes will serialize as. Leaving this at the base's version would
+    // make `to_bytes` refuse the successor it just built.
+    snapshot.version = snapshot.wire_version();
 
     let lap = tracing::info_span!("kindb.prepare.storage_admission").entered();
     operation.roots_after = metadata.roots.clone();
@@ -4365,9 +4392,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
-) -> Result<(), KinDbError> {
+) -> Result<Option<CapturedBaseGraph>, KinDbError> {
     let Some(mutation) = &transaction.workspace_mutation else {
-        return Ok(());
+        // No workspace moved, so no base was resolved and there is nothing to
+        // persist. The successor keeps whatever section it inherited, which is
+        // either still correct for its workspace's base or refused by name.
+        return Ok(None);
     };
     let mut workspaces: BTreeMap<WorkspaceId, WorkspaceState> = metadata
         .workspaces
@@ -4398,13 +4428,19 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // this whole lap. The lap is the largest single term in a full-history
     // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    let next_base = {
+    // The one Retain in the tree. This resolution is at
+    // `mutation.new_base_target`, and the successor's own check below refuses
+    // unless its base target is that same target, so the state captured here is
+    // the resolution at exactly the change a section names. No other resolution
+    // is asked to capture, and none of them pays for one.
+    let (next_base, captured_base) = {
         let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
-        resolve_workspace_base_graph_snapshot(
+        resolve_workspace_base_graph_snapshot_capturing(
             snapshot,
             metadata,
             mutation.new_base_target.as_ref(),
             WorkspaceBaseHistory::Omitted,
+            WorkspaceBaseCapture::Retain,
         )?
     };
 
@@ -4507,7 +4543,11 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     WORKSPACE_MUTATION_BASE_CHANGES.with(|count| {
         count.set(WORKSPACE_BASE_CHANGES.with(|total| total.get()) - base_changes_before)
     });
-    Ok(())
+    // Handed up rather than stamped here, because the snapshot this belongs on
+    // is the successor `prepare_successor` is still assembling, and stamping it
+    // before the roots are computed would put a section inside the state the
+    // roots are computed over.
+    Ok(captured_base)
 }
 
 /// Recompute repository admission from the successor authority itself.
@@ -5890,6 +5930,71 @@ thread_local! {
 /// relation endpoint is an entity, artifact, test, contract, work item,
 /// verification run or external reference and never a change, so the endpoint
 /// pass cannot weaken either.
+/// A resolved base graph captured for persistence, and the guard that it is
+/// complete.
+///
+/// Its own module for one reason, and the reason is the whole point: the fields
+/// are private, and the single constructor takes a `ResolvedGraphState` whole.
+/// Nothing outside can assemble one from a base snapshot's fields, which is the
+/// mistake that would otherwise be easy to make and impossible to see, because
+/// `resolve_workspace_base_graph_snapshot` moves five of the seven domains into
+/// the base it returns and drops the two tombstone maps. A section built from
+/// that reassembly would carry empty tombstones and look exactly like a
+/// complete one.
+///
+/// So the writer has two states and no third: it holds a capture taken before
+/// anything was destructured, or it holds nothing and writes `None`. A partial
+/// section is unrepresentable rather than merely discouraged.
+mod captured_base_graph {
+    use crate::storage::format::{MaterializedGraphSection, MATERIALIZED_GRAPH_SCHEMA_VERSION};
+    use crate::types::{ResolvedGraphState, SemanticChangeId};
+
+    /// The complete resolution at one change, and the change it resolves at.
+    #[derive(Debug, Clone)]
+    pub(super) struct CapturedBaseGraph {
+        resolved_at: SemanticChangeId,
+        state: ResolvedGraphState,
+    }
+
+    impl CapturedBaseGraph {
+        /// Take a capture from a state no field has left yet.
+        ///
+        /// The only way to build one. It takes the state by value, so a caller
+        /// that has already moved a domain out cannot reach here.
+        pub(super) fn capture(resolved_at: SemanticChangeId, state: ResolvedGraphState) -> Self {
+            Self { resolved_at, state }
+        }
+
+        pub(super) fn resolved_at(&self) -> &SemanticChangeId {
+            &self.resolved_at
+        }
+
+        /// The section these bytes become.
+        pub(super) fn into_section(self) -> MaterializedGraphSection {
+            MaterializedGraphSection {
+                schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+                resolved_at: self.resolved_at,
+                state: self.state,
+            }
+        }
+    }
+}
+
+use captured_base_graph::CapturedBaseGraph;
+
+/// Whether a base resolution keeps its resolved state for persistence.
+///
+/// Every resolution already computes the state; almost every caller wants only
+/// the base snapshot built from it. `Retain` costs one clone of the resolved
+/// graph, which is O(entities plus relations) and not another fold over
+/// history. That distinction is the whole reason this is a parameter rather
+/// than an unconditional capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceBaseCapture {
+    Discard,
+    Retain,
+}
+
 enum WorkspaceBaseHistory<'a> {
     /// Carry the change map, with a witness when the caller holds one this
     /// base's copy can carry instead of repeating.
@@ -5930,6 +6035,28 @@ fn resolve_workspace_base_graph_snapshot(
     base_target: Option<&RefTarget>,
     history: WorkspaceBaseHistory<'_>,
 ) -> Result<GraphSnapshot, KinDbError> {
+    resolve_workspace_base_graph_snapshot_capturing(
+        authority_snapshot,
+        metadata,
+        base_target,
+        history,
+        WorkspaceBaseCapture::Discard,
+    )
+    .map(|(base, _)| base)
+}
+
+/// Resolve a workspace base, optionally keeping the resolved state.
+///
+/// The capture is taken from the state `resolve_graph_at` returned, BEFORE the
+/// base below moves five of its seven domains out. Taking it afterwards is what
+/// would silently lose the tombstones.
+fn resolve_workspace_base_graph_snapshot_capturing(
+    authority_snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    base_target: Option<&RefTarget>,
+    history: WorkspaceBaseHistory<'_>,
+    capture: WorkspaceBaseCapture,
+) -> Result<(GraphSnapshot, Option<CapturedBaseGraph>), KinDbError> {
     #[cfg(test)]
     WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     // Replay-derived domains first. The whole-snapshot clone this function
@@ -5938,9 +6065,15 @@ fn resolve_workspace_base_graph_snapshot(
     // whose admission pass, relation and entity indexes, and Merkle cache
     // were discarded after one history replay.
     let mut timer = PublicationPhaseTimer::start();
-    let resolved = match base_target {
-        Some(target) => {
-            let change_id = target_change_id(metadata, target)?;
+    let mut captured: Option<CapturedBaseGraph> = None;
+    // Resolved once and reused: the capture below names the same change the
+    // section is the resolution at, and computing it twice would let the two
+    // drift.
+    let base_change = base_target
+        .map(|target| target_change_id(metadata, target))
+        .transpose()?;
+    let resolved = match base_change {
+        Some(change_id) => {
             Some(
                 match resolved_graph_from_section(authority_snapshot, &change_id) {
                     Ok(state) => {
@@ -5991,6 +6124,16 @@ fn resolve_workspace_base_graph_snapshot(
         None => None,
     };
     let history_resolve_ms = timer.lap_ms();
+    // Taken here and nowhere else. Below, five of this state's seven domains
+    // move into the base and the two tombstone maps are dropped, so a capture
+    // taken after this point could only ever be a reassembly carrying empty
+    // tombstones. `CapturedBaseGraph::capture` takes the state whole, and its
+    // module gives it no other constructor.
+    if capture == WorkspaceBaseCapture::Retain {
+        if let (Some(state), Some(change_id)) = (resolved.as_ref(), base_change) {
+            captured = Some(CapturedBaseGraph::capture(change_id, state.clone()));
+        }
+    }
     let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
     {
         Some(state) => (
@@ -6096,7 +6239,7 @@ fn resolve_workspace_base_graph_snapshot(
     );
     #[cfg(test)]
     WORKSPACE_BASE_CHANGES.with(|count| count.set(count.get() + base.changes.len()));
-    Ok(base)
+    Ok((base, captured))
 }
 
 fn derive_workspace_semantic_overlay(

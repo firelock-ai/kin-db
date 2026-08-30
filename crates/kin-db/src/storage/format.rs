@@ -579,18 +579,38 @@ pub(crate) struct LocateGraphSnapshot {
 }
 
 impl GraphSnapshot {
-    /// The version this binary WRITES.
+    /// The newest version this binary can write.
     ///
-    /// Deliberately still 13 while [`MAX_SUPPORTED_VERSION`](Self::MAX_SUPPORTED_VERSION)
-    /// is 14. That gap is the whole reader-before-writer ordering: this build
-    /// understands a v14 body and never produces one, so nothing it touches
-    /// stops opening under a binary that knows only v13. The bump belongs to
-    /// the change that starts WRITING sections, because until then a v14 store
-    /// would carry nothing and cost every older reader its ability to open it.
-    pub const CURRENT_VERSION: u32 = 13;
+    /// A snapshot is NOT written at this version merely because the binary
+    /// knows it. The version a body is written at is derived from what the
+    /// body carries, by [`wire_version`](Self::wire_version): 13 without a
+    /// materialized graph section, 14 with one. So a store becomes v14 exactly
+    /// when it gains something a v13 reader could not represent, and a store
+    /// that never gains one stays readable by every shipped binary.
+    ///
+    /// This constant moved from 13 to 14 in the change that started WRITING
+    /// sections. Before that the binary read v14 and never produced one, which
+    /// is why the reader landed first.
+    pub const CURRENT_VERSION: u32 = 14;
 
     /// The oldest on-disk format version this binary opens.
     pub const MIN_SUPPORTED_VERSION: u32 = 13;
+
+    /// The on-disk version these exact contents serialize as.
+    ///
+    /// Derived from the contents rather than from the binary. Version, width
+    /// and the section's presence are three readings of one fact and this is
+    /// where they are tied together: v13 is 35 elements with no section, v14 is
+    /// 36 with one. Both partial decoders below use that as their
+    /// discriminator, and `to_bytes` refuses any snapshot whose declared
+    /// version disagrees with this.
+    pub const fn wire_version(&self) -> u32 {
+        if self.materialized_graph.is_some() {
+            Self::CURRENT_VERSION
+        } else {
+            Self::MIN_SUPPORTED_VERSION
+        }
+    }
 
     /// The newest on-disk format version this binary READS.
     ///
@@ -614,7 +634,11 @@ impl GraphSnapshot {
     pub fn empty() -> Self {
         Self {
             materialized_graph: None,
-            version: Self::CURRENT_VERSION,
+            // No section, so these contents ARE a v13 snapshot. Naming
+            // CURRENT_VERSION here would make every fresh snapshot declare a
+            // version its own bytes do not serialize as, which `to_bytes`
+            // refuses.
+            version: Self::MIN_SUPPORTED_VERSION,
             entities: HashMap::new(),
             relations: HashMap::new(),
             outgoing: HashMap::new(),
@@ -818,31 +842,16 @@ impl GraphSnapshot {
         persisted_root_hash: Option<[u8; 32]>,
         validate_admission: bool,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
-        // Ordered before the version check on purpose. A snapshot carrying a
-        // section fails BOTH, and the section is the specific news: told only
-        // that its version field is wrong, a caller would move the version and
-        // hit this again.
-        //
-        // A section is the one thing a v13 body cannot hold, and this binary
-        // writes v13. Serializing one anyway would mint a 36-element body under
-        // a v13 header, which no reader can classify: this decoder refuses it
-        // on the width-to-version join, and an older one refuses it as a
-        // malformed array. The change that starts writing sections is the change
-        // that moves CURRENT_VERSION to MAX_SUPPORTED_VERSION, and nothing in
-        // this build sets the field, so this is a guard rather than a path.
-        if self.materialized_graph.is_some() {
+        let wire_version = self.wire_version();
+        if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
-                "refusing to serialize a materialized graph section at v{}; a section makes a \
-                 body v{}, and this binary reads that version without writing it",
-                Self::CURRENT_VERSION,
-                Self::MAX_SUPPORTED_VERSION
-            )));
-        }
-        if self.version != Self::CURRENT_VERSION {
-            return Err(crate::error::KinDbError::StorageError(format!(
-                "refusing to serialize snapshot body version {}; current schema is exactly v{}",
+                "refusing to serialize a snapshot whose body declares v{} while its contents \
+                 serialize as v{}; a materialized graph section makes a body v{}, and its \
+                 absence makes it v{}",
                 self.version,
-                Self::CURRENT_VERSION
+                wire_version,
+                Self::CURRENT_VERSION,
+                Self::MIN_SUPPORTED_VERSION
             )));
         }
         if validate_admission {
@@ -870,12 +879,7 @@ impl GraphSnapshot {
         // of the repository, and the buffer is then exactly sized, so the write
         // pass never reallocates and never holds a half-grown copy beside a
         // growing one.
-        assemble_snapshot_frame(
-            self,
-            Self::CURRENT_VERSION,
-            persisted_root_hash,
-            trailer_len,
-        )
+        assemble_snapshot_frame(self, wire_version, persisted_root_hash, trailer_len)
     }
 
     /// Deserialize a snapshot from bytes (with header validation).
@@ -1011,11 +1015,15 @@ impl GraphSnapshot {
                 frame.version, snapshot.version
             )));
         }
-        // The decoded value keeps the version its bytes declared. A v14
-        // snapshot read here therefore refuses to re-serialize, which is
-        // correct and loud: this binary reads that version without writing it,
-        // and silently downgrading a store by dropping its section is the one
-        // outcome worse than refusing.
+        // The decoded value keeps the version its bytes declared, which is now
+        // also the version it re-serializes as, because both are a function of
+        // whether it carries a section. A store that gained nothing therefore
+        // round-trips as v13.
+        debug_assert_eq!(
+            snapshot.version,
+            snapshot.wire_version(),
+            "a decoded snapshot's declared version must match what its contents serialize as"
+        );
         if validate_storage_admission {
             snapshot.validate_storage_admission()?;
         }
@@ -2048,14 +2056,13 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         // name) determines the mapping.
         //
         // A live mutable graph never carries a materialized section, so this is
-        // a v13 body: 35 elements and no trailing field. Writing 36 here would
-        // mint a v14 body carrying nothing, which is exactly the compatibility
-        // cost the reader-before-writer ordering exists to avoid.
+        // a v13 body by the same rule `wire_version` applies: 35 elements, no
+        // trailing field, and the version to match.
         let mut state =
             serializer.serialize_struct("GraphSnapshot", GRAPH_SNAPSHOT_V13_FIELD_COUNT)?;
 
         // 1. version
-        state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
+        state.serialize_field("version", &GraphSnapshot::MIN_SUPPORTED_VERSION)?;
         // 2. entities  (hashbrown::HashMap → map)
         state.serialize_field("entities", self.entities)?;
         // 3. relations
@@ -2173,7 +2180,7 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         // held two whole encodings of the store at once.
         assemble_snapshot_frame(
             self,
-            GraphSnapshot::CURRENT_VERSION,
+            GraphSnapshot::MIN_SUPPORTED_VERSION,
             persisted_root_hash,
             trailer_len,
         )
