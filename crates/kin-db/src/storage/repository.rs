@@ -14229,12 +14229,19 @@ mod tests {
         let backend = Arc::new(LocalFileBackend::new(directory.path()));
         let manager =
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        // Two commits, not one. The first writes a full snapshot base, so a
+        // one-commit fixture is journal-FREE and exercises the early return
+        // rather than the walk. CI caught exactly that: the first version of
+        // this test asserted generation 2 after one commit and read 1.
         manager
             .commit_repository_transaction(arbitrary_repository_transaction(&manager))
-            .expect("the fixture commit must land");
-        assert_eq!(manager.read_authority().generation(), 2);
+            .expect("the fixture's first commit must land");
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture's second commit must land");
 
-        // The control that makes this test about the journal walk. A fixture
+        // The control that makes this test about the journal walk, and the one
+        // that decides whether the fixture is the right shape at all. A fixture
         // whose base already IS the head exercises the early return and would
         // pass with the walk deleted.
         let persisted = backend
@@ -14252,7 +14259,11 @@ mod tests {
         let envelope = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
             .expect("the envelope read must not error")
             .expect("the envelope read must answer over a journal, not decline");
-        assert_eq!(envelope.generation(), 2);
+        assert_eq!(
+            envelope.generation(),
+            manager.read_authority().generation(),
+            "the envelope must reach the generation the full open reaches"
+        );
         assert_eq!(
             envelope.metadata(),
             manager.read_authority().metadata(),
