@@ -2385,14 +2385,15 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
     /// introduced artifact with the full sensitive-content check and nothing
     /// skipped as already-tracked.
     ///
-    /// `case` is the publisher's matcher semantics and the caller must supply
-    /// it. This layer will not invent one, because `resolve_admission_matcher`
-    /// compiles the SHARED policy under it, so a fabricated case would judge
-    /// another replica's policy by rules this one made up.
+    /// `case` is the publisher's matcher semantics. This layer never invents
+    /// one: `resolve_admission_matcher` compiles the SHARED policy under it, so
+    /// a fabricated case would judge another replica's policy by rules this one
+    /// made up. `None` is accepted only where it cannot matter, which is a
+    /// shared policy carrying no rule sources, and is refused by name otherwise.
     pub fn commit_transferred_repository_transaction(
         &self,
         transaction: RepositoryTransaction,
-        case: crate::admission::AdmissionCase,
+        case: Option<crate::admission::AdmissionCase>,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
         let transaction_hash = {
             let _hash_span =
@@ -4375,13 +4376,22 @@ pub enum NativeAdmissionSource {
     LocalWorkspace,
     /// Admitted from another replica by exact repository-v6 transfer.
     ///
-    /// `case` is the publisher's matcher semantics and it travels with the
-    /// transfer rather than being chosen here. `AdmissionCase` is authority and
-    /// not a host hint: the same policy bytes decide differently under
+    /// `case` is the publisher's matcher semantics. `AdmissionCase` is authority
+    /// and not a host hint: the same policy bytes decide differently under
     /// case-sensitive and ASCII-folded matching, so a receiver that invented one
     /// would be judging another replica's policy by rules it made up.
+    ///
+    /// It is optional, and the rule for when it is required is exact rather than
+    /// cautious. `resolve_admission_matcher` compiles the case together with
+    /// `rule_sets`, and on this path `rule_sets` comes from the shared policy's
+    /// sources alone, because a transfer contributes no local sources. A shared
+    /// policy with NO sources therefore compiles a matcher that matches nothing,
+    /// and a matcher that matches nothing decides identically under either case.
+    /// So a repository with no shared admission rules needs no case and `None`
+    /// invents nothing there; a repository that has them is refused by name until
+    /// the publisher's case travels with the transfer.
     Transfer {
-        case: crate::admission::AdmissionCase,
+        case: Option<crate::admission::AdmissionCase>,
     },
 }
 
@@ -4537,6 +4547,26 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 // there is no safe default to choose: folding makes exclusion
                 // rules match more paths but makes their negations match more
                 // too, so neither case is uniformly stricter.
+                // Required exactly when it can change an answer, which is when
+                // the shared policy has sources for the matcher to compile.
+                let case = match (case, policy.sources.is_empty()) {
+                    (Some(case), _) => case,
+                    // No shared rules, so the matcher matches nothing and both
+                    // cases decide alike. Picking one invents nothing.
+                    (None, true) => crate::admission::AdmissionCase::Sensitive,
+                    (None, false) => {
+                        return Err(ModelError::InvalidOperation(format!(
+                            "native change {} arrived by transfer against a shared admission \
+                             policy with {} rule source(s), and the publisher's admission case \
+                             did not travel with it; the same policy bytes decide differently \
+                             under case-sensitive and ASCII-folded matching, so this replica \
+                             will not choose one on the publisher's behalf",
+                            change.id,
+                            policy.sources.len()
+                        ))
+                        .into());
+                    }
+                };
                 transfer_overlay =
                     FrozenLocalOverlay::new(WorkspaceId(uuid::Uuid::nil()), 0, case, Vec::new())
                         .map_err(KinDbError::from)?;
@@ -19660,7 +19690,7 @@ mod native_admission_lineage {
         let receipt = manager
             .commit_transferred_repository_transaction(
                 transaction,
-                crate::admission::AdmissionCase::Sensitive,
+                Some(crate::admission::AdmissionCase::Sensitive),
             )
             .expect("a transferred Native introduction must be admitted");
         assert_eq!(receipt.generation, 1, "the transfer must move authority");
@@ -19678,7 +19708,7 @@ mod native_admission_lineage {
         let error = manager
             .commit_transferred_repository_transaction(
                 transaction,
-                crate::admission::AdmissionCase::Sensitive,
+                Some(crate::admission::AdmissionCase::Sensitive),
             )
             .expect_err("an excluded artifact must be refused on the receiver")
             .to_string();
@@ -19711,7 +19741,7 @@ mod native_admission_lineage {
             manager
                 .commit_transferred_repository_transaction(
                     transaction,
-                    crate::admission::AdmissionCase::FoldAscii,
+                    Some(crate::admission::AdmissionCase::FoldAscii),
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -19724,7 +19754,7 @@ mod native_admission_lineage {
             manager
                 .commit_transferred_repository_transaction(
                     transaction,
-                    crate::admission::AdmissionCase::Sensitive,
+                    Some(crate::admission::AdmissionCase::Sensitive),
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -19740,6 +19770,66 @@ mod native_admission_lineage {
         sensitive.expect(
             "the same rule must NOT match under Sensitive, so this must be admitted; if it \
              refuses, the case is not reaching the shared matcher and carrying it buys nothing",
+        );
+    }
+
+    /// A repository with NO shared admission rules needs no case, and this is
+    /// what makes `None` an exact answer rather than a convenient one.
+    ///
+    /// With no shared sources and no local sources, `resolve_admission_matcher`
+    /// compiles a matcher over an empty rule set, which matches nothing and so
+    /// decides identically under either case. Admitting with `None` there
+    /// invents nothing.
+    #[test]
+    fn a_transfer_needs_no_case_when_the_shared_policy_has_no_rules() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+        assert!(
+            shared.sources.is_empty(),
+            "this test is about the no-rules case, so the fixture must have none"
+        );
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        manager
+            .commit_transferred_repository_transaction(transaction, None)
+            .expect("a transfer against a rule-free policy must not require a case");
+    }
+
+    /// And a repository that HAS shared rules is refused by name until the
+    /// publisher's case travels, rather than being decided by a guess.
+    ///
+    /// This is the pair to the test above. Together they say the case is
+    /// required exactly when it can change an answer and not one moment before,
+    /// which is the difference between an exact rule and a cautious one.
+    #[test]
+    fn a_transfer_against_a_rule_carrying_policy_is_refused_without_a_case() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = policy_excluding(&manager, "does/not/match/anything.rs");
+        assert!(
+            !shared.sources.is_empty(),
+            "this test is about the rules-present case"
+        );
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        let error = manager
+            .commit_transferred_repository_transaction(transaction, None)
+            .expect_err("a rule-carrying policy must refuse a transfer with no case")
+            .to_string();
+        assert!(
+            error.contains("the publisher's admission case did not travel with it"),
+            "the refusal must name the missing case: {error}"
+        );
+        assert!(
+            error.contains("will not choose one on the publisher's behalf"),
+            "the refusal must say the replica declined to guess: {error}"
+        );
+        // The rule deliberately matches nothing, so this cannot be the artifact
+        // being excluded. It is the missing case alone.
+        assert!(
+            !error.contains("excluded by the exact graph-owned admission policy"),
+            "the refusal must be about the case, not about an exclusion: {error}"
         );
     }
 
@@ -19798,7 +19888,7 @@ mod native_admission_lineage {
         let receipt = manager
             .commit_transferred_repository_transaction(
                 transaction,
-                crate::admission::AdmissionCase::Sensitive,
+                Some(crate::admission::AdmissionCase::Sensitive),
             )
             .expect("a realistic first push must be admitted");
         let elapsed = started.elapsed();
