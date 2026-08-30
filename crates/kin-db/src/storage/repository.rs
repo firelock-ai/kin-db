@@ -554,7 +554,10 @@ pub struct PersistedRepositoryAuthority {
 }
 
 impl PersistedRepositoryAuthority {
-    fn empty(repository_id: RepositoryId, snapshot: &GraphSnapshot) -> Result<Self, KinDbError> {
+    pub(crate) fn empty(
+        repository_id: RepositoryId,
+        snapshot: &GraphSnapshot,
+    ) -> Result<Self, KinDbError> {
         let mut authority = Self {
             schema_version: REPOSITORY_AUTHORITY_SCHEMA_VERSION,
             repository_id,
@@ -1896,6 +1899,145 @@ impl StorageBackend for FrozenLocalBodyBackend<'_> {
 
     fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
         Err(Self::unsupported("repository listing"))
+    }
+}
+
+/// The repository-authority envelope, opened without materializing the history.
+///
+/// A full [`RepositoryAuthorityManager::open`] decodes every domain the
+/// snapshot carries, replays history when no durable validation record covers
+/// the exact bytes, and re-verifies every persisted body against its content
+/// address. On a converted repository that is the whole store: 6493 commits of
+/// psf/requests produce a 1051 MiB snapshot whose `changes` map dominates it.
+///
+/// A caller that reads the envelope and then loads a few bodies by content
+/// address needs none of that. `kin graph status` is the case that forced this
+/// open: it takes one workspace tree out of the envelope and loads the bodies
+/// its structured facets name, and it was paying a whole-store open per cold
+/// request to do it.
+///
+/// What this still proves, so nobody reads it as a weakened boundary:
+///
+/// - The snapshot frame and its checksum are verified exactly as a full decode
+///   verifies them, so tampered or truncated bytes refuse here too.
+/// - The authority digest is checked against the durable authority record by
+///   the backend load this is built on.
+/// - Every body [`Self::load_source_blob`] returns is re-verified against its
+///   own content address at this boundary, byte for byte, by the same code the
+///   manager uses.
+///
+/// What it deliberately does not do is re-verify the bodies nobody asked for.
+/// That sweep is a whole-store integrity audit; it belongs to an open that
+/// intends to serve the store, not to a read of two fields. `open` keeps it,
+/// unconditionally, and so does the freeze path.
+///
+/// This refuses rather than guesses in the one case it cannot answer: an
+/// authority whose acknowledged journal head is past its snapshot base has an
+/// envelope that lives partly in unapplied frames, and reading the base alone
+/// would serve a superseded envelope as current. That returns `None`, which
+/// means "take the full open", never a wrong answer.
+pub struct RepositoryAuthorityMetadata<B: StorageBackend + ?Sized> {
+    repository_id: RepositoryId,
+    backend: Arc<B>,
+    metadata: PersistedRepositoryAuthority,
+    generation: Generation,
+}
+
+impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
+    /// Read the envelope for `repository_id`, or `None` when a full open is
+    /// required to answer correctly.
+    ///
+    /// `None` has exactly three producers and each is a "cannot answer cheaply"
+    /// rather than an error: no persisted authority exists yet, the acknowledged
+    /// journal head is past the snapshot base, or the snapshot carries no v13
+    /// envelope. A caller treats all three the same way, by opening in full.
+    pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Option<Self>, KinDbError> {
+        let started = std::time::Instant::now();
+        let Some(authority) = backend.load_snapshot_authority(repository_id.as_str())? else {
+            return Ok(None);
+        };
+        if authority.snapshot_generation != authority.head_generation {
+            tracing::debug!(
+                repository = %repository_id,
+                base = authority.snapshot_generation,
+                head = authority.head_generation,
+                "authority envelope read declined: acknowledged journal is past the snapshot base"
+            );
+            return Ok(None);
+        }
+        let read_at = started.elapsed();
+        let envelope = crate::storage::format::AuthorityEnvelopeSnapshot::from_bytes(
+            &authority.snapshot_bytes,
+        )?;
+        // The bytes are the largest thing this function ever holds and nothing
+        // below reads them, so they go before the envelope is checked rather
+        // than at the end of the scope.
+        drop(authority);
+        let decode_at = started.elapsed();
+        let Some(metadata) = envelope.repository_authority else {
+            return Ok(None);
+        };
+        if metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "snapshot authority belongs to {}, not {}",
+                metadata.repository_id, repository_id
+            )));
+        }
+        let generation = metadata.roots.generation;
+        tracing::debug!(
+            repository = %repository_id,
+            generation,
+            read_ms = read_at.as_millis(),
+            decode_ms = (decode_at - read_at).as_millis(),
+            "repository authority envelope read"
+        );
+        Ok(Some(Self {
+            repository_id,
+            backend,
+            metadata,
+            generation,
+        }))
+    }
+
+    /// The envelope this read resolved.
+    pub const fn metadata(&self) -> &PersistedRepositoryAuthority {
+        &self.metadata
+    }
+
+    /// The authority generation the envelope names.
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Load exact immutable source bytes from repository-owned CAS authority.
+    ///
+    /// Byte for byte the manager's own boundary: bounded, size-validated, and
+    /// re-verified against the requested content address before it returns.
+    pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>, KinDbError> {
+        let Some(data) = self.backend.load_source_blob_bounded(
+            self.repository_id.as_str(),
+            *digest.as_bytes(),
+            MAX_SOURCE_BLOB_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            storage(format!(
+                "immutable source blob {} length does not fit u64",
+                digest
+            ))
+        })?;
+        validate_source_blob_size(
+            byte_len,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        verify_source_blob_digest(
+            *digest.as_bytes(),
+            &data,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        Ok(Some(data))
     }
 }
 
