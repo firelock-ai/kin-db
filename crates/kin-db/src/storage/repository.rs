@@ -20040,43 +20040,42 @@ mod native_admission_lineage {
 
     /// The journal WALK reaches the envelope a full open reaches.
     ///
-    /// This is the arm the sibling test in the outer module cannot hold. Every
-    /// live store takes this path, because a store's acknowledged head moves
-    /// past its snapshot base the first time its daemon writes anything, and a
-    /// walk that builds a wrong envelope gives wrong workspace answers with no
-    /// error on the daemon's primary read.
+    /// Every live store takes this path, because a store's acknowledged head
+    /// moves past its snapshot base the first time its daemon writes anything,
+    /// and a walk that builds a wrong envelope gives wrong workspace answers
+    /// with no error on the daemon's primary read.
     ///
-    /// It lives here because this module already has what the outer one does
-    /// not: `transaction_shell` reads `expected_generation` and
-    /// `expected_roots` off the current lease and mutates no refs, so a second
-    /// call after the first commit is a valid successor. Three attempts to
-    /// build this out of the outer module's bootstrap helper failed on the
-    /// fixture rather than on the code, the last of them on
-    /// `ref refs/heads/main already exists`.
+    /// It lives here because this module has the two-commit shape the outer one
+    /// does not. `committed_history(true)` lands the bootstrap through a bound
+    /// workspace, and `transaction_shell` then reads `expected_generation` and
+    /// `expected_roots` off the current lease while mutating no refs, so a
+    /// second call is a valid successor and therefore a frame past the base.
+    ///
+    /// **The follow-on change carries no tree deltas, and that is required
+    /// rather than incidental.** `transaction_shell` sets
+    /// `workspace_mutation: None`, so a change introducing artifacts is refused
+    /// with "introduces artifacts without a bound workspace admission context".
+    /// An earlier version of this test built its own first commit out of
+    /// `transfer_fixture` plus `chained_history` and hit exactly that.
     ///
     /// The assertion is the JOIN, against what the full open produces, because
     /// a hardcoded expectation passes with both sides wrong. The control above
     /// it is what makes the join mean anything: without a frame past the base
-    /// the read takes its early return, and this test would pass with the walk
+    /// the read takes its early return and this test passes with the walk
     /// deleted.
     #[test]
     fn the_envelope_walk_reaches_the_envelope_a_full_open_reaches() {
-        let (directory, manager, tree_deltas) = transfer_fixture();
+        let fixture = committed_history(true);
         let shared = SharedAdmissionPolicy::empty(0);
-
-        let first = chained_history(&shared, &tree_deltas);
-        let tail = first.last().expect("the chain is not empty").id;
-        manager
-            .commit_repository_transaction(transaction_shell(&manager, 3, first))
-            .expect("the fixture's first commit must land");
-
-        let follow = vec![native_change(CHANGES, Some(tail), &shared, Vec::new())];
-        manager
-            .commit_repository_transaction(transaction_shell(&manager, 4, follow))
-            .expect("the fixture's second commit must land");
+        let follow_on = native_change(CHANGES, Some(fixture.head), &shared, Vec::new());
+        let receipt = fixture
+            .manager
+            .commit_repository_transaction(transaction_shell(&fixture.manager, 2, vec![follow_on]))
+            .expect("a follow-on Native change that introduces nothing must commit");
+        assert_eq!(receipt.generation, 2);
 
         let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
-            directory.path(),
+            fixture._directory.path(),
         ));
 
         // THE CONTROL. A fixture whose base already is its head exercises the
@@ -20099,12 +20098,12 @@ mod native_admission_lineage {
                 .expect("the envelope read must answer over a journal, not decline");
         assert_eq!(
             envelope.generation(),
-            manager.read_authority().generation(),
+            fixture.manager.read_authority().generation(),
             "the walked envelope must reach the acknowledged head"
         );
         assert_eq!(
             envelope.metadata(),
-            manager.read_authority().metadata(),
+            fixture.manager.read_authority().metadata(),
             "the walked envelope must equal the one a full open produces, field for field"
         );
     }
