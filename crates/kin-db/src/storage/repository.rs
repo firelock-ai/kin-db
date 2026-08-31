@@ -40,8 +40,8 @@ use crate::admission::{
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::authority::{
-    AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
-    PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
+    AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, AuthorityRewriteDecision,
+    DurableAuthorityPersistence, PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
 };
 use crate::storage::backend::{
     load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
@@ -885,6 +885,25 @@ impl RepositoryAuthorityState {
         }
     }
 
+    /// Replace only the durable representation of this exact authority.
+    ///
+    /// The section is derived state and changes neither semantic roots nor the
+    /// logical generation. The authenticated Gitlink index therefore remains
+    /// exact. Prepared state does not: its binding names the old authority
+    /// bytes, so a rewrite drops it rather than carrying a cache that can only
+    /// refuse.
+    fn from_validated_equivalent(current: &Self, snapshot: GraphSnapshot) -> Self {
+        debug_assert_eq!(
+            snapshot.repository_authority.as_ref().map(|m| &m.roots),
+            Some(current.roots())
+        );
+        Self {
+            snapshot,
+            authenticated_gitlinks: Arc::clone(&current.authenticated_gitlinks),
+            prepared: None,
+        }
+    }
+
     pub fn snapshot(&self) -> &GraphSnapshot {
         &self.snapshot
     }
@@ -1439,6 +1458,67 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
+    /// Reconcile one exact full-snapshot candidate, whether it was a logical
+    /// successor or an equivalent representation rewrite.
+    fn reconcile_full_snapshot(&self, next: &RepositoryAuthorityState) -> PersistOutcome {
+        // The retained candidate is the exact `Arc` a persist attempt already
+        // serialized, so its admission gate still stands.
+        let bytes = match next.snapshot.to_bytes_pre_validated() {
+            Ok(bytes) => bytes,
+            Err(error) => return PersistOutcome::NotCommitted(error),
+        };
+        let mut state = self.state.lock();
+        let (installed, _journal) = match self
+            .backend
+            .load_recovery_state(self.repository_id.as_str())
+        {
+            Ok(installed) => installed,
+            Err(error) => return PersistOutcome::Indeterminate(error),
+        };
+
+        match installed {
+            Some(authority)
+                if authority.snapshot_generation != authority.head_generation =>
+            {
+                PersistOutcome::NotCommitted(storage(format!(
+                    "repository {} authority advanced through an incremental journal while an exact full-snapshot write was indeterminate",
+                    self.repository_id
+                )))
+            }
+            Some(authority) if authority.snapshot_bytes == bytes => {
+                let installed_cursor = authority.cursor();
+                if installed_cursor == state.cursor {
+                    return PersistOutcome::Indeterminate(storage(format!(
+                        "repository {} exposes the pending full-snapshot bytes without advancing backend cursor {}",
+                        self.repository_id,
+                        state.cursor.backend_generation()
+                    )));
+                }
+                state.cursor = installed_cursor;
+                let retired = self.note_full_snapshot_committed(&mut state, bytes.len());
+                self.clear_retired_frames(retired);
+                PersistOutcome::Committed
+            }
+            Some(authority) if authority.cursor() != state.cursor => {
+                PersistOutcome::NotCommitted(storage(format!(
+                    "repository {} backend authority advanced from cursor {} to {} with different snapshot bytes while a full-snapshot write was indeterminate",
+                    self.repository_id,
+                    state.cursor.backend_generation(),
+                    authority.cursor().backend_generation()
+                )))
+            }
+            Some(_) => self.persist_bytes(&bytes, &mut state),
+            None if state.cursor == SnapshotCursor::INITIAL => {
+                self.persist_bytes(&bytes, &mut state)
+            }
+            None => PersistOutcome::Indeterminate(storage(format!(
+                "repository {} backend authority disappeared while reconciling cursor {}",
+                self.repository_id,
+                state.cursor.backend_generation()
+            ))),
+        }
+    }
+
     /// Reconcile a retained frame candidate whose append was indeterminate.
     ///
     /// The record and the acknowledged frame bytes are read under the backend
@@ -1681,80 +1761,72 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        let mut state = self.state.lock();
-        // A retained frame candidate is reconciled against the exact bytes the
-        // append tried to install, and only for the successor it was encoded
-        // for. It stays retained only while its outcome is still unknown; a
-        // committed or refused frame is dropped with the candidate.
-        if let Some(pending) = state.pending_frame.take() {
-            if pending.roots == *next.roots() {
-                let outcome = match self.reconcile_frame(&mut state, &pending.bytes) {
-                    Ok(outcome) => outcome,
-                    Err(error) => PersistOutcome::Indeterminate(error),
-                };
-                if matches!(outcome, PersistOutcome::Indeterminate(_)) {
-                    state.pending_frame = Some(pending);
+        {
+            let mut state = self.state.lock();
+            // A retained frame candidate is reconciled against the exact bytes the
+            // append tried to install, and only for the successor it was encoded
+            // for. It stays retained only while its outcome is still unknown; a
+            // committed or refused frame is dropped with the candidate.
+            if let Some(pending) = state.pending_frame.take() {
+                if pending.roots == *next.roots() {
+                    let outcome = match self.reconcile_frame(&mut state, &pending.bytes) {
+                        Ok(outcome) => outcome,
+                        Err(error) => PersistOutcome::Indeterminate(error),
+                    };
+                    if matches!(outcome, PersistOutcome::Indeterminate(_)) {
+                        state.pending_frame = Some(pending);
+                    }
+                    return outcome;
                 }
-                return outcome;
             }
         }
         let _ = current;
-        // A reconciled full-snapshot candidate is the exact retained `Arc` a
-        // persist attempt already serialized, so its admission gate still
-        // stands.
+        self.reconcile_full_snapshot(next)
+    }
+
+    fn persist_equivalent(
+        &self,
+        current: &RepositoryAuthorityState,
+        next: &RepositoryAuthorityState,
+    ) -> PersistOutcome {
+        if current.roots() != next.roots() {
+            return PersistOutcome::NotCommitted(storage(format!(
+                "repository {} equivalent representation rewrite changed semantic roots",
+                self.repository_id
+            )));
+        }
+
+        // A representation rewrite is always a complete snapshot CAS. An
+        // authority frame represents a logical operation and is deliberately
+        // unavailable to this path.
+        let _persist_span = tracing::info_span!("kindb.commit.persist_equivalent").entered();
+        let mut timer = PublicationPhaseTimer::start();
         let bytes = match next.snapshot.to_bytes_pre_validated() {
             Ok(bytes) => bytes,
             Err(error) => return PersistOutcome::NotCommitted(error),
         };
-        let installed = match self
-            .backend
-            .load_snapshot_authority(self.repository_id.as_str())
-        {
-            Ok(installed) => installed,
-            Err(error) => return PersistOutcome::Indeterminate(error),
-        };
+        let serialize_ms = timer.lap_ms();
+        let snapshot_bytes = bytes.len();
+        let mut state = self.state.lock();
+        state.pending_frame = None;
+        let outcome = self.persist_bytes(&bytes, &mut state);
+        let write_ms = timer.lap_ms();
+        record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+        outcome
+    }
 
-        match installed {
-            Some(authority)
-                if authority.snapshot_generation != authority.head_generation =>
-            {
-                PersistOutcome::NotCommitted(storage(format!(
-                    "repository {} authority advanced through an incremental journal while an exact full-snapshot commit was indeterminate",
-                    self.repository_id
-                )))
-            }
-            Some(authority) if authority.snapshot_bytes == bytes => {
-                let installed_cursor = authority.cursor();
-                if installed_cursor == state.cursor {
-                    return PersistOutcome::Indeterminate(storage(format!(
-                        "repository {} exposes the pending successor bytes without advancing backend cursor {}",
-                        self.repository_id,
-                        state.cursor.backend_generation()
-                    )));
-                }
-                state.cursor = installed_cursor;
-                let retired = self.note_full_snapshot_committed(&mut state, bytes.len());
-                self.clear_retired_frames(retired);
-                PersistOutcome::Committed
-            }
-            Some(authority) if authority.cursor() != state.cursor => {
-                PersistOutcome::NotCommitted(storage(format!(
-                    "repository {} backend authority advanced from cursor {} to {} with different snapshot bytes while a commit was indeterminate",
-                    self.repository_id,
-                    state.cursor.backend_generation(),
-                    authority.cursor().backend_generation()
-                )))
-            }
-            Some(_) => self.persist_bytes(&bytes, &mut state),
-            None if state.cursor == SnapshotCursor::INITIAL => {
-                self.persist_bytes(&bytes, &mut state)
-            }
-            None => PersistOutcome::Indeterminate(storage(format!(
-                "repository {} backend authority disappeared while reconciling cursor {}",
-                self.repository_id,
-                state.cursor.backend_generation()
-            ))),
+    fn reconcile_equivalent(
+        &self,
+        current: &RepositoryAuthorityState,
+        next: &RepositoryAuthorityState,
+    ) -> PersistOutcome {
+        if current.roots() != next.roots() {
+            return PersistOutcome::NotCommitted(storage(format!(
+                "repository {} equivalent representation rewrite changed semantic roots",
+                self.repository_id
+            )));
         }
+        self.reconcile_full_snapshot(next)
     }
 }
 
@@ -1775,6 +1847,23 @@ pub struct RepositoryAuthorityManager<B: StorageBackend + ?Sized + 'static> {
     /// loaded. Retained here so its counters outlive the published state a
     /// later commit replaces.
     prepared: Option<Arc<PreparedWorkspaceGraphCache>>,
+}
+
+/// Result of explicitly persisting one workspace base graph section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedGraphSectionOutcome {
+    /// A complete section was durably written.
+    Persisted {
+        resolved_at: SemanticChangeId,
+        authority_generation: Generation,
+    },
+    /// The current snapshot already carries a usable section for this base.
+    AlreadyCurrent {
+        resolved_at: SemanticChangeId,
+        authority_generation: Generation,
+    },
+    /// The workspace exists but has no committed base to resolve yet.
+    NoBaseTarget { authority_generation: Generation },
 }
 
 /// Exclusive, cross-process lease over one fully revalidated local repository
@@ -2130,17 +2219,17 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
         };
         let frames_at = started.elapsed();
 
-        let generation = metadata.roots.generation;
-        if generation != head_generation {
-            return Err(storage(format!(
-                "repository {repository_id} envelope reached generation {generation}, not the acknowledged head {head_generation}"
-            )));
-        }
+        // The backend cursor fences physical writes. The roots generation is
+        // the logical repository generation. A representation-only full
+        // snapshot rewrite advances the first while deliberately preserving
+        // the second, so equality between them is not an authority invariant.
+        let logical_generation = metadata.roots.generation;
         tracing::debug!(
             repository = %repository_id,
-            generation,
-            base_generation,
-            frames = head_generation.saturating_sub(base_generation),
+            logical_generation,
+            backend_base_generation = base_generation,
+            backend_head_generation = head_generation,
+            backend_frames = head_generation.saturating_sub(base_generation),
             read_ms = read_at.as_millis(),
             decode_ms = (decode_at - read_at).as_millis(),
             frames_ms = (frames_at - decode_at).as_millis(),
@@ -2150,7 +2239,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
             repository_id,
             backend,
             metadata,
-            generation,
+            generation: logical_generation,
             materialized_graph,
         }))
     }
@@ -2648,6 +2737,101 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     ) -> Result<Option<GraphSnapshot>, KinDbError> {
         self.require_repository(repository_id)?;
         self.read_authority().workspace_graph_snapshot(workspace_id)
+    }
+
+    /// Persist the complete resolved graph at one workspace's committed base.
+    ///
+    /// This is an explicit representation rewrite, not a repository operation:
+    /// it advances the backend's fenced write cursor while preserving the exact
+    /// logical roots and generation. Ordinary publish deliberately does not pay
+    /// this capture's memory cost. A caller may invoke this after initialization
+    /// or as an operator-requested refresh. Repeating it for an already-valid
+    /// section is idempotent and performs no durable write.
+    ///
+    /// `Ok(None)` means the workspace does not exist. An unborn workspace is
+    /// reported distinctly and performs no write.
+    pub fn materialize_workspace_base_graph_section(
+        &self,
+        repository_id: &RepositoryId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<MaterializedGraphSectionOutcome>, KinDbError> {
+        self.require_repository(repository_id)?;
+
+        self.publication.rewrite_equivalent(|current| {
+            let Some(workspace) = current
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.workspace_id == workspace_id)
+            else {
+                return Ok(AuthorityRewriteDecision::Unchanged { output: None });
+            };
+            let authority_generation = current.generation();
+            let Some(resolved_at) =
+                workspace_base_change_id(current.metadata(), workspace.base_target.as_ref())?
+            else {
+                return Ok(AuthorityRewriteDecision::Unchanged {
+                    output: Some(MaterializedGraphSectionOutcome::NoBaseTarget {
+                        authority_generation,
+                    }),
+                });
+            };
+
+            if current
+                .snapshot
+                .materialized_graph
+                .as_ref()
+                .is_some_and(|section| section.validate_for(&resolved_at).is_ok())
+            {
+                return Ok(AuthorityRewriteDecision::Unchanged {
+                    output: Some(MaterializedGraphSectionOutcome::AlreadyCurrent {
+                        resolved_at,
+                        authority_generation,
+                    }),
+                });
+            }
+
+            // Resolve directly from history. The read path may trust a section
+            // by schema and target, but the writer must prove its memo by
+            // computing the call it memoizes. The complete state stays whole
+            // through `CapturedBaseGraph`, including both tombstone maps and
+            // the fold's entity revision timelines.
+            let state = AuthorityHistoryView {
+                changes: &current.snapshot.changes,
+            }
+            .resolve_graph_at(&resolved_at)?;
+            let mut snapshot = current.snapshot.clone();
+            snapshot.materialized_graph = Some(Arc::new(
+                CapturedBaseGraph::capture(resolved_at, state).into_section(),
+            ));
+            snapshot.version = snapshot.wire_version();
+            if snapshot
+                .repository_authority
+                .as_ref()
+                .map(|metadata| &metadata.roots)
+                != Some(current.roots())
+            {
+                return Err(storage(
+                    "materialized graph representation rewrite changed semantic roots".to_string(),
+                ));
+            }
+            if let Some(field) =
+                crate::storage::authority_frame::first_difference(current.snapshot(), &snapshot)
+            {
+                return Err(storage(format!(
+                    "materialized graph representation rewrite changed {field}"
+                )));
+            }
+
+            let next = RepositoryAuthorityState::from_validated_equivalent(current, snapshot);
+            Ok(AuthorityRewriteDecision::Rewrite {
+                next,
+                output: Some(MaterializedGraphSectionOutcome::Persisted {
+                    resolved_at,
+                    authority_generation,
+                }),
+            })
+        })
     }
 
     /// Commit one complete repository transaction.
@@ -15790,6 +15974,373 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_explicit_materialize_operation_stamps_the_workspace_base_once() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let roots_before = store.manager.read_authority().roots().clone();
+        let backend_before = store
+            .backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the fixture wrote authority")
+            .head_generation;
+
+        let outcome = store
+            .manager
+            .materialize_workspace_base_graph_section(&repository_id(), &store.workspace_id)
+            .unwrap()
+            .expect("the synthetic workspace has a committed base");
+        let MaterializedGraphSectionOutcome::Persisted {
+            resolved_at,
+            authority_generation,
+        } = outcome
+        else {
+            panic!("the first explicit materialization must persist")
+        };
+        assert_eq!(authority_generation, roots_before.generation);
+
+        let lease = store.manager.read_authority();
+        assert_eq!(lease.roots(), &roots_before);
+        assert_eq!(lease.generation(), roots_before.generation);
+        let section = lease
+            .snapshot()
+            .materialized_graph
+            .as_ref()
+            .expect("the explicit operation writes a section");
+        section
+            .validate_for(&resolved_at)
+            .expect("the written section names the workspace base and current schema");
+        assert_eq!(lease.snapshot().version, lease.snapshot().wire_version());
+        drop(lease);
+
+        let backend_after = store
+            .backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the rewrite remained durable")
+            .head_generation;
+        assert_eq!(
+            backend_after,
+            backend_before + 1,
+            "the equivalent full snapshot must advance its fenced backend cursor"
+        );
+
+        assert_eq!(
+            store
+                .manager
+                .materialize_workspace_base_graph_section(&repository_id(), &store.workspace_id)
+                .unwrap(),
+            Some(MaterializedGraphSectionOutcome::AlreadyCurrent {
+                resolved_at,
+                authority_generation: roots_before.generation,
+            })
+        );
+        assert_eq!(
+            store
+                .backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .unwrap()
+                .head_generation,
+            backend_after,
+            "an already-valid section must not perform another durable write"
+        );
+    }
+
+    #[test]
+    fn materialize_distinguishes_a_missing_workspace_from_an_unborn_one() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xf1_2955));
+        manager
+            .commit_repository_transaction(unborn_workspace_transaction(
+                &manager, 0xf1_2956, 0xf1_2955, b"unborn",
+            ))
+            .unwrap();
+        let backend_before = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap()
+            .head_generation;
+
+        assert_eq!(
+            manager
+                .materialize_workspace_base_graph_section(&repository_id(), &workspace_id)
+                .unwrap(),
+            Some(MaterializedGraphSectionOutcome::NoBaseTarget {
+                authority_generation: manager.read_authority().generation(),
+            })
+        );
+        assert_eq!(
+            manager
+                .materialize_workspace_base_graph_section(
+                    &repository_id(),
+                    &WorkspaceId::from_uuid(Uuid::from_u128(0xf1_ffff)),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .unwrap()
+                .head_generation,
+            backend_before,
+            "neither no-op result may advance the backend cursor"
+        );
+    }
+
+    #[test]
+    fn the_explicitly_materialized_section_is_the_complete_history_fold() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let outcome = store
+            .manager
+            .materialize_workspace_base_graph_section(&repository_id(), &store.workspace_id)
+            .unwrap()
+            .unwrap();
+        let MaterializedGraphSectionOutcome::Persisted { resolved_at, .. } = outcome else {
+            panic!("the first explicit materialization must persist")
+        };
+        let lease = store.manager.read_authority();
+        let section = lease
+            .snapshot()
+            .materialized_graph
+            .as_ref()
+            .expect("the explicit operation writes a section");
+        let folded = AuthorityHistoryView {
+            changes: &lease.snapshot().changes,
+        }
+        .resolve_graph_at(&resolved_at)
+        .expect("the workspace base folds from admitted history");
+
+        assert!(!section.state.entities.is_empty());
+        assert!(!section.state.entity_revisions.is_empty());
+        assert_eq!(section.state.entities, folded.entities);
+        assert_eq!(section.state.relations, folded.relations);
+        assert_eq!(section.state.entity_revisions, folded.entity_revisions);
+        assert_eq!(section.state.tree, folded.tree);
+        assert_eq!(
+            section.state.external_references,
+            folded.external_references
+        );
+        assert_eq!(section.state.entity_tombstones, folded.entity_tombstones);
+        assert_eq!(
+            section.state.relation_tombstones,
+            folded.relation_tombstones
+        );
+    }
+
+    #[test]
+    fn a_successor_shares_the_materialized_section_instead_of_copying_it() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        store
+            .manager
+            .materialize_workspace_base_graph_section(&repository_id(), &store.workspace_id)
+            .unwrap()
+            .unwrap();
+        let before = Arc::clone(
+            store
+                .manager
+                .read_authority()
+                .snapshot()
+                .materialized_graph
+                .as_ref()
+                .expect("materialize writes a section"),
+        );
+
+        stage_synthetic_overlay(&store);
+
+        let after = Arc::clone(
+            store
+                .manager
+                .read_authority()
+                .snapshot()
+                .materialized_graph
+                .as_ref()
+                .expect("an ordinary successor retains the base section"),
+        );
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "later publishes must share the immutable section allocation"
+        );
+    }
+
+    #[test]
+    fn a_logical_generation_survives_materialize_then_a_frame_and_both_reopens() {
+        let synthetic = build_synthetic_history_store(2, 8, 1, 3);
+        let (seed_bytes, _) = synthetic
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic fixture persisted its authority");
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        backend
+            .save_snapshot(repository_id().as_str(), &seed_bytes, 0)
+            .expect("seed the local backend from the admitted synthetic authority");
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let roots_before = manager.read_authority().roots().clone();
+
+        let outcome = manager
+            .materialize_workspace_base_graph_section(&repository_id(), &synthetic.workspace_id)
+            .unwrap()
+            .unwrap();
+        let MaterializedGraphSectionOutcome::Persisted { resolved_at, .. } = outcome else {
+            panic!("the first explicit materialization must persist")
+        };
+        let materialized_backend = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            materialized_backend.snapshot_generation, materialized_backend.head_generation,
+            "an equivalent rewrite is a complete snapshot, never a frame"
+        );
+        assert!(materialized_backend.head_generation > roots_before.generation);
+
+        let metadata = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+            .unwrap()
+            .expect("metadata-only open must accept distinct backend and logical generations");
+        assert_eq!(metadata.generation(), roots_before.generation);
+        assert_eq!(metadata.metadata().roots, roots_before);
+        metadata
+            .materialized_graph_for(&resolved_at)
+            .expect("metadata-only open carries the new section");
+        let full = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert_eq!(full.read_authority().roots(), &roots_before);
+        full.read_authority()
+            .snapshot()
+            .materialized_graph
+            .as_ref()
+            .expect("full open carries the new section")
+            .validate_for(&resolved_at)
+            .unwrap();
+
+        let relation = synthetic_overlay_relation(&synthetic);
+        let transaction = semantic_workspace_transaction(
+            &manager,
+            0xf1_2324,
+            WorkspaceSemanticDelta::new_with_external_references(
+                Vec::new(),
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        manager
+            .commit_repository_transaction(transaction)
+            .expect("an ordinary successor must commit after the equivalent rewrite");
+        let framed = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .unwrap();
+        assert!(
+            framed.snapshot_generation < framed.head_generation,
+            "the control must carry a frame after the materialized base"
+        );
+        assert_eq!(
+            manager.read_authority().generation(),
+            roots_before.generation + 1
+        );
+
+        let metadata_after =
+            RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+                .unwrap()
+                .expect("metadata-only open must walk the frame after a representation rewrite");
+        let full_after =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert_eq!(
+            metadata_after.generation(),
+            full_after.read_authority().generation()
+        );
+        assert_eq!(
+            metadata_after.metadata(),
+            full_after.read_authority().metadata()
+        );
+        metadata_after
+            .materialized_graph_for(&resolved_at)
+            .expect("the unchanged workspace base still accepts the section after a frame");
+        assert_eq!(
+            full_after
+                .workspace_graph_snapshot(&repository_id(), &synthetic.workspace_id)
+                .unwrap()
+                .unwrap()
+                .relations
+                .get(&relation.id),
+            Some(&relation),
+            "the full reopen must apply the successor workspace overlay"
+        );
+    }
+
+    #[test]
+    fn an_indeterminate_materialize_reconciles_the_exact_installed_snapshot() {
+        let synthetic = build_synthetic_history_store(2, 8, 1, 3);
+        let (seed_bytes, _) = synthetic
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic fixture persisted its authority");
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        backend
+            .save_snapshot(repository_id().as_str(), &seed_bytes, 0)
+            .unwrap();
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let logical_generation = manager.read_authority().generation();
+
+        backend.fail_next_snapshot_parent_sync_after_install();
+        let error = manager
+            .materialize_workspace_base_graph_section(&repository_id(), &synthetic.workspace_id)
+            .expect_err("lost post-install acknowledgement must remain indeterminate");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+        assert!(manager
+            .read_authority()
+            .snapshot()
+            .materialized_graph
+            .is_none());
+        let installed_cursor = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the exact materialized candidate was installed")
+            .head_generation;
+
+        let reconciled = manager
+            .materialize_workspace_base_graph_section(&repository_id(), &synthetic.workspace_id)
+            .expect("the next writer reconciles before preparing")
+            .expect("the workspace still exists");
+        assert!(matches!(
+            reconciled,
+            MaterializedGraphSectionOutcome::AlreadyCurrent {
+                authority_generation,
+                ..
+            } if authority_generation == logical_generation
+        ));
+        assert!(manager
+            .read_authority()
+            .snapshot()
+            .materialized_graph
+            .is_some());
+        assert_eq!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .unwrap()
+                .head_generation,
+            installed_cursor,
+            "reconciliation adopts the installed bytes without allocating another cursor"
+        );
+    }
+
     /// A section stamped by hand, standing in for what the materialize
     /// operation will write.
     ///
@@ -15803,8 +16354,9 @@ mod tests {
         }
         .resolve_graph_at(&change_id)
         .expect("the head resolves");
-        snapshot.materialized_graph =
-            Some(CapturedBaseGraph::capture(change_id, state).into_section());
+        snapshot.materialized_graph = Some(Arc::new(
+            CapturedBaseGraph::capture(change_id, state).into_section(),
+        ));
         snapshot.version = snapshot.wire_version();
     }
 
@@ -15897,14 +16449,15 @@ mod tests {
         stamp_a_section(&mut snapshot, change_id);
         let mut wrong = snapshot
             .materialized_graph
-            .clone()
+            .as_deref()
+            .cloned()
             .expect("the stamp put one there");
         // Emptied, so a reader that serves without checking gives an answer
         // that cannot be mistaken for the right one.
         wrong.state.entities.clear();
         wrong.state.relations.clear();
         wrong.resolved_at = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
-        snapshot.materialized_graph = Some(wrong);
+        snapshot.materialized_graph = Some(Arc::new(wrong));
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "a section for another change must not answer");
@@ -15923,12 +16476,13 @@ mod tests {
         stamp_a_section(&mut snapshot, change_id);
         let mut wrong = snapshot
             .materialized_graph
-            .clone()
+            .as_deref()
+            .cloned()
             .expect("the stamp put one there");
         wrong.state.entities.clear();
         wrong.state.relations.clear();
         wrong.schema_version = MATERIALIZED_GRAPH_SCHEMA_VERSION + 1;
-        snapshot.materialized_graph = Some(wrong);
+        snapshot.materialized_graph = Some(Arc::new(wrong));
 
         let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
         assert_eq!(served, 0, "an unknown schema must not answer");
@@ -19468,7 +20022,7 @@ mod fir2334_attribution {
                 .len(),
             section.state.external_references.len(),
         );
-        snapshot.materialized_graph = Some(section);
+        snapshot.materialized_graph = Some(Arc::new(section));
 
         // AFTER: the same resolution, served.
         PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());

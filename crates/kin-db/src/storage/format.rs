@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{GitProjectionTreeReplay, PersistedRepositoryAuthority};
@@ -339,8 +340,9 @@ pub const MATERIALIZED_GRAPH_SCHEMA_VERSION: u32 = 1;
 /// A converted repository's snapshot IS its history: the `changes` map is
 /// most of the body, while the entities and relations a daemon actually serves
 /// are absent from the file and folded out of that history at every open by
-/// `ChangeStore::resolve_graph_at`. This section is that fold, written once by
-/// the publish that produced it and read directly afterwards.
+/// `ChangeStore::resolve_graph_at`. This section is that fold, written by an
+/// explicit materialization operation after initialization or on operator
+/// request, and read directly afterwards. Ordinary publish does not capture it.
 ///
 /// It is derived state, not authority, and the distinction is load-bearing.
 /// Nothing here is hashed into any authority root, because the authority over a
@@ -500,8 +502,13 @@ pub struct GraphSnapshot {
     /// is strictly better than bumping every store on the same commit: the
     /// compatibility cost is paid per store, by the stores that bought
     /// something with it.
+    ///
+    /// The `Arc` is wire-transparent immutable sharing. A later repository
+    /// successor clones the pointer instead of deep-copying this measured-large
+    /// derived section; serde still writes the contained value in the same v14
+    /// field shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub materialized_graph: Option<MaterializedGraphSection>,
+    pub materialized_graph: Option<Arc<MaterializedGraphSection>>,
 }
 
 fn deserialize_required_repository_authority<'de, D>(
@@ -3710,9 +3717,19 @@ mod tests {
     /// An otherwise empty snapshot that carries a section, and so is v14.
     fn a_v14_snapshot(entity_name: &str) -> GraphSnapshot {
         let mut snapshot = GraphSnapshot::empty();
-        snapshot.materialized_graph = Some(a_section(a_change_id(0x11), entity_name));
+        snapshot.materialized_graph = Some(Arc::new(a_section(a_change_id(0x11), entity_name)));
         snapshot.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
         snapshot
+    }
+
+    #[test]
+    fn arc_sharing_is_wire_transparent_for_a_materialized_section() {
+        let section = a_section(a_change_id(0x11), "shared");
+        assert_eq!(
+            rmp_serde::to_vec(&Some(section.clone())).expect("direct section encodes"),
+            rmp_serde::to_vec(&Some(Arc::new(section))).expect("shared section encodes"),
+            "Arc is an in-memory sharing choice and must not change the v14 field bytes"
+        );
     }
 
     /// The exact bytes a future writer will produce for a v14 snapshot.

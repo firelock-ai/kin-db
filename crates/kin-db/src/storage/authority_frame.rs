@@ -666,7 +666,10 @@ fn take_drained_frame_tamper() -> Option<Box<dyn FnOnce(&mut AuthorityFrame)>> {
 /// comparison names it. Collections whose element types carry `PartialEq` are
 /// compared directly; the others are compared element by element through the
 /// MessagePack form a full snapshot would have persisted them in.
-fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Option<&'static str> {
+pub(crate) fn first_difference(
+    reconstructed: &GraphSnapshot,
+    next: &GraphSnapshot,
+) -> Option<&'static str> {
     let GraphSnapshot {
         // Bound and not compared, for the same reason `materialized_graph` is
         // below and downstream of it. The version a snapshot declares is a pure
