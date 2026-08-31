@@ -7,241 +7,197 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow_root="${1:-${root}/.github/workflows}"
 
-python3 - "${workflow_root}" <<'PY'
-import re
-import sys
-from pathlib import Path
+ruby - "${workflow_root}" <<'RUBY'
+require "psych"
+require "yaml"
 
-workflow_root = Path(sys.argv[1])
-if not workflow_root.is_dir():
-    sys.exit(f"FAIL: workflow directory does not exist: {workflow_root}")
+workflow_root = File.expand_path(ARGV.fetch(0))
+abort("FAIL: workflow directory does not exist: #{workflow_root}") unless Dir.exist?(workflow_root)
 
 expected_counts = {
-    "ci.yml": (2, 1),
-    "ci-linux.yml": (1, 0),
-    "windows-nightly.yml": (1, 1),
-}
-allowed_paths = ["~/.cargo/registry", "~/.cargo/git"]
+  "ci.yml" => [2, 1],
+  "ci-linux.yml" => [1, 0],
+  "windows-nightly.yml" => [1, 1],
+}.freeze
+allowed_paths = ["~/.cargo/registry", "~/.cargo/git"].freeze
 restore_key = "${{ runner.os }}-cargo-sources-v2"
 restore_prefix = "${{ runner.os }}-cargo-sources-"
 save_key = "${{ steps.cargo-sources.outputs.cache-primary-key }}"
-save_condition = (
-    "github.ref == 'refs/heads/main' && "
-    "steps.cargo-sources.outputs.cache-hit != 'true'"
-)
-
-
-def step_block(lines, uses_at):
-    uses_line = lines[uses_at]
-    uses_indent = len(uses_line) - len(uses_line.lstrip())
-    if uses_line.lstrip().rstrip().startswith("-"):
-        start = uses_at
-        step_indent = uses_indent
-    else:
-        start = None
-        step_indent = None
-        for index in range(uses_at - 1, -1, -1):
-            line = lines[index]
-            stripped = line.lstrip().rstrip()
-            indent = len(line) - len(line.lstrip())
-            if (stripped == "-" or stripped.startswith("- ")) and indent < uses_indent:
-                start = index
-                step_indent = indent
-                break
-        if start is None:
-            raise ValueError(f"could not find step start before line {uses_at + 1}")
-
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        line = lines[index]
-        stripped = line.lstrip().rstrip()
-        indent = len(line) - len(line.lstrip())
-        if (stripped == "-" or stripped.startswith("- ")) and indent <= step_indent:
-            end = index
-            break
-        if stripped and indent < step_indent:
-            end = index
-            break
-    return start, end, lines[start:end]
-
-
-def scalar(block, field):
-    match = None
-    key = rf"(?:{re.escape(field)}|'{re.escape(field)}'|\"{re.escape(field)}\")"
-    pattern = re.compile(rf"^\s*(?:-\s*)?{key}\s*:\s*(.*?)\s*$")
-    for line in block:
-        candidate = pattern.match(line)
-        if candidate:
-            if match is not None:
-                raise ValueError(f"step declares {field!r} more than once")
-            value = candidate.group(1)
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                value = value[1:-1]
-            match = value
-    return match
-
-
-def literal_list(block, field):
-    key = rf"(?:{re.escape(field)}|'{re.escape(field)}'|\"{re.escape(field)}\")"
-    pattern = re.compile(rf"^(\s*)(?:-\s*)?{key}\s*:\s*\|\s*$")
-    for index, line in enumerate(block):
-        match = pattern.match(line)
-        if not match:
-            continue
-        field_indent = len(match.group(1))
-        values = []
-        for value_line in block[index + 1:]:
-            stripped = value_line.strip()
-            indent = len(value_line) - len(value_line.lstrip())
-            if stripped and indent <= field_indent:
-                break
-            if stripped and not stripped.startswith("#"):
-                values.append(stripped)
-        return values
-    return None
-
+save_condition = "github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'"
 
 errors = []
 counts = {}
-workflows = sorted(workflow_root.glob("*.yml")) + sorted(workflow_root.glob("*.yaml"))
-if not workflows:
-    sys.exit(f"FAIL: no workflow files found under {workflow_root}")
+workflows = Dir[File.join(workflow_root, "*.{yml,yaml}")].sort
+abort("FAIL: no workflow files found under #{workflow_root}") if workflows.empty?
 
-for workflow in workflows:
-    lines = workflow.read_text(encoding="utf-8").splitlines()
-    seen_ranges = set()
-    parsed_cache_steps = 0
-    restore_count = 0
-    save_count = 0
-    for uses_at, line in enumerate(lines):
-        line_action = scalar([line], "uses")
-        if line_action is None or not line_action.startswith("actions/cache"):
-            continue
-        try:
-            start, end, block = step_block(lines, uses_at)
-            if (start, end) in seen_ranges:
-                continue
-            seen_ranges.add((start, end))
-            parsed_cache_steps += 1
-            action = scalar(block, "uses")
-            paths = literal_list(block, "path")
-            key = scalar(block, "key")
-            condition = scalar(block, "if")
-            block_text = "\n".join(block)
+def inspect_yaml_node(node, file_name, errors)
+  case node
+  when Psych::Nodes::Alias
+    errors << "#{file_name}:#{node.start_line + 1}: YAML aliases are forbidden in workflow policy"
+  when Psych::Nodes::Mapping
+    seen = {}
+    node.children.each_slice(2) do |key_node, value_node|
+      unless key_node.is_a?(Psych::Nodes::Scalar)
+        errors << "#{file_name}:#{key_node.start_line + 1}: complex YAML mapping keys are forbidden"
+        inspect_yaml_node(value_node, file_name, errors)
+        next
+      end
 
-            if action == "actions/cache/restore@v6":
-                restore_count += 1
-                if scalar(block, "id") != "cargo-sources":
-                    errors.append(f"{workflow.name}:{start + 1}: restore id must be cargo-sources")
-                if condition is not None:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: cache restore must run on every workflow ref"
-                    )
-                step_indent = len(lines[start]) - len(lines[start].lstrip())
-                job_start = 0
-                for prior_at in range(start - 1, -1, -1):
-                    prior_line = lines[prior_at]
-                    stripped = prior_line.strip()
-                    indent = len(prior_line) - len(prior_line.lstrip())
-                    if stripped and indent < step_indent:
-                        job_start = prior_at + 1
-                        break
-                prior_run = next(
-                    (
-                        prior_at + 1
-                        for prior_at in range(job_start, start)
-                        if scalar([lines[prior_at]], "run") is not None
-                    ),
-                    None,
-                )
-                if prior_run is not None:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: cache restore must precede every run step; "
-                        f"found earlier work at line {prior_run}"
-                    )
-                if key != restore_key:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: restore key must be the bounded epoch {restore_key}"
-                    )
-                if literal_list(block, "restore-keys") != [restore_prefix]:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: restore prefix must be {restore_prefix}"
-                    )
-            elif action == "actions/cache/save@v6":
-                save_count += 1
-                if condition != save_condition:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: cache save must be restricted to a main cache miss"
-                    )
-                if key != save_key:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: save key must come from the restore primary key"
-                    )
-                later_step = None
-                step_indent = len(lines[start]) - len(lines[start].lstrip())
-                for later_at in range(end, len(lines)):
-                    later_line = lines[later_at]
-                    stripped = later_line.lstrip().rstrip()
-                    indent = len(later_line) - len(later_line.lstrip())
-                    if stripped and indent < step_indent:
-                        break
-                    if (stripped == "-" or stripped.startswith("- ")) and indent == step_indent:
-                        later_step = later_at + 1
-                        break
-                if later_step is not None:
-                    errors.append(
-                        f"{workflow.name}:{start + 1}: cache save must be the last declared job step; "
-                        f"found a later step at line {later_step}"
-                    )
-            else:
-                errors.append(
-                    f"{workflow.name}:{start + 1}: use actions/cache/restore@v6 or actions/cache/save@v6, not {action}"
-                )
-
-            if paths != allowed_paths:
-                errors.append(
-                    f"{workflow.name}:{start + 1}: cache paths must be exactly {allowed_paths}; target output is forbidden"
-                )
-            if re.search(r"(^|[\s/])target([\s/]|$)", block_text):
-                errors.append(f"{workflow.name}:{start + 1}: target output is forbidden in Actions caches")
-            if "hashFiles(" in block_text or "github.sha" in block_text or "github.run_id" in block_text:
-                errors.append(
-                    f"{workflow.name}:{start + 1}: cache keys must not expand per dependency hash, SHA, or run"
-                )
-        except ValueError as error:
-            errors.append(f"{workflow.name}:{uses_at + 1}: {error}")
-
-    raw_cache_mentions = "\n".join(lines).count("actions/cache")
-    if parsed_cache_steps != raw_cache_mentions:
-        errors.append(
-            f"{workflow.name}: found {raw_cache_mentions} actions/cache mentions but parsed "
-            f"{parsed_cache_steps} cache steps; unsupported YAML shape or comment"
+      key = key_node.value
+      if seen.key?(key)
+        errors << (
+          "#{file_name}:#{key_node.start_line + 1}: duplicate YAML mapping key #{key.inspect}; " \
+          "first declared at line #{seen.fetch(key)}"
         )
+      else
+        seen[key] = key_node.start_line + 1
+      end
+      inspect_yaml_node(value_node, file_name, errors)
+    end
+  else
+    Array(node.children).each { |child| inspect_yaml_node(child, file_name, errors) }
+  end
+end
 
-    counts[workflow.name] = (restore_count, save_count)
+def lines(value)
+  return nil unless value.is_a?(String)
 
-for workflow_name, expected in expected_counts.items():
-    actual = counts.get(workflow_name, (0, 0))
-    if actual != expected:
-        errors.append(
-            f"{workflow_name}: expected {expected[0]} restore and {expected[1]} save steps; "
-            f"found {actual[0]} restore and {actual[1]} save steps"
+  value.lines.map(&:strip).reject(&:empty?)
+end
+
+workflows.each do |workflow|
+  file_name = File.basename(workflow)
+  content = File.read(workflow, encoding: "UTF-8")
+
+  begin
+    syntax_tree = Psych.parse_stream(content, filename: workflow)
+    inspect_yaml_node(syntax_tree, file_name, errors)
+    document = YAML.safe_load(
+      content,
+      permitted_classes: [],
+      permitted_symbols: [],
+      aliases: false,
+      filename: workflow,
+    )
+  rescue Psych::Exception => error
+    errors << "#{file_name}: YAML parse failed: #{error.message}"
+    counts[file_name] = [0, 0]
+    next
+  end
+
+  jobs = document.is_a?(Hash) ? document["jobs"] : nil
+  unless jobs.is_a?(Hash)
+    errors << "#{file_name}: jobs must be a YAML mapping"
+    counts[file_name] = [0, 0]
+    next
+  end
+
+  restore_count = 0
+  save_count = 0
+
+  jobs.each do |job_name, job|
+    next unless job.is_a?(Hash)
+
+    steps = job["steps"]
+    next if steps.nil?
+    unless steps.is_a?(Array)
+      errors << "#{file_name}: job #{job_name.inspect} steps must be a YAML sequence"
+      next
+    end
+
+    steps.each_with_index do |step, index|
+      next unless step.is_a?(Hash)
+
+      action = step["uses"]
+      next unless action.is_a?(String) && action.start_with?("actions/cache")
+
+      location = "#{file_name}: job #{job_name.inspect} step #{index + 1}"
+      cache_paths = lines(step.dig("with", "path")) if step["with"].is_a?(Hash)
+      key = step.dig("with", "key") if step["with"].is_a?(Hash)
+      body = step.inspect
+
+      case action
+      when "actions/cache/restore@v6"
+        restore_count += 1
+        errors << "#{location}: restore id must be cargo-sources" unless step["id"] == "cargo-sources"
+        if step.key?("if")
+          errors << "#{location}: cache restore must run on every workflow ref"
+        end
+        if steps.take(index).any? { |prior| prior.is_a?(Hash) && prior.key?("run") }
+          errors << "#{location}: cache restore must precede every run step"
+        end
+        if key != restore_key
+          errors << "#{location}: restore key must be the bounded epoch #{restore_key}"
+        end
+        restore_keys = lines(step.dig("with", "restore-keys")) if step["with"].is_a?(Hash)
+        if restore_keys != [restore_prefix]
+          errors << "#{location}: restore prefix must be #{restore_prefix}"
+        end
+      when "actions/cache/save@v6"
+        save_count += 1
+        if step["if"] != save_condition
+          errors << "#{location}: cache save must be restricted to a main cache miss"
+        end
+        if key != save_key
+          errors << "#{location}: save key must come from the restore primary key"
+        end
+        if index != steps.length - 1
+          errors << "#{location}: cache save must be the last declared job step"
+        end
+        unless steps.take(index).any? do |prior|
+                 prior.is_a?(Hash) && prior["id"] == "cargo-sources" &&
+                   prior["uses"] == "actions/cache/restore@v6"
+               end
+          errors << "#{location}: cache save must follow cargo-sources restore in the same job"
+        end
+      else
+        errors << (
+          "#{location}: use actions/cache/restore@v6 or actions/cache/save@v6, not #{action}"
         )
+      end
 
-for workflow_name, actual in counts.items():
-    if workflow_name not in expected_counts and actual != (0, 0):
-        errors.append(
-            f"{workflow_name}: unexpected cache action; add it to the bounded policy deliberately"
+      if body.include?("hashFiles(") || body.include?("github.sha") || body.include?("github.run_id")
+        errors << "#{location}: cache keys must not expand per dependency hash, SHA, or run"
+      end
+      if cache_paths != allowed_paths
+        errors << (
+          "#{location}: cache paths must be exactly #{allowed_paths.inspect}; " \
+          "target output is forbidden"
         )
+      end
+      if cache_paths&.any? { |path| path.split("/").include?("target") }
+        errors << "#{location}: target output is forbidden in Actions caches"
+      end
+    end
+  end
 
-if errors:
-    print("FAIL: GitHub Actions cache policy is not bounded:")
-    for error in errors:
-        print(f"  - {error}")
-    sys.exit(1)
+  counts[file_name] = [restore_count, save_count]
+end
 
-print(
-    "OK: repo-local Actions caches are source-only, epoch-bounded, and save only from main "
-    "(4 restores, 2 saves)."
+expected_counts.each do |workflow_name, expected|
+  actual = counts.fetch(workflow_name, [0, 0])
+  next if actual == expected
+
+  errors << (
+    "#{workflow_name}: expected #{expected[0]} restore and #{expected[1]} save steps; " \
+    "found #{actual[0]} restore and #{actual[1]} save steps"
+  )
+end
+
+counts.each do |workflow_name, actual|
+  next if expected_counts.key?(workflow_name) || actual == [0, 0]
+
+  errors << "#{workflow_name}: unexpected cache action; add it to the bounded policy deliberately"
+end
+
+unless errors.empty?
+  warn("FAIL: GitHub Actions cache policy is not bounded:")
+  errors.each { |error| warn("  - #{error}") }
+  exit(1)
+end
+
+puts(
+  "OK: repo-local Actions caches are source-only, epoch-bounded, and save only from main " \
+  "(4 restores, 2 saves)."
 )
-PY
+RUBY

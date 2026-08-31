@@ -52,6 +52,10 @@ case_root="$(make_case monolithic-action)"
 perl -0pi -e 's#actions/cache/restore\@v6#actions/cache\@v6#' "${case_root}/ci.yml"
 expect_rejection monolithic-action "${case_root}" "use actions/cache/restore@v6 or actions/cache/save@v6"
 
+case_root="$(make_case escaped-monolithic-action)"
+perl -0pi -e 's#uses: actions/cache/restore\@v6#uses: "actions/\\u0063ache\@v6"#' "${case_root}/ci.yml"
+expect_rejection escaped-monolithic-action "${case_root}" "use actions/cache/restore@v6 or actions/cache/save@v6"
+
 case_root="$(make_case conditional-restore)"
 perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
 expect_rejection conditional-restore "${case_root}" "cache restore must run on every workflow ref"
@@ -83,5 +87,17 @@ expect_rejection bare-dash-late-step "${case_root}" "cache save must be the last
 case_root="$(make_case late-restore)"
 perl -0pi -e 's#(      - name: Restore cargo sources\n)#      - name: Cargo work before restore\n        run: cargo fetch\n\n$1#' "${case_root}/ci.yml"
 expect_rejection late-restore "${case_root}" "cache restore must precede every run step"
+
+case_root="$(make_case comment-before-condition)"
+perl -0pi -e "s/(            \\$\{\{ runner.os \}\}-cargo-sources-\n)/\$1# parser boundary comment\n        if: github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
+expect_rejection comment-before-condition "${case_root}" "cache restore must run on every workflow ref"
+
+case_root="$(make_case comment-before-late-step)"
+perl -0pi -e 's!\n  # Security audit moved!\n# parser boundary comment\n      - name: Later work\n        run: echo later\n\n  # Security audit moved!' "${case_root}/ci.yml"
+expect_rejection comment-before-late-step "${case_root}" "cache save must be the last declared job step"
+
+case_root="$(make_case duplicate-condition-key)"
+perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: true\n        if: false\n/" "${case_root}/ci.yml"
+expect_rejection duplicate-condition-key "${case_root}" "duplicate YAML mapping key"
 
 echo "OK: all Actions cache policy falsifiers were rejected."
