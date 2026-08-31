@@ -206,6 +206,15 @@ jobs:
         if: runner.os == 'Linux'
         run: ./scripts/check-windows-nightly-parity.sh
 
+      # Fill the bounded source cache only from a complete dependency fetch.
+      # This separate fail-hard step prevents an earlier diagnostic or masked
+      # build failure from persisting a partial Cargo source graph.
+      - name: Fetch complete Cargo source graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+
       - name: Save cargo sources on main
         if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -223,6 +232,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Keep this first after checkout. The policy checker verifies its own
+      # required-job placement so cache controls cannot become best effort.
+      - name: Check Actions cache policy
+        run: |
+          ./scripts/check-actions-cache-policy.sh
+          ./scripts/test-actions-cache-policy.sh
+
       # schemas/ is schemars output for kin-model types, and kin-model owns the
       # generator, so this repo cannot regenerate them and no runtime path reads
       # them. Both facts together are why they drifted three minor versions
@@ -230,11 +246,6 @@ jobs:
       # generator version against the pin is the part this repo can prove alone.
       - name: Check schema provenance
         run: ./scripts/check-schema-provenance.sh
-
-      - name: Check Actions cache policy
-        run: |
-          ./scripts/check-actions-cache-policy.sh
-          ./scripts/test-actions-cache-policy.sh
 
   coverage:
     name: Code Coverage

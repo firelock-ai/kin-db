@@ -157,6 +157,15 @@ jobs:
         if: runner.os == 'Linux'
         run: ./scripts/check-windows-nightly-parity.sh
 
+      # Fill the bounded source cache only from a complete dependency fetch.
+      # This separate fail-hard step prevents an earlier diagnostic or masked
+      # build failure from persisting a partial Cargo source graph.
+      - name: Fetch complete Cargo source graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+
       - name: Save cargo sources on main
         if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6

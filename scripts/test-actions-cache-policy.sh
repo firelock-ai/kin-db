@@ -47,6 +47,14 @@ case_root="$(make_case dynamic-key)"
 perl -0pi -e 's/cargo-sources-v2/cargo-sources-\$\{\{ github.sha \}\}/' "${case_root}/ci.yml"
 expect_rejection dynamic-key "${case_root}" "cache keys must not expand"
 
+case_root="$(make_case lookup-only)"
+perl -0pi -e 's/(          restore-keys: \|\n)/          lookup-only: true\n$1/' "${case_root}/ci.yml"
+expect_rejection lookup-only "${case_root}" "restore inputs must be exactly"
+
+case_root="$(make_case fail-on-cache-miss)"
+perl -0pi -e 's/(          restore-keys: \|\n)/          fail-on-cache-miss: true\n$1/' "${case_root}/ci.yml"
+expect_rejection fail-on-cache-miss "${case_root}" "restore inputs must be exactly"
+
 case_root="$(make_case non-main-save)"
 perl -0pi -e "s/if: github.ref == 'refs\/heads\/main' && steps.cargo-sources.outputs.cache-hit != 'true'/if: always()/" "${case_root}/ci.yml"
 expect_rejection non-main-save "${case_root}" "cache save must be restricted to a main cache miss"
@@ -87,6 +95,14 @@ perl -0pi -e '
 ' "${case_root}/ci.yml"
 expect_rejection early-save "${case_root}" "cache save must be the last declared job step"
 
+case_root="$(make_case soft-fetch)"
+perl -0pi -e 's/cargo fetch/cargo fetch || true/' "${case_root}/ci.yml"
+expect_rejection soft-fetch "${case_root}" "cache save must immediately follow an unconditional fail-hard cargo fetch"
+
+case_root="$(make_case conditional-fetch)"
+perl -0pi -e 's/(      - name: Fetch complete Cargo source graph\n)/$1        if: always()\n/' "${case_root}/ci.yml"
+expect_rejection conditional-fetch "${case_root}" "cache save must immediately follow an unconditional fail-hard cargo fetch"
+
 case_root="$(make_case bare-dash-late-step)"
 perl -0pi -e 's#\n  \# Security audit moved#\n      -\n        name: Late Cargo work\n        run: cargo fetch\n\n  \# Security audit moved#' "${case_root}/ci.yml"
 expect_rejection bare-dash-late-step "${case_root}" "cache save must be the last declared job step"
@@ -110,5 +126,33 @@ expect_rejection duplicate-condition-key "${case_root}" "duplicate YAML mapping 
 case_root="$(make_case composite-cache-action)"
 perl -0pi -e 's!\z!\n    - name: Hidden target cache\n      uses: Actions/cache\@v6\n      with:\n        path: target\n        key: hidden-target\n!' "${case_root}/../actions/rust-toolchain/action.yml"
 expect_rejection composite-cache-action "${case_root}" "repo-local composite actions must not invoke actions/cache"
+
+case_root="$(make_case setup-node-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden Node cache\n        uses: actions/setup-node\@v6\n!' "${case_root}/ci.yml"
+expect_rejection setup-node-default-cache "${case_root}" "actions/setup-node must set package-manager-cache: false"
+
+case_root="$(make_case setup-go-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden Go cache\n        uses: actions/setup-go\@v6\n!' "${case_root}/ci.yml"
+expect_rejection setup-go-default-cache "${case_root}" "actions/setup-go must set cache: false"
+
+case_root="$(make_case setup-gradle-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden Gradle cache\n        uses: gradle/actions/setup-gradle\@v4\n!' "${case_root}/ci.yml"
+expect_rejection setup-gradle-default-cache "${case_root}" "gradle/actions/setup-gradle must set cache-disabled: true"
+
+case_root="$(make_case setup-uv-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden uv cache\n        uses: astral-sh/setup-uv\@v6\n!' "${case_root}/ci.yml"
+expect_rejection setup-uv-default-cache "${case_root}" "astral-sh/setup-uv must set enable-cache: false"
+
+case_root="$(make_case buildkit-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden BuildKit cache\n        uses: docker/build-push-action\@v6\n        with:\n          cache-to: type=gha\n!' "${case_root}/ci.yml"
+expect_rejection buildkit-cache "${case_root}" 'hidden cache input "cache-to" is forbidden'
+
+case_root="$(make_case guarded-job-condition)"
+perl -0pi -e 's/(  schema-provenance:\n)/$1    if: false\n/' "${case_root}/ci.yml"
+expect_rejection guarded-job-condition "${case_root}" "schema-provenance job must not declare if"
+
+case_root="$(make_case guarded-step-soft-fail)"
+perl -0pi -e 's/(      - name: Check Actions cache policy\n)/$1        continue-on-error: true\n/' "${case_root}/ci.yml"
+expect_rejection guarded-step-soft-fail "${case_root}" "cache policy guard must be the first unconditional step after checkout"
 
 echo "OK: all Actions cache policy falsifiers were rejected."

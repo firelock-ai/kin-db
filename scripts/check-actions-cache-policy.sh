@@ -26,6 +26,11 @@ restore_key = "${{ runner.os }}-cargo-sources-v2"
 restore_prefix = "${{ runner.os }}-cargo-sources-"
 save_key = "${{ steps.cargo-sources.outputs.cache-primary-key }}"
 save_condition = "github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'"
+fetch_run = ["set -euo pipefail", "cargo fetch"].freeze
+guard_run = [
+  "./scripts/check-actions-cache-policy.sh",
+  "./scripts/test-actions-cache-policy.sh",
+].freeze
 
 errors = []
 counts = {}
@@ -77,6 +82,67 @@ def each_mapping(value, &block)
   end
 end
 
+def false_value?(value)
+  value == false || value.to_s.strip.downcase == "false"
+end
+
+def true_value?(value)
+  value == true || value.to_s.strip.downcase == "true"
+end
+
+def inspect_hidden_cache_action(mapping, location, errors)
+  action = mapping["uses"]
+  return unless action.is_a?(String)
+
+  normalized = action.downcase
+  return if normalized.start_with?("actions/cache")
+
+  inputs = mapping["with"].is_a?(Hash) ? mapping["with"] : {}
+  cache_inputs = %w[
+    cache
+    cache-dependency-path
+    cache-from
+    cache-to
+    cache-key
+    shared-key
+    save-cache
+    restore-cache
+  ]
+  cache_inputs.each do |input|
+    next unless inputs.key?(input)
+    next if false_value?(inputs[input])
+
+    errors << "#{location}: hidden cache input #{input.inspect} is forbidden"
+  end
+
+  action_name = normalized.split("@", 2).first
+  case action_name
+  when "actions/setup-node"
+    unless inputs.key?("package-manager-cache") && false_value?(inputs["package-manager-cache"])
+      errors << (
+        "#{location}: actions/setup-node must set package-manager-cache: false " \
+        "to disable its implicit dependency cache"
+      )
+    end
+  when "actions/setup-go"
+    unless inputs.key?("cache") && false_value?(inputs["cache"])
+      errors << "#{location}: actions/setup-go must set cache: false"
+    end
+  when "gradle/actions/setup-gradle"
+    unless inputs.key?("cache-disabled") && true_value?(inputs["cache-disabled"])
+      errors << "#{location}: gradle/actions/setup-gradle must set cache-disabled: true"
+    end
+  when "astral-sh/setup-uv"
+    unless inputs.key?("enable-cache") && false_value?(inputs["enable-cache"])
+      errors << "#{location}: astral-sh/setup-uv must set enable-cache: false"
+    end
+  end
+
+  if action_name.match?(%r{(?:^|/)(?:rust-cache|sccache-action|ccache-action|cache-apt-pkgs-action)$})
+    errors << "#{location}: dedicated cache action #{action.inspect} is forbidden"
+  end
+end
+
 workflows.each do |workflow|
   file_name = File.basename(workflow)
   content = File.read(workflow, encoding: "UTF-8")
@@ -104,6 +170,39 @@ workflows.each do |workflow|
     next
   end
 
+  if file_name == "ci.yml"
+    guard_job = jobs["schema-provenance"]
+    unless guard_job.is_a?(Hash)
+      errors << "ci.yml: required schema-provenance job is missing"
+    else
+      errors << "ci.yml: schema-provenance job name must remain Schema Provenance" unless guard_job["name"] == "Schema Provenance"
+      errors << "ci.yml: schema-provenance must run on ubuntu-latest" unless guard_job["runs-on"] == "ubuntu-latest"
+      %w[if continue-on-error needs uses strategy].each do |attribute|
+        if guard_job.key?(attribute)
+          errors << "ci.yml: schema-provenance job must not declare #{attribute}"
+        end
+      end
+
+      guard_steps = guard_job["steps"]
+      if !guard_steps.is_a?(Array) || guard_steps.length < 2
+        errors << "ci.yml: schema-provenance must check out the repo and run the cache guard"
+      else
+        checkout = guard_steps[0]
+        unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@v7" &&
+               !checkout.key?("if") && !checkout.key?("continue-on-error")
+          errors << "ci.yml: schema-provenance must begin with an unconditional actions/checkout@v7"
+        end
+
+        guard = guard_steps[1]
+        unless guard.is_a?(Hash) && guard["name"] == "Check Actions cache policy" &&
+               lines(guard["run"]) == guard_run &&
+               !guard.key?("if") && !guard.key?("continue-on-error")
+          errors << "ci.yml: cache policy guard must be the first unconditional step after checkout"
+        end
+      end
+    end
+  end
+
   restore_count = 0
   save_count = 0
 
@@ -120,10 +219,11 @@ workflows.each do |workflow|
     steps.each_with_index do |step, index|
       next unless step.is_a?(Hash)
 
+      location = "#{file_name}: job #{job_name.inspect} step #{index + 1}"
+      inspect_hidden_cache_action(step, location, errors)
       action = step["uses"]
       next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
 
-      location = "#{file_name}: job #{job_name.inspect} step #{index + 1}"
       cache_paths = lines(step.dig("with", "path")) if step["with"].is_a?(Hash)
       key = step.dig("with", "key") if step["with"].is_a?(Hash)
       body = step.inspect
@@ -131,7 +231,13 @@ workflows.each do |workflow|
       case action
       when "actions/cache/restore@v6"
         restore_count += 1
+        expected_inputs = %w[key path restore-keys]
+        actual_inputs = step["with"].is_a?(Hash) ? step["with"].keys.sort : []
+        if actual_inputs != expected_inputs
+          errors << "#{location}: restore inputs must be exactly #{expected_inputs.inspect}"
+        end
         errors << "#{location}: restore id must be cargo-sources" unless step["id"] == "cargo-sources"
+        errors << "#{location}: cache restore must not continue on error" if step.key?("continue-on-error")
         if step.key?("if")
           errors << "#{location}: cache restore must run on every workflow ref"
         end
@@ -147,6 +253,12 @@ workflows.each do |workflow|
         end
       when "actions/cache/save@v6"
         save_count += 1
+        expected_inputs = %w[key path]
+        actual_inputs = step["with"].is_a?(Hash) ? step["with"].keys.sort : []
+        if actual_inputs != expected_inputs
+          errors << "#{location}: save inputs must be exactly #{expected_inputs.inspect}"
+        end
+        errors << "#{location}: cache save must not continue on error" if step.key?("continue-on-error")
         if step["if"] != save_condition
           errors << "#{location}: cache save must be restricted to a main cache miss"
         end
@@ -161,6 +273,14 @@ workflows.each do |workflow|
                    prior["uses"] == "actions/cache/restore@v6"
                end
           errors << "#{location}: cache save must follow cargo-sources restore in the same job"
+        end
+        fetch = steps[index - 1]
+        unless fetch.is_a?(Hash) && fetch["name"] == "Fetch complete Cargo source graph" &&
+               fetch["shell"] == "bash" && lines(fetch["run"]) == fetch_run &&
+               !fetch.key?("if") && !fetch.key?("continue-on-error")
+          errors << (
+            "#{location}: cache save must immediately follow an unconditional fail-hard cargo fetch"
+          )
         end
       else
         errors << (
@@ -206,6 +326,7 @@ Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
   end
 
   each_mapping(document) do |mapping|
+    inspect_hidden_cache_action(mapping, relative_name, errors)
     action = mapping["uses"]
     next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
 
