@@ -67,15 +67,18 @@ jobs:
           # release discovers.
           targets: x86_64-unknown-linux-musl
 
-      - name: Cache cargo registry and sources
-        uses: actions/cache@v6
+      # Reuse the one small Linux source cache owned by the main CI job. This
+      # job restores it on every ref but never creates a workflow-specific copy.
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-linux-sources-${{ hashFiles('kin-db/**/Cargo.toml', 'kin-db/.cargo/config.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v2
           restore-keys: |
-            ${{ runner.os }}-cargo-linux-sources-
+            ${{ runner.os }}-cargo-sources-
 
       # Default features only (vector + embeddings, CPU inference). No `metal`.
       - name: Build

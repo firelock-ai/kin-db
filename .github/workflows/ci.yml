@@ -104,24 +104,22 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # Key on the manifests, not on Cargo.lock. kin-db is a library workspace
-      # and gitignores its lockfile, so no Cargo.lock exists when this step
-      # runs and `hashFiles` returns an empty string. That left the key frozen
-      # at `<os>-cargo-`, and a cache key is immutable, so every later run hit
-      # the primary key and skipped the save. The 2026-08-12 main run says so
-      # in its own log: "Cache hit occurred on the primary key Linux-cargo-,
-      # not saving cache." The cache had stopped tracking the dependency set
-      # entirely while still reading as a hit.
-      - name: Cache cargo registry and build
-        uses: actions/cache@v6
+      # Cache only downloaded Cargo sources. A complete target/ archive was
+      # 1.3-5.4 GiB per entry and the PR, merge-queue, and main refs minted
+      # separate immutable copies. The explicit epoch keeps one small archive
+      # per runner OS; bump it deliberately when a source refresh is useful.
+      # Default-branch caches are visible to PR and merge-queue runs, so every
+      # ref restores acceleration while only main is allowed to save it.
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v2
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-sources-
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -208,6 +206,15 @@ jobs:
         if: runner.os == 'Linux'
         run: ./scripts/check-windows-nightly-parity.sh
 
+      - name: Save cargo sources on main
+        if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo-sources.outputs.cache-primary-key }}
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   schema-provenance:
@@ -224,6 +231,11 @@ jobs:
       - name: Check schema provenance
         run: ./scripts/check-schema-provenance.sh
 
+      - name: Check Actions cache policy
+        run: |
+          ./scripts/check-actions-cache-policy.sh
+          ./scripts/test-actions-cache-policy.sh
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
@@ -233,16 +245,18 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v6
+      # Coverage consumes the same small main-owned source cache as the Linux
+      # check job. It never saves a second coverage-specific archive.
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v2
           restore-keys: |
-            ${{ runner.os }}-cargo-tarpaulin-
+            ${{ runner.os }}-cargo-sources-
 
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@v2
