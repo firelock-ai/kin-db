@@ -48,7 +48,7 @@ jobs:
     name: Check & Test (windows-latest)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
@@ -63,7 +63,7 @@ jobs:
       # ref restores acceleration while only main is allowed to save it.
       - name: Restore cargo sources
         id: cargo-sources
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -168,7 +168,7 @@ jobs:
 
       - name: Save cargo sources on main
         if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry

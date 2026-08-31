@@ -22,7 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain
       # Mirror ci.yml / ci-linux.yml: HF_HUB_OFFLINE keeps the run deterministic
       # and offline. The three tests that construct a real embedder needing HF
@@ -58,8 +58,8 @@ jobs:
     # consumer, and only then mints this tag. Keep registry credentials confined
     # to that main-only workflow; a tag release must not republish the same bytes.
     steps:
-      - uses: actions/checkout@v7
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

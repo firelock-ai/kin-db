@@ -44,4 +44,4 @@ permissions:
 # The ref goes in the query string. `gh api` has no `--ref` flag and rejects it.
 jobs:
   alarm:
-    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.33
+    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@398595fa14ba1eaebca6eb176facd8a57ce9db05 # v0.1.33

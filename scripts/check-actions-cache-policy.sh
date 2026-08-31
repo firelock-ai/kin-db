@@ -7,16 +7,25 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow_root="${1:-${root}/.github/workflows}"
 action_root="${2:-$(dirname "${workflow_root}")/actions}"
+repo_root="${3:-$(cd "${workflow_root}/../.." && pwd)}"
 
-ruby - "${workflow_root}" "${action_root}" <<'RUBY'
+ruby - "${workflow_root}" "${action_root}" "${repo_root}" "${root}" <<'RUBY'
 require "digest"
+require "find"
+require "json"
 require "psych"
 require "set"
 require "yaml"
 
 workflow_root = File.expand_path(ARGV.fetch(0))
 action_root = File.expand_path(ARGV.fetch(1))
-abort("FAIL: workflow directory does not exist: #{workflow_root}") unless Dir.exist?(workflow_root)
+repo_root = File.expand_path(ARGV.fetch(2))
+authority_root = File.expand_path(ARGV.fetch(3))
+
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+CACHE_RESTORE_ACTION = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+CACHE_SAVE_ACTION = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+UNSAFE_REGISTRY_COMMIT = "d6b6585d0b5902437d2745a94a960fe0d7d27f0e"
 
 expected_counts = {
   "ci.yml" => [2, 1],
@@ -36,23 +45,117 @@ guard_run = [
 approved_step_actions = Set.new([
   "./.github/actions/rust-toolchain",
   "./kin-db/.github/actions/rust-toolchain",
-  "EmbarkStudios/cargo-deny-action@v2",
-  "actions/cache/restore@v6",
-  "actions/cache/save@v6",
-  "actions/checkout@v7",
-  "actions/upload-artifact@v4",
-  "codecov/codecov-action@v5",
-  "softprops/action-gh-release@v2",
-  "taiki-e/install-action@v2",
+  "EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25",
+  CACHE_RESTORE_ACTION,
+  CACHE_SAVE_ACTION,
+  CHECKOUT_ACTION,
+  "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+  "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac",
+  "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+  "taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf",
 ]).freeze
-approved_reusable_jobs = {
-  ["kin-dependency-wave.yml", "dependency-wave"] =>
-    "firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.31",
-  ["registry-publish.yml", "release"] =>
-    "firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.31",
-  ["scheduled-failure-alarm.yml", "alarm"] =>
-    "firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.33",
+expected_action_identities = {
+  ["cache-policy-authority.yml", "candidate-policy", 0] => CHECKOUT_ACTION,
+  ["cache-policy-authority.yml", "candidate-policy", 1] => CHECKOUT_ACTION,
+  ["ci-linux.yml", "linux-build-test", 0] => CHECKOUT_ACTION,
+  ["ci-linux.yml", "linux-build-test", 1] => "./kin-db/.github/actions/rust-toolchain",
+  ["ci-linux.yml", "linux-build-test", 2] => CACHE_RESTORE_ACTION,
+  ["ci.yml", "dco", 0] => CHECKOUT_ACTION,
+  ["ci.yml", "check", 0] => CHECKOUT_ACTION,
+  ["ci.yml", "check", 1] => "./.github/actions/rust-toolchain",
+  ["ci.yml", "check", 2] => CACHE_RESTORE_ACTION,
+  ["ci.yml", "check", 10] => CACHE_SAVE_ACTION,
+  ["ci.yml", "schema-provenance", 0] => CHECKOUT_ACTION,
+  ["ci.yml", "coverage", 0] => CHECKOUT_ACTION,
+  ["ci.yml", "coverage", 1] => "./.github/actions/rust-toolchain",
+  ["ci.yml", "coverage", 2] => CACHE_RESTORE_ACTION,
+  ["ci.yml", "coverage", 3] => "taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf",
+  ["ci.yml", "coverage", 5] => "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac",
+  ["fuzz.yml", "fuzz-smoke", 0] => CHECKOUT_ACTION,
+  ["fuzz.yml", "fuzz-smoke", 1] => "./.github/actions/rust-toolchain",
+  ["fuzz.yml", "fuzz-smoke", 4] => "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+  ["release.yml", "validate", 0] => CHECKOUT_ACTION,
+  ["release.yml", "validate", 1] => "./.github/actions/rust-toolchain",
+  ["release.yml", "release", 0] => CHECKOUT_ACTION,
+  ["release.yml", "release", 1] => "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+  ["sast.yml", "cargo-deny", 0] => CHECKOUT_ACTION,
+  ["sast.yml", "cargo-deny", 1] => "./.github/actions/rust-toolchain",
+  ["sast.yml", "cargo-deny", 2] => "EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25",
+  ["windows-nightly.yml", "windows", 0] => CHECKOUT_ACTION,
+  ["windows-nightly.yml", "windows", 1] => "./.github/actions/rust-toolchain",
+  ["windows-nightly.yml", "windows", 2] => CACHE_RESTORE_ACTION,
+  ["windows-nightly.yml", "windows", 10] => CACHE_SAVE_ACTION,
 }.freeze
+approved_reusable_jobs = {
+  ["kin-dependency-wave.yml", "dependency-wave"] => {
+    uses: "firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@d6b6585d0b5902437d2745a94a960fe0d7d27f0e",
+    digest: "06602f164d9a5eacdc3aaade5325bad5e637b62f7eb820915e36a581ee394f6c",
+  },
+  ["scheduled-failure-alarm.yml", "alarm"] => {
+    uses: "firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@398595fa14ba1eaebca6eb176facd8a57ce9db05",
+    digest: "358f14736aa565ee219db8c47f68043117ee54760bde937ed813b78b1e77bc7d",
+  },
+}.freeze
+protected_job_contracts = {
+  ["ci.yml", "check"] => [
+    "54440a78bb977b5ec0c72cf26ba2d5886ff777c2f0da81033bbb9b7a8b43c953",
+    "cache-owner job contract drifted",
+  ],
+  ["ci.yml", "schema-provenance"] => [
+    "0a561846cdd51c4d0f4203454b0a3cc42d36e0aa0186b791a509870169ec321b",
+    "candidate self-check job drifted or became non-authoritative",
+  ],
+  ["ci.yml", "coverage"] => [
+    "06924d5f750ef317e9c1b1cea5a95cd071572d9dc6a9c2dfba5494ae0b4ca4e1",
+    "coverage cache-owner job contract drifted",
+  ],
+  ["ci-linux.yml", "linux-build-test"] => [
+    "fc4353c3f707b83fd6fa4bfb8426f36d1e5908c652d93d773d4c78c0e2a752e5",
+    "Linux cache-owner job contract drifted",
+  ],
+  ["windows-nightly.yml", "windows"] => [
+    "f767a34ff9454ad28523997c61c228b85fad15a6909dd14762e7735789e4019b",
+    "Windows cache-owner job contract drifted",
+  ],
+  ["registry-publish.yml", "release"] => [
+    "37191df75202f9f5dd669fe74734aa151420b38cbc92ebcbd669c844327c90dd",
+    "registry release hold drifted or became non-authoritative",
+  ],
+  ["cache-policy-authority.yml", "candidate-policy"] => [
+    "9f72550e78de36b536a3bbfc30f68d5f20b6197fe022744fcbcebb058208d487",
+    "trusted authority job drifted or became non-authoritative",
+  ],
+}.freeze
+protected_workflow_envelopes = {
+  "cache-policy-authority.yml" => "e46706ae86086649d68c2832e3da6643d28ac3e5199e064e3b20a33dbdb4a9b8",
+  "ci.yml" => "a38b83967e34cdbced7990a548c240f68bf728e304f43d5828b93130b13243ae",
+  "ci-linux.yml" => "9474a4b88c83c3eb3f66682b2ff14ac16debae0d9b819ec71ff49088226edd74",
+  "windows-nightly.yml" => "d62f3a6e796150c7bf2cf9e22c22aeba509acc52821c413eadb6117447c7cec3",
+  "registry-publish.yml" => "21dd138161e756f2df3409237e8b2cb341146c5f0b11b8818eab3116cdd8b3dc",
+}.freeze
+protected_repo_files = {
+  ".github/actions/rust-toolchain/action.yml" => [
+    "6f33e96a8bfd31511b907d0b22a54be94ccfde79bf2b328f7aa56e087de8d398",
+    "protected local rust-toolchain action drifted",
+  ],
+  ".cargo/config.toml" => [
+    "9bd43ae87aad7adc817737b91249b1c44c92b415a43757a88128dab8ab63c8e6",
+    "tracked Cargo config drifted or can redirect target output",
+  ],
+  "rust-toolchain.toml" => [
+    "796c340f29e77e94c0e4c6d6d6cac0ae3f07f88ad68622f338116a4a489dd756",
+    "Rust toolchain pin drifted",
+  ],
+  ".github/workflows/cache-policy-authority.yml" => [
+    "cb87ccd555cc8cb39e9dc5547d03d8278afeed92d9f6618def6a338e0dd5e232",
+    "trusted authority workflow drifted or became non-authoritative",
+  ],
+}.freeze
+trusted_policy_files = %w[
+  .github/workflows/cache-policy-authority.yml
+  scripts/check-actions-cache-policy.sh
+  scripts/test-actions-cache-policy.sh
+].freeze
 owner_job_names = {
   "ci.yml" => "check",
   "windows-nightly.yml" => "windows",
@@ -63,7 +166,7 @@ owner_job_keys = {
 }.freeze
 owner_step_topology = {
   "ci.yml" => [
-    "@actions/checkout@v7",
+    "@#{CHECKOUT_ACTION}",
     "Install Rust toolchain",
     "Restore cargo sources",
     "Check formatting",
@@ -76,7 +179,7 @@ owner_step_topology = {
     "Save cargo sources on main",
   ],
   "windows-nightly.yml" => [
-    "@actions/checkout@v7",
+    "@#{CHECKOUT_ACTION}",
     "Install Rust toolchain",
     "Restore cargo sources",
     "Check formatting",
@@ -103,8 +206,8 @@ protected_env_keys = Set.new(%w[CARGO_HOME CARGO_TARGET_DIR HOME]).freeze
 errors = []
 counts = {}
 reusable_seen = Set.new
-workflows = Dir[File.join(workflow_root, "*.{yml,yaml}")].sort
-abort("FAIL: no workflow files found under #{workflow_root}") if workflows.empty?
+protected_jobs_seen = Set.new
+action_identities_seen = Set.new
 
 def inspect_yaml_node(node, file_name, errors)
   case node
@@ -155,6 +258,67 @@ def step_identity(step)
   step["name"] || "@#{step["uses"]}"
 end
 
+def canonical(value)
+  case value
+  when Hash
+    value.keys.sort_by(&:to_s).to_h { |key| [key.to_s, canonical(value.fetch(key))] }
+  when Array
+    value.map { |entry| canonical(entry) }
+  else
+    value
+  end
+end
+
+def canonical_digest(value)
+  Digest::SHA256.hexdigest(JSON.generate(canonical(value)))
+end
+
+def path_within?(path, root)
+  resolved_path = File.realpath(path)
+  resolved_root = File.realpath(root)
+  resolved_path == resolved_root || resolved_path.start_with?("#{resolved_root}#{File::SEPARATOR}")
+rescue SystemCallError
+  false
+end
+
+def regular_file?(path, root, location, errors)
+  stat = File.lstat(path)
+  unless stat.file? && !stat.symlink?
+    errors << "#{location}: must be a regular file, not a symlink or special file"
+    return false
+  end
+  unless path_within?(path, root)
+    errors << "#{location}: resolves outside the candidate repository"
+    return false
+  end
+
+  true
+rescue Errno::ENOENT, Errno::ENOTDIR
+  errors << "#{location}: required file is missing"
+  false
+end
+
+def safe_directory?(path, root, location, errors)
+  stat = File.lstat(path)
+  unless stat.directory? && !stat.symlink?
+    errors << "#{location}: must be a real directory, not a symlink"
+    return false
+  end
+  unless path_within?(path, root)
+    errors << "#{location}: resolves outside the candidate repository"
+    return false
+  end
+
+  true
+rescue Errno::ENOENT, Errno::ENOTDIR
+  errors << "#{location}: required directory is missing"
+  false
+end
+
+def immutable_remote_reference?(action)
+  action.is_a?(String) && action.match?(%r{\A[^@\s]+@[0-9a-f]{40}\z})
+end
+
 def inspect_protected_env(mapping, location, protected_env_keys, errors)
   env = mapping["env"]
   return unless env.is_a?(Hash)
@@ -164,6 +328,14 @@ def inspect_protected_env(mapping, location, protected_env_keys, errors)
       errors << "#{location}: protected runner environment #{key} must not be overridden"
     end
   end
+end
+
+def inspect_github_env_writes(mapping, location, errors)
+  run = mapping["run"]
+  return unless run.is_a?(String) && run.match?(/GITHUB_ENV/i)
+  return unless run.match?(/CARGO_TARGET_DIR|(?:^|[^A-Z_])HOME\s*=/i)
+
+  errors << "#{location}: protected target or HOME write through GITHUB_ENV is forbidden"
 end
 
 def false_value?(value)
@@ -227,8 +399,52 @@ def inspect_hidden_cache_action(mapping, location, errors)
   end
 end
 
+unless safe_directory?(repo_root, repo_root, "candidate repository", errors)
+  warn("FAIL: GitHub Actions cache policy could not inspect the candidate repository:")
+  errors.each { |error| warn("  - #{error}") }
+  exit(1)
+end
+workflow_root_ok = safe_directory?(workflow_root, repo_root, "workflow root", errors)
+action_root_ok = safe_directory?(action_root, repo_root, "local action root", errors)
+authority_root_ok = safe_directory?(authority_root, authority_root, "trusted authority root", errors)
+
+trusted_policy_files.each do |relative_path|
+  candidate_path = File.join(repo_root, relative_path)
+  trusted_path = File.join(authority_root, relative_path)
+  candidate_ok = regular_file?(candidate_path, repo_root, relative_path, errors)
+  trusted_ok = authority_root_ok && regular_file?(trusted_path, authority_root, "trusted #{relative_path}", errors)
+  next unless candidate_ok && trusted_ok
+
+  candidate_digest = Digest::SHA256.file(candidate_path).hexdigest
+  trusted_digest = Digest::SHA256.file(trusted_path).hexdigest
+  candidate_mode = File.stat(candidate_path).mode & 0o111
+  trusted_mode = File.stat(trusted_path).mode & 0o111
+  unless candidate_digest == trusted_digest && candidate_mode == trusted_mode
+    errors << "#{relative_path}: trusted policy implementation drifted from default-branch authority"
+  end
+end
+
+protected_repo_files.each do |relative_path, (expected_digest, message)|
+  path = File.join(repo_root, relative_path)
+  next unless regular_file?(path, repo_root, relative_path, errors)
+
+  errors << "#{relative_path}: #{message}" unless Digest::SHA256.file(path).hexdigest == expected_digest
+end
+
+legacy_cargo_config = File.join(repo_root, ".cargo/config")
+if File.exist?(legacy_cargo_config) || File.symlink?(legacy_cargo_config)
+  errors << ".cargo/config: legacy tracked Cargo config is forbidden; it can redirect target output"
+end
+
+workflows = workflow_root_ok ? Dir[File.join(workflow_root, "*.{yml,yaml}")].sort : []
+if workflows.empty?
+  errors << "no workflow files found under #{workflow_root}"
+end
+
 workflows.each do |workflow|
   file_name = File.basename(workflow)
+  next unless regular_file?(workflow, repo_root, file_name, errors)
+
   content = File.read(workflow, encoding: "UTF-8")
 
   begin
@@ -254,12 +470,24 @@ workflows.each do |workflow|
     next
   end
 
+  if protected_workflow_envelopes.key?(file_name)
+    envelope = document.reject { |key, _value| key == "jobs" }
+    unless canonical_digest(envelope) == protected_workflow_envelopes.fetch(file_name)
+      errors << "#{file_name}: protected workflow trigger, permission, or global contract drifted"
+    end
+  end
+
+  if document["name"] == "Cache Policy Authority" && file_name != "cache-policy-authority.yml"
+    errors << "#{file_name}: duplicate Cache Policy Authority workflow identity is forbidden"
+  end
+
   if document.key?("defaults")
     errors << "#{file_name}: workflow defaults are forbidden because they can mask guard failures"
   end
 
   each_mapping(document) do |mapping|
     inspect_protected_env(mapping, file_name, protected_env_keys, errors)
+    inspect_github_env_writes(mapping, file_name, errors)
   end
 
   if file_name == "ci.yml"
@@ -279,8 +507,8 @@ workflows.each do |workflow|
       else
         checkout = guard_steps[0]
         unless checkout.is_a?(Hash) && checkout.keys == ["uses"] &&
-               checkout["uses"] == "actions/checkout@v7"
-          errors << "ci.yml: schema-provenance must begin with an exact current-ref actions/checkout@v7"
+               checkout["uses"] == CHECKOUT_ACTION
+          errors << "ci.yml: schema-provenance must begin with the exact immutable checkout identity"
         end
 
         guard = guard_steps[1]
@@ -299,12 +527,36 @@ workflows.each do |workflow|
   jobs.each do |job_name, job|
     next unless job.is_a?(Hash)
 
+    identity = [file_name, job_name]
+    if job["name"] == "Cache Policy Authority" && identity != ["cache-policy-authority.yml", "candidate-policy"]
+      errors << "#{file_name}: job #{job_name.inspect} duplicates the trusted Cache Policy Authority identity"
+    end
+
+    if protected_job_contracts.key?(identity)
+      expected_digest, message = protected_job_contracts.fetch(identity)
+      protected_jobs_seen << identity
+      unless canonical_digest(job) == expected_digest
+        errors << "#{file_name}: job #{job_name.inspect} #{message}"
+      end
+    end
+
     reusable = job["uses"]
     if reusable
-      identity = [file_name, job_name]
+      if reusable.to_s.include?("cargo-registry-release.yml@") &&
+         (reusable.to_s.end_with?("@v0.1.31") || reusable.to_s.end_with?("@#{UNSAFE_REGISTRY_COMMIT}"))
+        errors << (
+          "#{file_name}: job #{job_name.inspect} unsafe target-caching registry release is forbidden " \
+          "until reviewed kin-actions v0.1.34 immutable bytes exist"
+        )
+      end
+      unless immutable_remote_reference?(reusable)
+        errors << "#{file_name}: job #{job_name.inspect} reusable workflow must use a full immutable commit SHA"
+      end
       expected = approved_reusable_jobs[identity]
-      if expected != reusable
+      if !expected || expected.fetch(:uses) != reusable
         errors << "#{file_name}: job #{job_name.inspect} uses unapproved reusable workflow #{reusable.inspect}"
+      elsif canonical_digest(job) != expected.fetch(:digest)
+        errors << "#{file_name}: job #{job_name.inspect} reviewed reusable-job mapping drifted"
       else
         reusable_seen << identity
       end
@@ -342,8 +594,8 @@ workflows.each do |workflow|
       end
 
       checkout = steps.first
-      unless checkout.is_a?(Hash) && checkout.keys == ["uses"] && checkout["uses"] == "actions/checkout@v7"
-        errors << "#{file_name}: cache-owner job must begin with an exact current-ref checkout"
+      unless checkout.is_a?(Hash) && checkout.keys == ["uses"] && checkout["uses"] == CHECKOUT_ACTION
+        errors << "#{file_name}: cache-owner job must begin with the exact immutable checkout identity"
       end
       steps.each do |step|
         next unless step.is_a?(Hash)
@@ -366,6 +618,21 @@ workflows.each do |workflow|
       inspect_protected_env(step, location, protected_env_keys, errors)
       inspect_hidden_cache_action(step, location, errors)
       action = step["uses"]
+      action_identity = [file_name, job_name, index]
+      if action
+        expected_action = expected_action_identities[action_identity]
+        if expected_action
+          action_identities_seen << action_identity
+          unless action == expected_action
+            errors << "#{location}: action identity drifted from #{expected_action.inspect}"
+          end
+        else
+          errors << "#{location}: unexpected action-bearing step is not part of reviewed topology"
+        end
+      end
+      if action.is_a?(String) && !action.start_with?("./") && !immutable_remote_reference?(action)
+        errors << "#{location}: remote action must use a full immutable commit SHA"
+      end
       if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
         errors << "#{location}: unapproved action identity #{action.inspect}"
       end
@@ -376,7 +643,7 @@ workflows.each do |workflow|
       body = step.inspect
 
       case action
-      when "actions/cache/restore@v6"
+      when CACHE_RESTORE_ACTION
         restore_count += 1
         unless step.keys.sort == %w[id name uses with]
           errors << "#{location}: cache restore step permits only id, name, uses, and with"
@@ -401,7 +668,7 @@ workflows.each do |workflow|
         if restore_keys != [restore_prefix]
           errors << "#{location}: restore prefix must be #{restore_prefix}"
         end
-      when "actions/cache/save@v6"
+      when CACHE_SAVE_ACTION
         save_count += 1
         unless step.keys.sort == %w[if name uses with]
           errors << "#{location}: cache save step permits only if, name, uses, and with"
@@ -423,7 +690,7 @@ workflows.each do |workflow|
         end
         unless steps.take(index).any? do |prior|
                  prior.is_a?(Hash) && prior["id"] == "cargo-sources" &&
-                   prior["uses"] == "actions/cache/restore@v6"
+                   prior["uses"] == CACHE_RESTORE_ACTION
                end
           errors << "#{location}: cache save must follow cargo-sources restore in the same job"
         end
@@ -459,6 +726,17 @@ workflows.each do |workflow|
   counts[file_name] = [restore_count, save_count]
 end
 
+protected_job_contracts.each_key do |identity|
+  unless protected_jobs_seen.include?(identity)
+    errors << "#{identity[0]}: required protected job #{identity[1].inspect} is missing"
+  end
+end
+
+expected_action_identities.each_key do |identity|
+  unless action_identities_seen.include?(identity)
+    errors << "#{identity[0]}: required reviewed action at job #{identity[1].inspect} step #{identity[2] + 1} is missing"
+  end
+end
 
 approved_reusable_jobs.each_key do |identity|
   unless reusable_seen.include?(identity)
@@ -466,8 +744,26 @@ approved_reusable_jobs.each_key do |identity|
   end
 end
 
-Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
+action_files = []
+if action_root_ok
+  Find.find(action_root) do |path|
+    stat = File.lstat(path)
+    if stat.symlink?
+      relative_name = path.delete_prefix("#{action_root}/")
+      errors << "#{relative_name}: symlinks are forbidden under the local action root"
+      Find.prune if File.directory?(path)
+    elsif stat.file? && path.match?(/\.ya?ml\z/)
+      action_files << path
+    end
+  rescue Errno::ENOENT, Errno::ENOTDIR
+    errors << "#{path}: disappeared during local action inspection"
+  end
+end
+
+action_files.sort.each do |action_file|
   relative_name = action_file.delete_prefix("#{action_root}/")
+  next unless regular_file?(action_file, repo_root, relative_name, errors)
+
   content = File.read(action_file, encoding: "UTF-8")
 
   begin
@@ -487,8 +783,12 @@ Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
 
   each_mapping(document) do |mapping|
     inspect_protected_env(mapping, relative_name, protected_env_keys, errors)
+    inspect_github_env_writes(mapping, relative_name, errors)
     inspect_hidden_cache_action(mapping, relative_name, errors)
     action = mapping["uses"]
+    if action.is_a?(String) && !action.start_with?("./") && !immutable_remote_reference?(action)
+      errors << "#{relative_name}: remote composite action must use a full immutable commit SHA"
+    end
     if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
       errors << "#{relative_name}: unapproved composite action identity #{action.inspect}"
     end

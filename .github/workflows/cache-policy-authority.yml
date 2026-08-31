@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Cache Policy Authority
+
+# pull_request_target loads this workflow from the trusted base commit. The
+# merge_group arm keeps the same required context available to the merge queue;
+# candidate changes to this file are rejected by the trusted PR arm before they
+# can enter a merge group.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-policy:
+    name: Cache Policy Authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted policy bytes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+          set-safe-directory: false
+
+      # checkout v7 requires this explicit opt-in for a fork head under
+      # pull_request_target. Candidate files remain inert input data: no script,
+      # action, build, hook, or generated executable from this tree is run.
+      - name: Check out candidate as inert data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          path: candidate
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+          set-safe-directory: false
+
+      - name: Evaluate candidate with trusted checker
+        shell: bash
+        env:
+          TRUSTED_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          CANDIDATE_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C trusted rev-parse HEAD)" = "$TRUSTED_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          mkdir -p "$RUNNER_TEMP/cache-policy-home"
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            HOME="$RUNNER_TEMP/cache-policy-home" \
+            /usr/bin/bash --noprofile --norc \
+            trusted/scripts/check-actions-cache-policy.sh \
+            candidate/.github/workflows \
+            candidate/.github/actions \
+            candidate

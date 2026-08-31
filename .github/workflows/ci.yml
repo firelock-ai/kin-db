@@ -38,7 +38,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -97,7 +97,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
@@ -112,7 +112,7 @@ jobs:
       # ref restores acceleration while only main is allowed to save it.
       - name: Restore cargo sources
         id: cargo-sources
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -217,7 +217,7 @@ jobs:
 
       - name: Save cargo sources on main
         if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -230,7 +230,7 @@ jobs:
     name: Schema Provenance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Keep this first after checkout. The policy checker verifies its own
       # required-job placement so cache controls cannot become best effort.
@@ -252,7 +252,7 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
@@ -261,7 +261,7 @@ jobs:
       # check job. It never saves a second coverage-specific archive.
       - name: Restore cargo sources
         id: cargo-sources
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -271,7 +271,7 @@ jobs:
             ${{ runner.os }}-cargo-sources-
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-tarpaulin
 
@@ -282,7 +282,7 @@ jobs:
           fi
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           files: cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
