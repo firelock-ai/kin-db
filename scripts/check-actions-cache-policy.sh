@@ -6,12 +6,14 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow_root="${1:-${root}/.github/workflows}"
+action_root="${2:-$(dirname "${workflow_root}")/actions}"
 
-ruby - "${workflow_root}" <<'RUBY'
+ruby - "${workflow_root}" "${action_root}" <<'RUBY'
 require "psych"
 require "yaml"
 
 workflow_root = File.expand_path(ARGV.fetch(0))
+action_root = File.expand_path(ARGV.fetch(1))
 abort("FAIL: workflow directory does not exist: #{workflow_root}") unless Dir.exist?(workflow_root)
 
 expected_counts = {
@@ -65,6 +67,16 @@ def lines(value)
   value.lines.map(&:strip).reject(&:empty?)
 end
 
+def each_mapping(value, &block)
+  case value
+  when Hash
+    yield(value)
+    value.each_value { |child| each_mapping(child, &block) }
+  when Array
+    value.each { |child| each_mapping(child, &block) }
+  end
+end
+
 workflows.each do |workflow|
   file_name = File.basename(workflow)
   content = File.read(workflow, encoding: "UTF-8")
@@ -109,7 +121,7 @@ workflows.each do |workflow|
       next unless step.is_a?(Hash)
 
       action = step["uses"]
-      next unless action.is_a?(String) && action.start_with?("actions/cache")
+      next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
 
       location = "#{file_name}: job #{job_name.inspect} step #{index + 1}"
       cache_paths = lines(step.dig("with", "path")) if step["with"].is_a?(Hash)
@@ -172,6 +184,36 @@ workflows.each do |workflow|
   end
 
   counts[file_name] = [restore_count, save_count]
+end
+
+Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
+  relative_name = action_file.delete_prefix("#{action_root}/")
+  content = File.read(action_file, encoding: "UTF-8")
+
+  begin
+    syntax_tree = Psych.parse_stream(content, filename: action_file)
+    inspect_yaml_node(syntax_tree, relative_name, errors)
+    document = YAML.safe_load(
+      content,
+      permitted_classes: [],
+      permitted_symbols: [],
+      aliases: false,
+      filename: action_file,
+    )
+  rescue Psych::Exception => error
+    errors << "#{relative_name}: YAML parse failed: #{error.message}"
+    next
+  end
+
+  each_mapping(document) do |mapping|
+    action = mapping["uses"]
+    next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
+
+    errors << (
+      "#{relative_name}: repo-local composite actions must not invoke actions/cache; " \
+      "declare bounded caches in an audited workflow job"
+    )
+  end
 end
 
 expected_counts.each do |workflow_name, expected|

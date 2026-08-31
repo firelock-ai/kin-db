@@ -12,9 +12,12 @@ trap 'rm -rf "${fixtures}"' EXIT
 make_case() {
   local name="$1"
   local case_root="${fixtures}/${name}"
-  mkdir -p "${case_root}"
-  cp "${root}"/.github/workflows/*.yml "${case_root}/"
-  printf '%s\n' "${case_root}"
+  local workflow_root="${case_root}/.github/workflows"
+  local action_root="${case_root}/.github/actions"
+  mkdir -p "${workflow_root}" "${action_root}"
+  cp "${root}"/.github/workflows/*.yml "${workflow_root}/"
+  cp -R "${root}/.github/actions/." "${action_root}/"
+  printf '%s\n' "${workflow_root}"
 }
 
 expect_rejection() {
@@ -51,6 +54,10 @@ expect_rejection non-main-save "${case_root}" "cache save must be restricted to 
 case_root="$(make_case monolithic-action)"
 perl -0pi -e 's#actions/cache/restore\@v6#actions/cache\@v6#' "${case_root}/ci.yml"
 expect_rejection monolithic-action "${case_root}" "use actions/cache/restore@v6 or actions/cache/save@v6"
+
+case_root="$(make_case uppercase-monolithic-action)"
+perl -0pi -e 's#actions/cache/restore\@v6#Actions/cache\@v6#' "${case_root}/ci.yml"
+expect_rejection uppercase-monolithic-action "${case_root}" "use actions/cache/restore@v6 or actions/cache/save@v6"
 
 case_root="$(make_case escaped-monolithic-action)"
 perl -0pi -e 's#uses: actions/cache/restore\@v6#uses: "actions/\\u0063ache\@v6"#' "${case_root}/ci.yml"
@@ -99,5 +106,9 @@ expect_rejection comment-before-late-step "${case_root}" "cache save must be the
 case_root="$(make_case duplicate-condition-key)"
 perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: true\n        if: false\n/" "${case_root}/ci.yml"
 expect_rejection duplicate-condition-key "${case_root}" "duplicate YAML mapping key"
+
+case_root="$(make_case composite-cache-action)"
+perl -0pi -e 's!\z!\n    - name: Hidden target cache\n      uses: Actions/cache\@v6\n      with:\n        path: target\n        key: hidden-target\n!' "${case_root}/../actions/rust-toolchain/action.yml"
+expect_rejection composite-cache-action "${case_root}" "repo-local composite actions must not invoke actions/cache"
 
 echo "OK: all Actions cache policy falsifiers were rejected."
