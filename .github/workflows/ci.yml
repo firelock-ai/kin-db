@@ -235,6 +235,7 @@ jobs:
       # Keep this first after checkout. The policy checker verifies its own
       # required-job placement so cache controls cannot become best effort.
       - name: Check Actions cache policy
+        shell: bash
         run: |
           ./scripts/check-actions-cache-policy.sh
           ./scripts/test-actions-cache-policy.sh

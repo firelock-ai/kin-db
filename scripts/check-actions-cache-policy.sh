@@ -9,7 +9,9 @@ workflow_root="${1:-${root}/.github/workflows}"
 action_root="${2:-$(dirname "${workflow_root}")/actions}"
 
 ruby - "${workflow_root}" "${action_root}" <<'RUBY'
+require "digest"
 require "psych"
+require "set"
 require "yaml"
 
 workflow_root = File.expand_path(ARGV.fetch(0))
@@ -31,9 +33,76 @@ guard_run = [
   "./scripts/check-actions-cache-policy.sh",
   "./scripts/test-actions-cache-policy.sh",
 ].freeze
+approved_step_actions = Set.new([
+  "./.github/actions/rust-toolchain",
+  "./kin-db/.github/actions/rust-toolchain",
+  "EmbarkStudios/cargo-deny-action@v2",
+  "actions/cache/restore@v6",
+  "actions/cache/save@v6",
+  "actions/checkout@v7",
+  "actions/upload-artifact@v4",
+  "codecov/codecov-action@v5",
+  "softprops/action-gh-release@v2",
+  "taiki-e/install-action@v2",
+]).freeze
+approved_reusable_jobs = {
+  ["kin-dependency-wave.yml", "dependency-wave"] =>
+    "firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.31",
+  ["registry-publish.yml", "release"] =>
+    "firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.31",
+  ["scheduled-failure-alarm.yml", "alarm"] =>
+    "firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.33",
+}.freeze
+owner_job_names = {
+  "ci.yml" => "check",
+  "windows-nightly.yml" => "windows",
+}.freeze
+owner_job_keys = {
+  "ci.yml" => %w[name runs-on steps strategy],
+  "windows-nightly.yml" => %w[name runs-on steps],
+}.freeze
+owner_step_topology = {
+  "ci.yml" => [
+    "@actions/checkout@v7",
+    "Install Rust toolchain",
+    "Restore cargo sources",
+    "Check formatting",
+    "Clippy",
+    "Build",
+    "Test",
+    "100K hydration smoke guard",
+    "Check the nightly Windows job still runs these steps",
+    "Fetch complete Cargo source graph",
+    "Save cargo sources on main",
+  ],
+  "windows-nightly.yml" => [
+    "@actions/checkout@v7",
+    "Install Rust toolchain",
+    "Restore cargo sources",
+    "Check formatting",
+    "Clippy",
+    "Build",
+    "Test",
+    "100K hydration smoke guard",
+    "Check the nightly Windows job still runs these steps",
+    "Fetch complete Cargo source graph",
+    "Save cargo sources on main",
+  ],
+}.freeze
+protected_run_contracts = {
+  "Check formatting" => ["edafbe150671a93865d25affda0ceb8125b50863752550e2ba8a18ef69b2841e", %w[name run]],
+  "Clippy" => ["786046eba8a6588787b01c2913e5ffb5482101680f91276f03a938168f6ca556", %w[name run shell]],
+  "Build" => ["6525cb3546379952d414d046f14f9bd255b680be01de84658c2933d241252d74", %w[name run]],
+  "Test" => ["4cb9ee46cf47c2359a046708d4e9f6599013360101992f749388bb9779c0fdc5", %w[env name run]],
+  "100K hydration smoke guard" => ["27da212cc355a564550d8195ec7a2cc448b7f60a7193adfc69c1e5850e94a222", %w[env name run]],
+  "Check the nightly Windows job still runs these steps" => ["3a04b48a4db5699f5b6fa9e0bbc66216ca3ffa810e2b2752ea30193a9f7787be", %w[if name run]],
+  "Fetch complete Cargo source graph" => ["2846693bc6bcf6b18c86af1b1a8ae419a361a1da74620336af5ee673a08df1dc", %w[name run shell]],
+}.freeze
+protected_env_keys = Set.new(%w[CARGO_HOME CARGO_TARGET_DIR HOME]).freeze
 
 errors = []
 counts = {}
+reusable_seen = Set.new
 workflows = Dir[File.join(workflow_root, "*.{yml,yaml}")].sort
 abort("FAIL: no workflow files found under #{workflow_root}") if workflows.empty?
 
@@ -79,6 +148,21 @@ def each_mapping(value, &block)
     value.each_value { |child| each_mapping(child, &block) }
   when Array
     value.each { |child| each_mapping(child, &block) }
+  end
+end
+
+def step_identity(step)
+  step["name"] || "@#{step["uses"]}"
+end
+
+def inspect_protected_env(mapping, location, protected_env_keys, errors)
+  env = mapping["env"]
+  return unless env.is_a?(Hash)
+
+  env.each_key do |key|
+    if protected_env_keys.include?(key.to_s.upcase)
+      errors << "#{location}: protected runner environment #{key} must not be overridden"
+    end
   end
 end
 
@@ -170,6 +254,14 @@ workflows.each do |workflow|
     next
   end
 
+  if document.key?("defaults")
+    errors << "#{file_name}: workflow defaults are forbidden because they can mask guard failures"
+  end
+
+  each_mapping(document) do |mapping|
+    inspect_protected_env(mapping, file_name, protected_env_keys, errors)
+  end
+
   if file_name == "ci.yml"
     guard_job = jobs["schema-provenance"]
     unless guard_job.is_a?(Hash)
@@ -177,10 +269,8 @@ workflows.each do |workflow|
     else
       errors << "ci.yml: schema-provenance job name must remain Schema Provenance" unless guard_job["name"] == "Schema Provenance"
       errors << "ci.yml: schema-provenance must run on ubuntu-latest" unless guard_job["runs-on"] == "ubuntu-latest"
-      %w[if continue-on-error needs uses strategy].each do |attribute|
-        if guard_job.key?(attribute)
-          errors << "ci.yml: schema-provenance job must not declare #{attribute}"
-        end
+      unless guard_job.keys.sort == %w[name runs-on steps]
+        errors << "ci.yml: schema-provenance job permits only name, runs-on, and steps"
       end
 
       guard_steps = guard_job["steps"]
@@ -188,16 +278,16 @@ workflows.each do |workflow|
         errors << "ci.yml: schema-provenance must check out the repo and run the cache guard"
       else
         checkout = guard_steps[0]
-        unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@v7" &&
-               !checkout.key?("if") && !checkout.key?("continue-on-error")
-          errors << "ci.yml: schema-provenance must begin with an unconditional actions/checkout@v7"
+        unless checkout.is_a?(Hash) && checkout.keys == ["uses"] &&
+               checkout["uses"] == "actions/checkout@v7"
+          errors << "ci.yml: schema-provenance must begin with an exact current-ref actions/checkout@v7"
         end
 
         guard = guard_steps[1]
         unless guard.is_a?(Hash) && guard["name"] == "Check Actions cache policy" &&
-               lines(guard["run"]) == guard_run &&
-               !guard.key?("if") && !guard.key?("continue-on-error")
-          errors << "ci.yml: cache policy guard must be the first unconditional step after checkout"
+               guard["shell"] == "bash" && lines(guard["run"]) == guard_run &&
+               guard.keys.sort == %w[name run shell]
+          errors << "ci.yml: cache policy guard must be the first exact fail-hard step after checkout"
         end
       end
     end
@@ -209,6 +299,18 @@ workflows.each do |workflow|
   jobs.each do |job_name, job|
     next unless job.is_a?(Hash)
 
+    reusable = job["uses"]
+    if reusable
+      identity = [file_name, job_name]
+      expected = approved_reusable_jobs[identity]
+      if expected != reusable
+        errors << "#{file_name}: job #{job_name.inspect} uses unapproved reusable workflow #{reusable.inspect}"
+      else
+        reusable_seen << identity
+      end
+      next
+    end
+
     steps = job["steps"]
     next if steps.nil?
     unless steps.is_a?(Array)
@@ -216,12 +318,57 @@ workflows.each do |workflow|
       next
     end
 
+    if owner_job_names[file_name] == job_name
+      expected_keys = owner_job_keys.fetch(file_name)
+      unless job.keys.sort == expected_keys
+        errors << "#{file_name}: cache-owner job permits only #{expected_keys.inspect}"
+      end
+      actual_topology = steps.map { |step| step.is_a?(Hash) ? step_identity(step) : "<invalid>" }
+      unless actual_topology == owner_step_topology.fetch(file_name)
+        errors << "#{file_name}: cache-owner step topology drifted"
+      end
+
+      protected_run_contracts.each do |step_name, (expected_digest, expected_keys_for_step)|
+        matches = steps.select { |step| step.is_a?(Hash) && step["name"] == step_name }
+        if matches.length != 1
+          errors << "#{file_name}: cache-owner job requires exactly one #{step_name.inspect} step"
+          next
+        end
+        protected = matches.first
+        actual_digest = protected["run"].is_a?(String) ? Digest::SHA256.hexdigest(protected["run"]) : nil
+        unless actual_digest == expected_digest && protected.keys.sort == expected_keys_for_step
+          errors << "#{file_name}: protected #{step_name.inspect} step drifted or became non-authoritative"
+        end
+      end
+
+      checkout = steps.first
+      unless checkout.is_a?(Hash) && checkout.keys == ["uses"] && checkout["uses"] == "actions/checkout@v7"
+        errors << "#{file_name}: cache-owner job must begin with an exact current-ref checkout"
+      end
+      steps.each do |step|
+        next unless step.is_a?(Hash)
+        if step.key?("continue-on-error")
+          errors << "#{file_name}: cache-owner steps must not continue on error"
+        end
+        next unless step.key?("if")
+        next if step["name"] == "Check the nightly Windows job still runs these steps" &&
+                step["if"] == "runner.os == 'Linux'"
+        next if step["name"] == "Save cargo sources on main" && step["if"] == save_condition
+
+        errors << "#{file_name}: cache-owner step #{step_identity(step).inspect} has an unapproved condition"
+      end
+    end
+
     steps.each_with_index do |step, index|
       next unless step.is_a?(Hash)
 
       location = "#{file_name}: job #{job_name.inspect} step #{index + 1}"
+      inspect_protected_env(step, location, protected_env_keys, errors)
       inspect_hidden_cache_action(step, location, errors)
       action = step["uses"]
+      if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
+        errors << "#{location}: unapproved action identity #{action.inspect}"
+      end
       next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
 
       cache_paths = lines(step.dig("with", "path")) if step["with"].is_a?(Hash)
@@ -231,6 +378,9 @@ workflows.each do |workflow|
       case action
       when "actions/cache/restore@v6"
         restore_count += 1
+        unless step.keys.sort == %w[id name uses with]
+          errors << "#{location}: cache restore step permits only id, name, uses, and with"
+        end
         expected_inputs = %w[key path restore-keys]
         actual_inputs = step["with"].is_a?(Hash) ? step["with"].keys.sort : []
         if actual_inputs != expected_inputs
@@ -253,6 +403,9 @@ workflows.each do |workflow|
         end
       when "actions/cache/save@v6"
         save_count += 1
+        unless step.keys.sort == %w[if name uses with]
+          errors << "#{location}: cache save step permits only if, name, uses, and with"
+        end
         expected_inputs = %w[key path]
         actual_inputs = step["with"].is_a?(Hash) ? step["with"].keys.sort : []
         if actual_inputs != expected_inputs
@@ -277,7 +430,7 @@ workflows.each do |workflow|
         fetch = steps[index - 1]
         unless fetch.is_a?(Hash) && fetch["name"] == "Fetch complete Cargo source graph" &&
                fetch["shell"] == "bash" && lines(fetch["run"]) == fetch_run &&
-               !fetch.key?("if") && !fetch.key?("continue-on-error")
+               fetch.keys.sort == %w[name run shell]
           errors << (
             "#{location}: cache save must immediately follow an unconditional fail-hard cargo fetch"
           )
@@ -306,6 +459,13 @@ workflows.each do |workflow|
   counts[file_name] = [restore_count, save_count]
 end
 
+
+approved_reusable_jobs.each_key do |identity|
+  unless reusable_seen.include?(identity)
+    errors << "#{identity[0]}: required reviewed reusable job #{identity[1].inspect} is missing"
+  end
+end
+
 Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
   relative_name = action_file.delete_prefix("#{action_root}/")
   content = File.read(action_file, encoding: "UTF-8")
@@ -326,8 +486,12 @@ Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
   end
 
   each_mapping(document) do |mapping|
+    inspect_protected_env(mapping, relative_name, protected_env_keys, errors)
     inspect_hidden_cache_action(mapping, relative_name, errors)
     action = mapping["uses"]
+    if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
+      errors << "#{relative_name}: unapproved composite action identity #{action.inspect}"
+    end
     next unless action.is_a?(String) && action.downcase.start_with?("actions/cache")
 
     errors << (

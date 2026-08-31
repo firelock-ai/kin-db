@@ -149,10 +149,68 @@ expect_rejection buildkit-cache "${case_root}" 'hidden cache input "cache-to" is
 
 case_root="$(make_case guarded-job-condition)"
 perl -0pi -e 's/(  schema-provenance:\n)/$1    if: false\n/' "${case_root}/ci.yml"
-expect_rejection guarded-job-condition "${case_root}" "schema-provenance job must not declare if"
+expect_rejection guarded-job-condition "${case_root}" "schema-provenance job permits only"
 
 case_root="$(make_case guarded-step-soft-fail)"
 perl -0pi -e 's/(      - name: Check Actions cache policy\n)/$1        continue-on-error: true\n/' "${case_root}/ci.yml"
-expect_rejection guarded-step-soft-fail "${case_root}" "cache policy guard must be the first unconditional step after checkout"
+expect_rejection guarded-step-soft-fail "${case_root}" "cache policy guard must be the first exact fail-hard step after checkout"
+
+case_root="$(make_case guarded-checkout-main)"
+perl -0pi -e 's/(  schema-provenance:.*?      - uses: actions\/checkout\@v7\n)/$1        with:\n          ref: main\n/s' "${case_root}/ci.yml"
+expect_rejection guarded-checkout-main "${case_root}" "must begin with an exact current-ref actions/checkout@v7"
+
+case_root="$(make_case guarded-shell-mask)"
+perl -0pi -e 's/(      - name: Check Actions cache policy\n        shell:) bash/$1 "bash {0} || true"/' "${case_root}/ci.yml"
+expect_rejection guarded-shell-mask "${case_root}" "cache policy guard must be the first exact fail-hard step after checkout"
+
+case_root="$(make_case guarded-job-default-mask)"
+perl -0pi -e 's/(  schema-provenance:\n)/$1    defaults:\n      run:\n        shell: "bash {0} || true"\n/' "${case_root}/ci.yml"
+expect_rejection guarded-job-default-mask "${case_root}" "schema-provenance job permits only"
+
+case_root="$(make_case workflow-default-mask)"
+perl -0pi -e 's/(jobs:\n)/defaults:\n  run:\n    shell: "bash {0} || true"\n\n$1/' "${case_root}/ci.yml"
+expect_rejection workflow-default-mask "${case_root}" "workflow defaults are forbidden"
+
+case_root="$(make_case setup-buildx-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden Buildx cache\n        uses: docker/setup-buildx-action\@v3\n!' "${case_root}/ci.yml"
+expect_rejection setup-buildx-default-cache "${case_root}" "unapproved action identity"
+
+case_root="$(make_case setup-qemu-default-cache)"
+perl -0pi -e 's!\z!\n      - name: Hidden QEMU cache\n        uses: docker/setup-qemu-action\@v3\n!' "${case_root}/ci.yml"
+expect_rejection setup-qemu-default-cache "${case_root}" "unapproved action identity"
+
+case_root="$(make_case copied-reusable-workflow)"
+cp "${case_root}/registry-publish.yml" "${case_root}/registry-publish-copy.yml"
+expect_rejection copied-reusable-workflow "${case_root}" "uses unapproved reusable workflow"
+
+case_root="$(make_case local-action-outside-root)"
+mkdir -p "${case_root}/../cache-toolchain"
+cp "${case_root}/../actions/rust-toolchain/action.yml" "${case_root}/../cache-toolchain/action.yml"
+perl -0pi -e 's!\./\.github/actions/rust-toolchain!./.github/cache-toolchain!' "${case_root}/ci.yml"
+expect_rejection local-action-outside-root "${case_root}" "unapproved action identity"
+
+case_root="$(make_case build-continue-on-error)"
+perl -0pi -e 's/(      - name: Build\n)/$1        continue-on-error: true\n/' "${case_root}/ci.yml"
+expect_rejection build-continue-on-error "${case_root}" "cache-owner steps must not continue on error"
+
+case_root="$(make_case build-command-mask)"
+perl -0pi -e 's/run: cargo build --all-targets/run: cargo build --all-targets || true/' "${case_root}/ci.yml"
+expect_rejection build-command-mask "${case_root}" 'protected "Build" step drifted or became non-authoritative'
+
+case_root="$(make_case fetch-cargo-home)"
+perl -0pi -e 's/(      - name: Fetch complete Cargo source graph\n)/$1        env:\n          CARGO_HOME: \/tmp\/other-cargo\n/' "${case_root}/ci.yml"
+expect_rejection fetch-cargo-home "${case_root}" "protected runner environment CARGO_HOME must not be overridden"
+
+case_root="$(make_case save-home)"
+perl -0pi -e 's/(      - name: Save cargo sources on main\n)/$1        env:\n          HOME: \/tmp\/hidden-target\n/' "${case_root}/ci.yml"
+expect_rejection save-home "${case_root}" "protected runner environment HOME must not be overridden"
+
+case_root="$(make_case target-under-source-cache)"
+perl -0pi -e 's/(      - name: Build\n)/$1        env:\n          CARGO_TARGET_DIR: \/home\/runner\/.cargo\/git\/target\n/' "${case_root}/ci.yml"
+expect_rejection target-under-source-cache "${case_root}" "protected runner environment CARGO_TARGET_DIR must not be overridden"
+
+case_root="$(make_case owner-job-condition)"
+perl -0pi -e 's/(  check:\n)/$1    if: github.ref == '\''refs\/heads\/main'\''\n/' "${case_root}/ci.yml"
+expect_rejection owner-job-condition "${case_root}" "cache-owner job permits only"
 
 echo "OK: all Actions cache policy falsifiers were rejected."
