@@ -125,6 +125,10 @@ for workflow in workflows:
                 restore_count += 1
                 if scalar(block, "id") != "cargo-sources":
                     errors.append(f"{workflow.name}:{start + 1}: restore id must be cargo-sources")
+                if condition is not None:
+                    errors.append(
+                        f"{workflow.name}:{start + 1}: cache restore must run on every workflow ref"
+                    )
                 if key != restore_key:
                     errors.append(
                         f"{workflow.name}:{start + 1}: restore key must be the bounded epoch {restore_key}"
@@ -142,6 +146,22 @@ for workflow in workflows:
                 if key != save_key:
                     errors.append(
                         f"{workflow.name}:{start + 1}: save key must come from the restore primary key"
+                    )
+                later_step = None
+                step_indent = len(lines[start]) - len(lines[start].lstrip())
+                for later_at in range(end, len(lines)):
+                    later_line = lines[later_at]
+                    stripped = later_line.lstrip()
+                    indent = len(later_line) - len(stripped)
+                    if stripped and indent < step_indent:
+                        break
+                    if stripped.startswith("- ") and indent == step_indent:
+                        later_step = later_at + 1
+                        break
+                if later_step is not None:
+                    errors.append(
+                        f"{workflow.name}:{start + 1}: cache save must be the last declared job step; "
+                        f"found a later step at line {later_step}"
                     )
             else:
                 errors.append(

@@ -52,4 +52,16 @@ case_root="$(make_case monolithic-action)"
 perl -0pi -e 's#actions/cache/restore\@v6#actions/cache\@v6#' "${case_root}/ci.yml"
 expect_rejection monolithic-action "${case_root}" "use actions/cache/restore@v6 or actions/cache/save@v6"
 
+case_root="$(make_case conditional-restore)"
+perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
+expect_rejection conditional-restore "${case_root}" "cache restore must run on every workflow ref"
+
+case_root="$(make_case early-save)"
+perl -0pi -e '
+  if (s#\n(      - name: Save cargo sources on main\n.*?          key: \$\{\{ steps\.cargo-sources\.outputs\.cache-primary-key \}\}\n)#$save = $1; "\n"#se) {
+    s#(      - name: Restore cargo sources\n.*?            \$\{\{ runner\.os \}\}-cargo-sources-\n)#$1\n$save#s;
+  }
+' "${case_root}/ci.yml"
+expect_rejection early-save "${case_root}" "cache save must be the last declared job step"
+
 echo "OK: all Actions cache policy falsifiers were rejected."
