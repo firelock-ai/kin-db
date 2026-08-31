@@ -56,6 +56,18 @@ case_root="$(make_case conditional-restore)"
 perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
 expect_rejection conditional-restore "${case_root}" "cache restore must run on every workflow ref"
 
+case_root="$(make_case conditional-restore-spaced-key)"
+perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if : github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
+expect_rejection conditional-restore-spaced-key "${case_root}" "cache restore must run on every workflow ref"
+
+case_root="$(make_case conditional-restore-quoted-key)"
+perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        'if' : github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
+expect_rejection conditional-restore-quoted-key "${case_root}" "cache restore must run on every workflow ref"
+
+case_root="$(make_case conditional-restore-double-quoted-key)"
+perl -0pi -e 's/(      - name: Restore cargo sources\n)/$1        "if" : github.event_name == '\''pull_request'\''\n/' "${case_root}/ci.yml"
+expect_rejection conditional-restore-double-quoted-key "${case_root}" "cache restore must run on every workflow ref"
+
 case_root="$(make_case early-save)"
 perl -0pi -e '
   if (s#\n(      - name: Save cargo sources on main\n.*?          key: \$\{\{ steps\.cargo-sources\.outputs\.cache-primary-key \}\}\n)#$save = $1; "\n"#se) {
@@ -63,5 +75,13 @@ perl -0pi -e '
   }
 ' "${case_root}/ci.yml"
 expect_rejection early-save "${case_root}" "cache save must be the last declared job step"
+
+case_root="$(make_case bare-dash-late-step)"
+perl -0pi -e 's#\n  \# Security audit moved#\n      -\n        name: Late Cargo work\n        run: cargo fetch\n\n  \# Security audit moved#' "${case_root}/ci.yml"
+expect_rejection bare-dash-late-step "${case_root}" "cache save must be the last declared job step"
+
+case_root="$(make_case late-restore)"
+perl -0pi -e 's#(      - name: Restore cargo sources\n)#      - name: Cargo work before restore\n        run: cargo fetch\n\n$1#' "${case_root}/ci.yml"
+expect_rejection late-restore "${case_root}" "cache restore must precede every run step"
 
 echo "OK: all Actions cache policy falsifiers were rejected."

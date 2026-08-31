@@ -34,7 +34,7 @@ save_condition = (
 def step_block(lines, uses_at):
     uses_line = lines[uses_at]
     uses_indent = len(uses_line) - len(uses_line.lstrip())
-    if uses_line.lstrip().startswith("- uses:"):
+    if uses_line.lstrip().rstrip().startswith("-"):
         start = uses_at
         step_indent = uses_indent
     else:
@@ -42,9 +42,9 @@ def step_block(lines, uses_at):
         step_indent = None
         for index in range(uses_at - 1, -1, -1):
             line = lines[index]
-            stripped = line.lstrip()
-            indent = len(line) - len(stripped)
-            if stripped.startswith("- ") and indent < uses_indent:
+            stripped = line.lstrip().rstrip()
+            indent = len(line) - len(line.lstrip())
+            if (stripped == "-" or stripped.startswith("- ")) and indent < uses_indent:
                 start = index
                 step_indent = indent
                 break
@@ -54,9 +54,9 @@ def step_block(lines, uses_at):
     end = len(lines)
     for index in range(start + 1, len(lines)):
         line = lines[index]
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if stripped.startswith("- ") and indent <= step_indent:
+        stripped = line.lstrip().rstrip()
+        indent = len(line) - len(line.lstrip())
+        if (stripped == "-" or stripped.startswith("- ")) and indent <= step_indent:
             end = index
             break
         if stripped and indent < step_indent:
@@ -67,18 +67,23 @@ def step_block(lines, uses_at):
 
 def scalar(block, field):
     match = None
-    pattern = re.compile(rf"^\s*(?:-\s*)?{re.escape(field)}:\s*(.*?)\s*$")
+    key = rf"(?:{re.escape(field)}|'{re.escape(field)}'|\"{re.escape(field)}\")"
+    pattern = re.compile(rf"^\s*(?:-\s*)?{key}\s*:\s*(.*?)\s*$")
     for line in block:
         candidate = pattern.match(line)
         if candidate:
             if match is not None:
                 raise ValueError(f"step declares {field!r} more than once")
-            match = candidate.group(1)
+            value = candidate.group(1)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            match = value
     return match
 
 
 def literal_list(block, field):
-    pattern = re.compile(rf"^(\s*)(?:-\s*)?{re.escape(field)}:\s*\|\s*$")
+    key = rf"(?:{re.escape(field)}|'{re.escape(field)}'|\"{re.escape(field)}\")"
+    pattern = re.compile(rf"^(\s*)(?:-\s*)?{key}\s*:\s*\|\s*$")
     for index, line in enumerate(block):
         match = pattern.match(line)
         if not match:
@@ -105,16 +110,19 @@ if not workflows:
 for workflow in workflows:
     lines = workflow.read_text(encoding="utf-8").splitlines()
     seen_ranges = set()
+    parsed_cache_steps = 0
     restore_count = 0
     save_count = 0
     for uses_at, line in enumerate(lines):
-        if not re.match(r"^\s*(?:-\s*)?uses:\s*actions/cache(?:/[^@\s]+)?@", line):
+        line_action = scalar([line], "uses")
+        if line_action is None or not line_action.startswith("actions/cache"):
             continue
         try:
             start, end, block = step_block(lines, uses_at)
             if (start, end) in seen_ranges:
                 continue
             seen_ranges.add((start, end))
+            parsed_cache_steps += 1
             action = scalar(block, "uses")
             paths = literal_list(block, "path")
             key = scalar(block, "key")
@@ -128,6 +136,28 @@ for workflow in workflows:
                 if condition is not None:
                     errors.append(
                         f"{workflow.name}:{start + 1}: cache restore must run on every workflow ref"
+                    )
+                step_indent = len(lines[start]) - len(lines[start].lstrip())
+                job_start = 0
+                for prior_at in range(start - 1, -1, -1):
+                    prior_line = lines[prior_at]
+                    stripped = prior_line.strip()
+                    indent = len(prior_line) - len(prior_line.lstrip())
+                    if stripped and indent < step_indent:
+                        job_start = prior_at + 1
+                        break
+                prior_run = next(
+                    (
+                        prior_at + 1
+                        for prior_at in range(job_start, start)
+                        if scalar([lines[prior_at]], "run") is not None
+                    ),
+                    None,
+                )
+                if prior_run is not None:
+                    errors.append(
+                        f"{workflow.name}:{start + 1}: cache restore must precede every run step; "
+                        f"found earlier work at line {prior_run}"
                     )
                 if key != restore_key:
                     errors.append(
@@ -151,11 +181,11 @@ for workflow in workflows:
                 step_indent = len(lines[start]) - len(lines[start].lstrip())
                 for later_at in range(end, len(lines)):
                     later_line = lines[later_at]
-                    stripped = later_line.lstrip()
-                    indent = len(later_line) - len(stripped)
+                    stripped = later_line.lstrip().rstrip()
+                    indent = len(later_line) - len(later_line.lstrip())
                     if stripped and indent < step_indent:
                         break
-                    if stripped.startswith("- ") and indent == step_indent:
+                    if (stripped == "-" or stripped.startswith("- ")) and indent == step_indent:
                         later_step = later_at + 1
                         break
                 if later_step is not None:
@@ -181,6 +211,13 @@ for workflow in workflows:
         except ValueError as error:
             errors.append(f"{workflow.name}:{uses_at + 1}: {error}")
 
+    raw_cache_mentions = "\n".join(lines).count("actions/cache")
+    if parsed_cache_steps != raw_cache_mentions:
+        errors.append(
+            f"{workflow.name}: found {raw_cache_mentions} actions/cache mentions but parsed "
+            f"{parsed_cache_steps} cache steps; unsupported YAML shape or comment"
+        )
+
     counts[workflow.name] = (restore_count, save_count)
 
 for workflow_name, expected in expected_counts.items():
@@ -204,7 +241,7 @@ if errors:
     sys.exit(1)
 
 print(
-    "OK: Actions caches are source-only, epoch-bounded, and save only from main "
+    "OK: repo-local Actions caches are source-only, epoch-bounded, and save only from main "
     "(4 restores, 2 saves)."
 )
 PY
