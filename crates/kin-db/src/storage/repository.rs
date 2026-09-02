@@ -61,15 +61,27 @@ use crate::storage::format::{
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 use crate::types::ResolvedGraphState;
 
-/// Persisted repository-envelope schema.
+/// Persisted repository-envelope schema this binary WRITES.
 ///
 /// Moved 3 to 4 when commit receipts stopped repeating their operation records
 /// (FIR-3064). The snapshot version ladder is what refuses an older BINARY at
-/// the frame header, before it decodes anything; this constant is what refuses
-/// an older ENVELOPE shape inside a binary that can read the frame, and what
-/// makes [`HISTORY_VALIDATION_VERSION`] refuse every durable validation proof
-/// minted against the shape that came before.
+/// the frame header, before it decodes anything; this constant is what a new
+/// envelope declares, and what makes [`HISTORY_VALIDATION_VERSION`] refuse
+/// every durable validation proof minted against the shape that came before,
+/// so an already-written store revalidates in full on its first open here.
 pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 4;
+
+/// The oldest persisted envelope schema this binary READS.
+///
+/// Reading has to be a range and writing a point, and conflating them is a
+/// migration nobody asked for. A schema-3 envelope differs from a schema-4 one
+/// only in that its receipts still carry the operation record the log already
+/// holds, which the receipt's own trailing `serde(default)` reads either way
+/// and which `validate_against` still checks against the log. Refusing it would
+/// have made every store on disk unopenable by this binary; an equality check
+/// here did exactly that, and the daemon-attribution run is what caught it:
+/// `unsupported repository authority schema 3; expected 4` on a real store.
+pub const MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 
 /// Revision of what `open`'s full validation path accepts and rejects.
 ///
@@ -730,10 +742,16 @@ impl PersistedRepositoryAuthority {
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
-        if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
+        if !(MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION..=REPOSITORY_AUTHORITY_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
             return Err(storage(format!(
-                "unsupported repository authority schema {}; expected {}",
-                self.schema_version, REPOSITORY_AUTHORITY_SCHEMA_VERSION
+                "unsupported repository authority schema {}; this binary reads {} through {} \
+                 and writes {}",
+                self.schema_version,
+                MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+                REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+                REPOSITORY_AUTHORITY_SCHEMA_VERSION
             )));
         }
         self.roots.validate()?;
@@ -17812,6 +17830,110 @@ mod tests {
         assert_eq!(
             advanced_base_changes, 0,
             "the two bases this mutation resolved carried {advanced_base_changes} changes              between them out of the repository's {history_changes}"
+        );
+    }
+
+    /// A store written before the receipts were trimmed still opens.
+    ///
+    /// This is the migration this change must not require, and an equality
+    /// check on the envelope schema silently created one: every store on disk
+    /// declares schema 3, and a binary that accepted only 4 refused all of
+    /// them with `unsupported repository authority schema 3; expected 4`. The
+    /// PR body said no migration was needed while the code required one, and
+    /// nothing in the suite disagreed, because every fixture writes the schema
+    /// the binary writes.
+    ///
+    /// So the fixture is aged deliberately: a real committed store, put back to
+    /// the shape it had before, with its receipt carrying the operation record
+    /// again and its envelope declaring schema 3. Reading has to be a range and
+    /// writing a point.
+    #[test]
+    fn a_store_from_before_the_receipts_were_trimmed_still_opens() {
+        let store = build_synthetic_history_store(2, 4, 1, 2);
+        let lease = store.manager.read_authority();
+        let mut snapshot = lease.snapshot().clone();
+        drop(lease);
+
+        let metadata = snapshot
+            .repository_authority
+            .as_mut()
+            .expect("the committed store carries an envelope");
+        assert_eq!(
+            metadata.schema_version, REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+            "the fixture must start at the schema this binary writes"
+        );
+        assert!(
+            metadata
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "the fixture must start trimmed, or ageing it below proves nothing"
+        );
+
+        // Age it: every receipt carries its operation record again, and the
+        // envelope declares the schema that shape was written under.
+        let log: std::collections::BTreeMap<_, _> = metadata
+            .operation_log
+            .iter()
+            .map(|operation| (operation.operation_id, operation.clone()))
+            .collect();
+        for receipt in &mut metadata.receipts {
+            receipt.operation = Some(
+                log.get(&receipt.operation_id)
+                    .expect("every receipt names a logged operation")
+                    .clone(),
+            );
+        }
+        metadata.schema_version = MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION;
+        snapshot.version = snapshot.wire_version();
+
+        // The aged store round-trips through the persisted format and validates
+        // on the way back, which is what an open does.
+        let bytes = snapshot.to_bytes().expect("the aged snapshot serializes");
+        let reopened = GraphSnapshot::from_bytes(&bytes).expect("the aged snapshot decodes");
+        let aged = reopened
+            .repository_authority
+            .as_ref()
+            .expect("the aged envelope survives the round trip");
+        assert_eq!(aged.schema_version, MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION);
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "the aged receipts must still carry their operation records"
+        );
+        for operation in &aged.operation_log {
+            let receipt = aged
+                .receipts
+                .iter()
+                .find(|receipt| receipt.operation_id == operation.operation_id)
+                .expect("every aged operation has a receipt");
+            receipt
+                .validate_against(operation)
+                .expect("an aged receipt is still checked against its embedded copy");
+        }
+
+        // The negative controls, so the range is a range and not an acceptance
+        // of anything.
+        let mut too_old = reopened.clone();
+        too_old
+            .repository_authority
+            .as_mut()
+            .expect("envelope")
+            .schema_version = MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION - 1;
+        assert!(
+            too_old.validate_storage_admission().is_err(),
+            "a schema below the readable range must be refused"
+        );
+        let mut too_new = reopened.clone();
+        too_new
+            .repository_authority
+            .as_mut()
+            .expect("envelope")
+            .schema_version = REPOSITORY_AUTHORITY_SCHEMA_VERSION + 1;
+        assert!(
+            too_new.validate_storage_admission().is_err(),
+            "a schema above the readable range must be refused"
         );
     }
 
