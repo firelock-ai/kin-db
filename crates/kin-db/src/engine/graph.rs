@@ -1254,7 +1254,10 @@ impl GraphHashSource for EntityData {
 /// Semantic change DAG. Named refs are repository authority, not graph state.
 #[derive(Clone)]
 struct ChangeData {
-    changes: HashMap<SemanticChangeId, SemanticChange>,
+    /// Held as the snapshot's own lazily decoded map rather than copied into
+    /// an engine map, so a graph built over a converted store's workspace
+    /// base keeps the history on disk until a history read asks for it.
+    changes: crate::storage::ChangeMap,
     /// Parent → children in the change DAG.
     change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
 }
@@ -1792,14 +1795,23 @@ mod embed_tier {
     pub const INTERNAL_SOURCE: u8 = 3;
     /// Private source symbols.
     pub const PRIVATE_SOURCE: u8 = 4;
-    /// Historical (non-HEAD) entity revisions — embed after all live HEAD source.
-    pub const REVISION: u8 = 5;
     /// Test code.
-    pub const TEST: u8 = 6;
+    pub const TEST: u8 = 5;
     /// Documentation entities.
-    pub const DOCS: u8 = 7;
+    pub const DOCS: u8 = 6;
     /// Generated / vendored / external code and non-entity keys.
-    pub const OTHER: u8 = 8;
+    pub const OTHER: u8 = 7;
+    /// Entity revisions, embedded after EVERY live entity rather than only
+    /// after live source.
+    ///
+    /// A revision key resolves to the same entity its live key does, so once
+    /// that entity holds a vector the revision can carry it instead of paying a
+    /// second forward pass. That carry only fires if the entity was embedded
+    /// first, and this tier is what guarantees it: at 5 the revisions of test,
+    /// docs, generated and vendored entities drained BEFORE those entities, so
+    /// on a test-heavy repository a large share of revisions missed the carry
+    /// and each cost a full GPU dispatch.
+    pub const REVISION: u8 = 8;
 }
 
 /// Classify a HEAD entity into an [`embed_tier`] bucket from its visibility,
@@ -1862,6 +1874,37 @@ struct EmbedSortKey {
     recency: EmbedRecency,
     centrality_rank: u32,
     key: RetrievalKey,
+}
+
+/// Copy each carried key's source vector into `vi`, returning how many landed
+/// and which keys lost their source.
+///
+/// The source is read here, in persist, rather than at prepare time, so a
+/// source this very batch re-embedded is copied at its new value instead of the
+/// stale one prepare saw. That is also why this cannot be folded into prepare:
+/// prepare decides eligibility, persist reads truth.
+///
+/// A source that has gone missing since prepare is REPORTED, never dropped. A
+/// dropped key would be absent from the index with nothing left to notice, and
+/// the next pass's coverage read would render that shortfall as ordinary
+/// pending work of unknown origin. The caller requeues it instead.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn apply_carried_vectors(
+    vi: &VectorIndex,
+    carried: &[(RetrievalKey, RetrievalKey)],
+) -> Result<(usize, Vec<RetrievalKey>), KinDbError> {
+    let producers = vi.actual_producers();
+    let mut copies: Vec<(RetrievalKey, Vec<f32>)> = Vec::with_capacity(carried.len());
+    let mut lost: Vec<RetrievalKey> = Vec::new();
+    for (key, source) in carried {
+        match vi.get_retrievable(source) {
+            Some(vector) => copies.push((*key, vector)),
+            None => lost.push(*key),
+        }
+    }
+    let copied = copies.len();
+    vi.upsert_retrievable_batch_with_producers(copies, &producers)?;
+    Ok((copied, lost))
 }
 
 /// Compute the [`EmbedSortKey`] for a queued entity key against current graph
@@ -2044,6 +2087,10 @@ pub struct PreparedEmbedBatch {
     keys: Vec<RetrievalKey>,
     /// Formatted text, parallel to `keys`. Owned once here and never recopied.
     texts: Vec<String>,
+    /// Head-revision keys that carry their live entity's vector instead of
+    /// paying a second forward pass, each paired with the entity key to copy
+    /// from. See `carry_source_for_head_revision` for when a key qualifies.
+    carried: Vec<(RetrievalKey, RetrievalKey)>,
     /// Recency for every drained key (including any whose entity was missing),
     /// so an error-requeue cannot demote changed-this-sync work to backfill.
     recency: hashbrown::HashMap<RetrievalKey, EmbedRecency>,
@@ -2101,9 +2148,14 @@ impl PreparedEmbedBatch {
         self.keys.len()
     }
 
-    /// Whether the batch holds no embeddable entities.
+    /// Whether the batch holds no work at all.
+    ///
+    /// Carried keys count. A batch of nothing but carries still moves the queue
+    /// forward and still writes vectors, so reporting it empty would stop the
+    /// drive loop on its "no progress" guard with the queue still full. The
+    /// batch did work, it just did not need the GPU to do it.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.keys.is_empty() && self.carried.is_empty()
     }
 }
 
@@ -2342,7 +2394,7 @@ impl InMemoryGraph {
                 opaque_artifacts: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
-                changes: HashMap::new(),
+                changes: crate::storage::ChangeMap::new(),
                 change_children: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
@@ -2843,7 +2895,7 @@ impl InMemoryGraph {
         let graph = Self {
             entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
-                changes: changes.into_iter().collect(),
+                changes,
                 change_children: change_children.into_iter().collect(),
             }),
             work: RwLock::new(WorkData {
@@ -3074,7 +3126,9 @@ impl InMemoryGraph {
         let graph = Self {
             entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
-                changes,
+                // The locate projection keeps its own map type; a graph built
+                // from it holds the decoded map, as it always did.
+                changes: changes.into_iter().collect(),
                 change_children: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
@@ -4115,7 +4169,7 @@ impl InMemoryGraph {
             file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
             opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
-            changes: chg.changes.into_iter().collect(),
+            changes: chg.changes,
             change_children: chg.change_children.into_iter().collect(),
             work_items: wrk.work_items.into_iter().collect(),
             annotations: wrk.annotations.into_iter().collect(),
@@ -5992,6 +6046,7 @@ impl InMemoryGraph {
 
         let mut keys: Vec<RetrievalKey> = Vec::with_capacity(batch.len());
         let mut texts: Vec<String> = Vec::with_capacity(batch.len());
+        let mut carried: Vec<(RetrievalKey, RetrievalKey)> = Vec::new();
         if !batch.is_empty() {
             let ent = self.entities.read();
 
@@ -6027,8 +6082,13 @@ impl InMemoryGraph {
                     }
                     RetrievalKey::EntityRevision(rev_id) => {
                         if let Some(rev) = rev_lookup.get(rev_id) {
-                            keys.push(*key);
-                            texts.push(format_graph_entity_text(&rev.entity));
+                            match self.carry_source_for_head_revision(&ent, rev) {
+                                Some(source) => carried.push((*key, source)),
+                                None => {
+                                    keys.push(*key);
+                                    texts.push(format_graph_entity_text(&rev.entity));
+                                }
+                            }
                         }
                     }
                     RetrievalKey::Artifact(artifact_id) => {
@@ -6062,8 +6122,75 @@ impl InMemoryGraph {
         PreparedEmbedBatch {
             keys,
             texts,
+            carried,
             recency,
         }
+    }
+
+    /// The entity key a head-revision key may copy its vector from, or `None`
+    /// when this revision has to be embedded like any other text.
+    ///
+    /// `RetrievalKey::EntityRevision(R)` and `RetrievalKey::Entity(E)` resolve
+    /// to the SAME entity when R is E's head revision. `resolve_retrieval_key`
+    /// returns `ResolvedRetrievalItem::Entity` for both, and for the revision
+    /// arm only while E is still live. So on a fresh store every entity was
+    /// embedded twice: once from its live text and once from the head
+    /// revision's, which is the same text minus the appended relation-context
+    /// lines. Two forward passes, two near-identical vectors, one object.
+    ///
+    /// This returns the live entity key when three things hold, and the vector
+    /// index already answering for that key is the load-bearing one:
+    ///
+    /// 1. E is live. A retired entity's revision must not resurrect it, which is
+    ///    the same liveness rule the revision arm of `resolve_retrieval_key`
+    ///    enforces.
+    /// 2. R is E's head revision. Superseded generations are not retrieval truth
+    ///    and `prune_orphaned_vectors` evicts them, so carrying into one would
+    ///    write a vector that is about to be reclaimed.
+    /// 3. The revision's fingerprint matches the live entity's on all three
+    ///    hashes. This is the same eligibility test `propagate_revision_vectors`
+    ///    already uses to copy along a revision chain; it is what makes the
+    ///    copied vector a vector OF this revision rather than of a later edit.
+    ///
+    /// The carried vector is the entity's, so it carries the relation-context
+    /// lines the revision's own text does not. That is a deliberate widening:
+    /// both keys name the same live entity, and the context-bearing vector is
+    /// the better description of it. It is also the only observable difference,
+    /// and it is why this is a carry rather than a claim that the two texts were
+    /// always identical. They were not.
+    ///
+    /// That is the one way this differs from `plan_minted_revision_vectors`,
+    /// which carries a vector along a revision CHAIN and takes byte equality of
+    /// `format_graph_entity_text` as its whole criterion. It can, because both
+    /// of its keys are revision keys and neither ever gets context. Here the
+    /// source is the live entity key, whose text is the revision's plus context,
+    /// so byte equality would refuse every real carry. Sameness of the object,
+    /// tested through liveness, head position and the fingerprint triple, is the
+    /// criterion instead.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn carry_source_for_head_revision(
+        &self,
+        ent: &EntityData,
+        rev: &EntityRevision,
+    ) -> Option<RetrievalKey> {
+        let entity_id = rev.entity.id;
+        let live = ent.entities.get(&entity_id)?;
+        let head = ent
+            .entity_revisions
+            .get(&entity_id)
+            .and_then(|chain| chain.last())?;
+        if head.revision_id != rev.revision_id {
+            return None;
+        }
+        if live.fingerprint.ast_hash != rev.entity.fingerprint.ast_hash
+            || live.fingerprint.signature_hash != rev.entity.fingerprint.signature_hash
+            || live.fingerprint.behavior_hash != rev.entity.fingerprint.behavior_hash
+        {
+            return None;
+        }
+        let source = RetrievalKey::Entity(entity_id);
+        let vi = self.vector_index.lock().clone()?;
+        vi.contains_retrievable(&source).then_some(source)
     }
 
     /// Stage 2 of the embed pipeline: run inference for a prepared batch. Holds
@@ -6157,7 +6284,7 @@ impl InMemoryGraph {
         prepared: &PreparedEmbedBatch,
         prune_on_empty: bool,
     ) -> Result<usize, KinDbError> {
-        if embedded.items.is_empty() {
+        if embedded.items.is_empty() && prepared.carried.is_empty() {
             return Ok(0);
         }
         let keys: Vec<RetrievalKey> = embedded.items.iter().map(|(key, _)| *key).collect();
@@ -6166,11 +6293,15 @@ impl InMemoryGraph {
             Ok(index) => index,
             Err(err) => {
                 self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
+                self.requeue_embedding_keys(
+                    prepared.carried.iter().map(|(key, _)| *key),
+                    &prepared.recency,
+                );
                 return Err(err);
             }
         };
 
-        let count = embedded.items.len();
+        let mut count = embedded.items.len();
         let persist_result = self
             .embed_stage_timings
             .time(crate::embed::EmbedStage::Persist, || {
@@ -6178,7 +6309,40 @@ impl InMemoryGraph {
             });
         if let Err(err) = persist_result {
             self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
+            self.requeue_embedding_keys(
+                prepared.carried.iter().map(|(key, _)| *key),
+                &prepared.recency,
+            );
             return Err(err);
+        }
+
+        // Carries: copy the live entity's vector onto its head-revision key.
+        if !prepared.carried.is_empty() {
+            let carry_result = self
+                .embed_stage_timings
+                .time(crate::embed::EmbedStage::Persist, || {
+                    apply_carried_vectors(&vi, &prepared.carried)
+                });
+            match carry_result {
+                Ok((copied, lost)) => {
+                    if !lost.is_empty() {
+                        tracing::warn!(
+                            lost = lost.len(),
+                            "carried head-revision source vectors vanished between prepare and \
+                             persist; requeued"
+                        );
+                        self.requeue_embedding_keys(lost.into_iter(), &prepared.recency);
+                    }
+                    count += copied;
+                }
+                Err(err) => {
+                    self.requeue_embedding_keys(
+                        prepared.carried.iter().map(|(key, _)| *key),
+                        &prepared.recency,
+                    );
+                    return Err(err);
+                }
+            }
         }
 
         // Live retire: when this batch drains the embed queues, a re-embed that
@@ -6528,7 +6692,12 @@ impl InMemoryGraph {
     ///   index was flushed at-or-after that content and is retained; a head
     ///   whose current head revision has no vector predates the entity's
     ///   current content and is retired for re-embed. An entity with no
-    ///   revision chain has no drift signal and is retained as-is.
+    ///   revision chain has no drift signal and is retained as-is. That
+    ///   inference needs an index a pass FINISHED: on one a pass is still
+    ///   filling there are no revision vectors at all yet, the absence proves
+    ///   nothing, and every head is retired for want of evidence it could not
+    ///   have. So an index holding no revision vector anywhere retires no heads
+    ///   (FIR-3096).
     /// - `Artifact` keys are id-stable across content edits and artifacts mint
     ///   no embedded revision keys, so drift leaves no per-key proof at all:
     ///   every artifact vector is retired and re-derived from the current
@@ -6553,10 +6722,46 @@ impl InMemoryGraph {
             None => return VectorSalvageStats::default(),
         };
 
+        // Sampled BEFORE the prune on purpose. The question this answers is
+        // "did an embed pass ever reach its revision tier on this index", and
+        // the prune drops superseded revision vectors, which are evidence that
+        // it did. Reading it after the prune would misread a store whose only
+        // revision vector was superseded as an index no pass had got to, and
+        // would then retain the stale head that store exists to retire.
+        let index_holds_no_revision_proof = !vi
+            .retrievable_keys()
+            .iter()
+            .any(|key| matches!(key, RetrievalKey::EntityRevision(_)));
+
         // Full generation eviction first: drops every key outside current
         // truth (the sidecar load marked a full reconcile pending).
         let evicted_orphans = self.prune_orphaned_vectors();
 
+        // FIR-3096. The head test below reads the ABSENCE of a revision vector
+        // as proof that a head vector predates the entity's current content.
+        // That inference needs the index to be one an embed pass finished. It
+        // is not sound on an index a pass is still filling: `embed_sort_key_for`
+        // ranks every live entity tier ahead of `embed_tier::REVISION`, so a
+        // pass embeds all live entities first and revision keys last, and
+        // between those two phases the index holds entity vectors and no
+        // revision vectors at all. Every head then fails a test it could not
+        // pass, and the salvage retires the entire pass.
+        //
+        // An index with no revision vectors anywhere therefore carries no
+        // evidence either way, and of the two readings available, retiring is
+        // the strictly worse one. Measured before this guard existed: a mid-pass
+        // reopen retired 940 and then 5,555 vectors on a live React store, and a
+        // hiredis run performed 1,677 embeds to fill a 1,485-vector store.
+        //
+        // The bounded cost of the other reading, stated plainly: in that window
+        // a head whose content genuinely changed since its vector was written is
+        // retained rather than retired, and stays slightly stale until the pass
+        // reaches it. That is bounded by one pass; the loss it replaces was
+        // total and unbounded.
+        //
+        // This is deliberately the narrow reading. It does NOT weaken the test
+        // for an index that holds revision vectors, where the absence of one
+        // head's revision really is evidence about that head.
         let mut retire: Vec<RetrievalKey> = Vec::new();
         {
             let ent = self.entities.read();
@@ -6572,6 +6777,9 @@ impl InMemoryGraph {
                         retire.push(key);
                     }
                     RetrievalKey::Entity(id) => {
+                        if index_holds_no_revision_proof {
+                            continue;
+                        }
                         if let Some(head) = head_by_entity.get(&id) {
                             if !vi.contains_retrievable(&RetrievalKey::EntityRevision(*head)) {
                                 retire.push(key);
@@ -18440,6 +18648,120 @@ mod tests {
     /// admitted every generation) kept BOTH vectors and `semantic_locate`
     /// returned the entity twice with two distinct cosine scores. Discriminating:
     /// FAILS on the old all-revisions truth (evicts 0), PASSES on head-only truth.
+    /// FIR-3096. A salvage that runs while an embed pass is only partway
+    /// through must not discard the vectors that pass has already produced.
+    ///
+    /// `reconcile_salvaged_vector_index` retains an `Entity(E)` key only when
+    /// `EntityRevision(head_of_E)` is also in the index, on the premise that a
+    /// content edit always mints a new head revision, so a head without one
+    /// predates the entity's current content. That premise does not hold DURING
+    /// a pass. `embed_sort_key_for` ranks every live entity tier ahead of
+    /// `embed_tier::REVISION`, so a pass embeds all live entities first and
+    /// revision keys last; midway the index holds entity vectors and no revision
+    /// vectors at all. The rule reads that expected drain order as staleness and
+    /// retires every one.
+    ///
+    /// Measured cost before this test existed: a mid-pass reopen retired 940 and
+    /// then 5,555 vectors on the demo's React store, and a hiredis run performed
+    /// 1,677 embeds to fill a 1,485-vector store. The index is not stale here,
+    /// it is young, and the two are not the same thing.
+    ///
+    /// Discriminating: today this retains 0 of 2 and both assertions fail.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn salvage_keeps_entity_vectors_from_a_pass_that_has_not_reached_revisions() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity_with_id(0xd0, "drained_first");
+        let b = test_entity_with_id(0xd1, "drained_second");
+        apply_init_change(&graph, 0x01, &[a.clone(), b.clone()]);
+
+        // Exactly the state a pass reaches after its entity tiers and before its
+        // revision tier: both live entities embedded, no revision key yet.
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(a.id), &[1.0f32, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(b.id), &[0.0f32, 1.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+
+        // Control: the chains exist, so the rule's lookup is exercised rather
+        // than skipped by an entity that simply has no revision history.
+        {
+            let ent = graph.entities.read();
+            for id in [a.id, b.id] {
+                assert!(
+                    ent.entity_revisions
+                        .get(&id)
+                        .is_some_and(|revs| !revs.is_empty()),
+                    "the test state must give each entity a revision chain"
+                );
+            }
+        }
+
+        let stats = graph.reconcile_salvaged_vector_index();
+
+        assert_eq!(
+            stats.retired_stale_entity_heads, 0,
+            "a pass that has not reached its revision tier has produced no \
+             staleness signal; retiring its entity vectors discards good work"
+        );
+        assert_eq!(
+            stats.retained, 2,
+            "both entity vectors must survive a salvage that runs mid-pass"
+        );
+    }
+
+    /// The control on the guard above: once an index holds revision vectors, the
+    /// presence test is evidence again and must still retire a head whose own
+    /// head revision has none. Without this, the FIR-3096 guard could be widened
+    /// to "never retire a head" and nothing would notice.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn salvage_still_retires_a_stale_head_once_the_index_holds_revision_proof() {
+        let graph = InMemoryGraph::new();
+        let proven = test_entity_with_id(0xd2, "proven");
+        let stale = test_entity_with_id(0xd3, "stale");
+        apply_init_change(&graph, 0x01, &[proven.clone(), stale.clone()]);
+
+        let (proven_head, stale_head) = {
+            let ent = graph.entities.read();
+            let head = |id: &EntityId| ent.entity_revisions.get(id).expect("chain")[0].revision_id;
+            (head(&proven.id), head(&stale.id))
+        };
+
+        // A finished-pass index: both heads, but only one head revision. The
+        // index therefore HOLDS revision proof, so the test is informative and
+        // `stale` must be retired while `proven` survives.
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(proven.id), &[1.0f32, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(stale.id), &[0.0f32, 1.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(proven_head), &[1.0f32, 0.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+        assert_ne!(
+            proven_head, stale_head,
+            "the two heads must be distinct keys"
+        );
+
+        let stats = graph.reconcile_salvaged_vector_index();
+
+        assert_eq!(
+            stats.retired_stale_entity_heads, 1,
+            "a head with no revision proof must still be retired when the index has proof to give"
+        );
+        let vi = graph.vector_index.lock().clone().expect("index");
+        assert!(
+            vi.contains_retrievable(&RetrievalKey::Entity(proven.id)),
+            "the proven head must survive"
+        );
+        assert!(
+            !vi.contains_retrievable(&RetrievalKey::Entity(stale.id)),
+            "the unproven head must be retired"
+        );
+    }
+
     #[cfg(feature = "vector")]
     #[test]
     fn live_reembed_retires_superseded_revision_vector() {
@@ -19880,7 +20202,12 @@ mod tests {
     /// that silently inverts any rung must fail here. Canonical order, earliest
     /// embed first:
     ///   PUBLIC_API < PUBLIC_SOURCE < CRATE_SOURCE < INTERNAL_SOURCE
-    ///   < PRIVATE_SOURCE < REVISION < TEST < DOCS < OTHER
+    ///   < PRIVATE_SOURCE < TEST < DOCS < OTHER < REVISION
+    ///
+    /// REVISION is last, after every live tier rather than only after live
+    /// source. A revision carries its live entity's vector, and that carry only
+    /// fires once the entity itself is in the index, so a revision that drained
+    /// before its own entity paid a full forward pass it did not need.
     #[cfg(feature = "vector")]
     #[test]
     fn entity_embed_tier_lattice_is_pinned_public_api_first_generated_last() {
@@ -19980,20 +20307,40 @@ mod tests {
         }
 
         // The full lattice is strictly ordered, earliest-embed first. REVISION
-        // is not produced by entity_embed_tier (it is assigned to historical
-        // revision keys in embed_sort_key_for) but is pinned in the chain so the
-        // overall ordering contract is encoded in one place.
+        // is not produced by entity_embed_tier (it is assigned to revision keys
+        // in embed_sort_key_for) but is pinned in the chain so the overall
+        // ordering contract is encoded in one place.
         assert!(
             embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE
                 && embed_tier::PUBLIC_SOURCE < embed_tier::CRATE_SOURCE
                 && embed_tier::CRATE_SOURCE < embed_tier::INTERNAL_SOURCE
                 && embed_tier::INTERNAL_SOURCE < embed_tier::PRIVATE_SOURCE
-                && embed_tier::PRIVATE_SOURCE < embed_tier::REVISION
-                && embed_tier::REVISION < embed_tier::TEST
+                && embed_tier::PRIVATE_SOURCE < embed_tier::TEST
                 && embed_tier::TEST < embed_tier::DOCS
-                && embed_tier::DOCS < embed_tier::OTHER,
-            "tier lattice must stay strictly ordered public-API → generated"
+                && embed_tier::DOCS < embed_tier::OTHER
+                && embed_tier::OTHER < embed_tier::REVISION,
+            "tier lattice must stay strictly ordered public-API → revision"
         );
+
+        // The rung the carry depends on: EVERY live tier embeds before any
+        // revision key. Without this a test, docs, generated or vendored
+        // entity's head revision drained before the entity itself, found no
+        // vector to carry, and paid a second forward pass for the same object.
+        for live in [
+            embed_tier::PUBLIC_API,
+            embed_tier::PUBLIC_SOURCE,
+            embed_tier::CRATE_SOURCE,
+            embed_tier::INTERNAL_SOURCE,
+            embed_tier::PRIVATE_SOURCE,
+            embed_tier::TEST,
+            embed_tier::DOCS,
+            embed_tier::OTHER,
+        ] {
+            assert!(
+                live < embed_tier::REVISION,
+                "live tier {live} must embed before any revision key"
+            );
+        }
     }
 
     #[cfg(feature = "vector")]
@@ -20502,6 +20849,254 @@ mod tests {
         );
     }
 
+    /// Seed a graph holding one live entity and its single head revision, with
+    /// the entity's vector already in a 2-dimension index. This is the state
+    /// every `kin init` store reaches partway through its first embed pass:
+    /// live entities embed first, their revisions drain afterwards.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn graph_with_embedded_entity_and_head_revision(
+        entity: &Entity,
+        entity_vector: &[f32],
+    ) -> (InMemoryGraph, EntityRevisionId) {
+        let g = InMemoryGraph::new();
+        apply_init_change(&g, 0x01, std::slice::from_ref(entity));
+        let head = {
+            let ent = g.entities.read();
+            let chain = ent
+                .entity_revisions
+                .get(&entity.id)
+                .expect("entity must have a revision chain");
+            assert_eq!(chain.len(), 1, "one change means exactly one revision");
+            chain[0].revision_id
+        };
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable_with_producers(
+            RetrievalKey::Entity(entity.id),
+            entity_vector,
+            &EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+        )
+        .unwrap();
+        *g.vector_index.lock() = Some(Arc::new(vi));
+        (g, head)
+    }
+
+    /// Queue exactly one key and prepare it.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn prepare_one(g: &InMemoryGraph, key: RetrievalKey) -> PreparedEmbedBatch {
+        let mut queue = g.embedding_queue.lock();
+        queue.clear();
+        queue.insert(key, EmbedRecency::Backfill);
+        drop(queue);
+        g.prepare_pending_embedding_batch(16)
+    }
+
+    /// The carry, and the work it removes.
+    ///
+    /// A `kin init` store gives every entity TWO retrieval keys, `Entity(E)` and
+    /// `EntityRevision(head)`, and embedded both. Measured on a 54-file
+    /// kernel/sched subject: 3,870 entities, 7,741 vectors, 2.00 per entity.
+    /// Both keys resolve to the SAME live entity, so the second forward pass
+    /// bought a near-duplicate of a vector the index already held, and on the
+    /// live React store that second pass is half of a run measured at 8.0
+    /// vectors per second.
+    ///
+    /// Discriminating: without the carry, `keys` holds the revision key and
+    /// `carried` is empty, so both assertions below fail. Falsified by making
+    /// `carry_source_for_head_revision` return `None`.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn head_revision_carries_its_live_entitys_vector_instead_of_embedding_again() {
+        let entity = test_entity_with_id(0xc0, "carry_target");
+        let entity_vector = [0.6f32, 0.8];
+        let (g, head) = graph_with_embedded_entity_and_head_revision(&entity, &entity_vector);
+        let revision_key = RetrievalKey::EntityRevision(head);
+
+        let prepared = prepare_one(&g, revision_key);
+        assert!(
+            prepared.keys.is_empty() && prepared.texts.is_empty(),
+            "a carried head revision must not be handed to the embedder"
+        );
+        assert_eq!(
+            prepared.carried,
+            vec![(revision_key, RetrievalKey::Entity(entity.id))],
+            "the carry must name the live entity key as its source"
+        );
+        assert!(
+            !prepared.is_empty(),
+            "a carry-only batch is work; reporting it empty stops the drive loop with a full queue"
+        );
+
+        // Applying the carry writes the ENTITY's vector under the revision key
+        // and counts it, so persist reports work the drive loop can see.
+        //
+        // Applied through `apply_carried_vectors` rather than through
+        // `persist_embedded_batch`: that wrapper calls `get_vector_index`, which
+        // builds a real embedder and resets any index whose dimension does not
+        // match it. This test must run with no model on disk and no network, so
+        // it drives the stage that does the copying.
+        let vi = g.vector_index.lock().clone().expect("seeded index");
+        let (copied, lost) = apply_carried_vectors(&vi, &prepared.carried).unwrap();
+        assert_eq!(copied, 1, "the carried key counts as persisted work");
+        assert!(
+            lost.is_empty(),
+            "the source was present, so nothing is lost"
+        );
+        assert_eq!(
+            vi.get_retrievable(&revision_key),
+            Some(entity_vector.to_vec()),
+            "the head revision must hold its live entity's vector, byte for byte"
+        );
+    }
+
+    /// A carry whose source disappeared between prepare and persist is reported,
+    /// never silently dropped. Dropping it would leave the key out of the index
+    /// with nothing left to notice it, and the next pass would render that
+    /// shortfall as ordinary pending work of unknown origin.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn carried_vectors_report_a_source_that_vanished_before_persist() {
+        let vi = VectorIndex::new(2).unwrap();
+        let present = EntityId(uuid::Uuid::from_u128(0xc5));
+        let vanished = EntityId(uuid::Uuid::from_u128(0xc6));
+        vi.upsert_retrievable(RetrievalKey::Entity(present), &[1.0f32, 0.0])
+            .unwrap();
+        let landed =
+            RetrievalKey::EntityRevision(EntityRevisionId::from_hash(Hash256::from_bytes([1; 32])));
+        let orphan =
+            RetrievalKey::EntityRevision(EntityRevisionId::from_hash(Hash256::from_bytes([2; 32])));
+
+        let (copied, lost) = apply_carried_vectors(
+            &vi,
+            &[
+                (landed, RetrievalKey::Entity(present)),
+                (orphan, RetrievalKey::Entity(vanished)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(copied, 1, "only the carry with a live source lands");
+        assert_eq!(lost, vec![orphan], "the sourceless carry must be named");
+        assert_eq!(vi.get_retrievable(&landed), Some(vec![1.0f32, 0.0]));
+        assert!(
+            vi.get_retrievable(&orphan).is_none(),
+            "a carry with no source must write nothing at all"
+        );
+    }
+
+    /// The three refusals that keep the carry honest, plus the fourth that keeps
+    /// it from firing before there is anything to carry. Each arm must fall back
+    /// to a real forward pass rather than copy a vector that is not this
+    /// revision's.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn head_revision_carry_refuses_stale_superseded_retired_and_unembedded_sources() {
+        let entity_vector = [0.6f32, 0.8];
+
+        // 1. Fingerprint drift: the live entity has moved on, so its vector is
+        //    not a description of this revision.
+        {
+            let entity = test_entity_with_id(0xc1, "drifted");
+            let (g, head) = graph_with_embedded_entity_and_head_revision(&entity, &entity_vector);
+            {
+                // Through the truth-write guard rather than the raw lock: the
+                // guard is the only writer, so the truth epoch stays a complete
+                // record of truth movement. `the_entity_write_guard_is_the_only_writer`
+                // counts raw acquisitions in this file's own text, so even a
+                // comment must not spell one.
+                let mut ent = g.entities_write();
+                let live = ent.entities.get_mut(&entity.id).expect("live entity");
+                live.fingerprint.behavior_hash = Hash256::from_bytes([9; 32]);
+            }
+            let prepared = prepare_one(&g, RetrievalKey::EntityRevision(head));
+            assert!(
+                prepared.carried.is_empty() && prepared.keys.len() == 1,
+                "a revision whose fingerprint no longer matches its live entity must be embedded"
+            );
+        }
+
+        // 2. Superseded generation: only the HEAD revision is retrieval truth,
+        //    and `prune_orphaned_vectors` evicts the rest, so carrying into an
+        //    older generation would write a vector about to be reclaimed.
+        //
+        //    The two generations here carry the SAME fingerprint triple on
+        //    purpose. A superseded revision that had also drifted is refused one
+        //    step earlier by the fingerprint test, and an arm built that way
+        //    stays green with the head test deleted, proving the wrong guard.
+        //    A pure move is the real shape: `entity_matches_revision` appends a
+        //    generation on the changed `file_origin` while all three hashes stay
+        //    equal, so only the head test can refuse it.
+        {
+            let entity = test_entity_with_id(0xc2, "superseded");
+            let mut moved = entity.clone();
+            moved.file_origin = Some(FilePathId::new("src/moved.rs"));
+            let g = InMemoryGraph::new();
+            apply_init_change(&g, 0x01, std::slice::from_ref(&entity));
+            apply_init_change(&g, 0x02, std::slice::from_ref(&moved));
+            let (rev_old, rev_head) = {
+                let ent = g.entities.read();
+                let chain = ent.entity_revisions.get(&entity.id).expect("chain");
+                assert_eq!(chain.len(), 2, "two changes must append two revisions");
+                (chain[0].revision_id, chain[1].revision_id)
+            };
+            assert_ne!(rev_old, rev_head, "the generations must be distinct keys");
+            let vi = VectorIndex::new(2).unwrap();
+            vi.upsert_retrievable(RetrievalKey::Entity(entity.id), &entity_vector)
+                .unwrap();
+            *g.vector_index.lock() = Some(Arc::new(vi));
+            let prepared = prepare_one(&g, RetrievalKey::EntityRevision(rev_old));
+            assert!(
+                prepared.carried.is_empty() && prepared.keys.len() == 1,
+                "a superseded revision must be embedded, never carried"
+            );
+            // Control: the head of the same chain, same fingerprint, IS carried.
+            // Without it this arm would pass on a carry that never fires at all.
+            let head_prepared = prepare_one(&g, RetrievalKey::EntityRevision(rev_head));
+            assert_eq!(
+                head_prepared.carried,
+                vec![(
+                    RetrievalKey::EntityRevision(rev_head),
+                    RetrievalKey::Entity(entity.id)
+                )],
+                "the head of the same chain must still carry"
+            );
+        }
+
+        // 3. Retired entity: the revision key outlives retirement by design, and
+        //    the live arm of `resolve_retrieval_key` refuses it. Carrying would
+        //    reintroduce the retired entity into the index it was evicted from.
+        {
+            let entity = test_entity_with_id(0xc3, "retired");
+            let (g, head) = graph_with_embedded_entity_and_head_revision(&entity, &entity_vector);
+            {
+                let mut ent = g.entities_write();
+                ent.entities.remove(&entity.id);
+            }
+            let prepared = prepare_one(&g, RetrievalKey::EntityRevision(head));
+            assert!(
+                prepared.carried.is_empty(),
+                "a retired entity must not be resurrected through its revision key"
+            );
+        }
+
+        // 4. Nothing to carry yet: the entity has no vector, so the revision has
+        //    to be embedded like any other text.
+        {
+            let entity = test_entity_with_id(0xc4, "unembedded");
+            let g = InMemoryGraph::new();
+            apply_init_change(&g, 0x01, std::slice::from_ref(&entity));
+            let head = {
+                let ent = g.entities.read();
+                ent.entity_revisions.get(&entity.id).expect("chain")[0].revision_id
+            };
+            *g.vector_index.lock() = Some(Arc::new(VectorIndex::new(2).unwrap()));
+            let prepared = prepare_one(&g, RetrievalKey::EntityRevision(head));
+            assert!(
+                prepared.carried.is_empty() && prepared.keys.len() == 1,
+                "with no source vector the revision must still be embedded"
+            );
+        }
+    }
+
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     #[test]
     fn prepare_pending_embedding_batch_tops_up_with_queued_artifacts() {
@@ -20653,6 +21248,7 @@ mod tests {
         let empty = PreparedEmbedBatch {
             keys: Vec::new(),
             texts: Vec::new(),
+            carried: Vec::new(),
             recency: hashbrown::HashMap::new(),
         };
         assert!(g.embed_prepared_batch(&empty).unwrap().items.is_empty());
@@ -20737,6 +21333,7 @@ mod tests {
             PreparedEmbedBatch {
                 keys,
                 texts,
+                carried: Vec::new(),
                 recency,
             }
         }
@@ -20832,6 +21429,7 @@ mod tests {
                     PreparedEmbedBatch {
                         texts: keys.iter().map(|k| format!("{k:?}")).collect(),
                         keys,
+                        carried: Vec::new(),
                         recency,
                     }
                 };
