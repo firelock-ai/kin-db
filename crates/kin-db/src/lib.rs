@@ -29,7 +29,7 @@ pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
 pub use search::{resolve_roles, ScoredHit, TextIndex};
 pub use storage::format::{
     CompactionStats, GraphSnapshot, MaterializedGraphRefusal, MaterializedGraphSection,
-    WorkspaceGraphFacts, MATERIALIZED_GRAPH_SCHEMA_VERSION,
+    SnapshotFrameShape, WorkspaceGraphFacts, MATERIALIZED_GRAPH_SCHEMA_VERSION,
 };
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
@@ -47,7 +47,7 @@ pub use storage::{
 pub use storage::{
     load_recovered_snapshot, AuthorityPayloadStats, GcsFullAuthorityEnvelopeCompatibility,
     Generation, LocalFileBackend, LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,
-    PersistedVectorArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
+    PersistedVectorArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor, SnapshotPayload,
     SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
     StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
     VectorArtifactLoadOutcome, VectorArtifactSaveOutcome, VectorRepositoryIdentity,

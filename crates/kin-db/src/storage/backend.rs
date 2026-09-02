@@ -1956,6 +1956,63 @@ pub(crate) fn checked_next_generation(
     })
 }
 
+/// A frame that was streamed into its staging leaf, and the mapping the gates
+/// above it read.
+///
+/// The mapping is held only until the install, and released there rather than
+/// dropped at the end of the scope, because a file with a live mapping cannot
+/// be renamed on Windows. `take_for_install` is the one place that releases it,
+/// which is also the one place that consumes the candidate, so the two can
+/// never drift apart.
+struct StagedInstall {
+    staged: Option<mmap::StagedCandidate>,
+    mapping: Option<memmap2::Mmap>,
+}
+
+impl StagedInstall {
+    /// The staged bytes, which are the bytes that will be installed.
+    fn bytes(&self) -> &[u8] {
+        self.mapping.as_deref().unwrap_or(&[])
+    }
+
+    /// Release the mapping and hand over the candidate to be renamed into place.
+    fn take_for_install(&mut self) -> Result<mmap::StagedCandidate, KinDbError> {
+        self.mapping = None;
+        self.staged.take().ok_or_else(|| {
+            KinDbError::StorageError(
+                "a staged snapshot frame was installed twice; refusing the second".to_string(),
+            )
+        })
+    }
+
+    /// Whatever is left when the save did not install it.
+    fn into_unused(self) -> Option<mmap::StagedCandidate> {
+        self.staged
+    }
+}
+
+/// Where the bytes of a snapshot being installed live.
+///
+/// A snapshot frame is the size of the repository, 2.24 GiB at the commit of a
+/// full VS Code tree, so where it lives is the whole question at persist time
+/// rather than a detail of the call (FIR-3064). Every gate reads a slice
+/// either way.
+enum SnapshotSource<'a> {
+    /// Bytes the caller assembled and holds on the heap.
+    Buffered(&'a [u8]),
+    /// A candidate already streamed into its staging leaf and mapped.
+    Staged(&'a mut StagedInstall),
+}
+
+impl SnapshotSource<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Buffered(data) => data,
+            Self::Staged(install) => install.bytes(),
+        }
+    }
+}
+
 /// The file a snapshot's bytes were read through, kept open.
 ///
 /// An open that leaves the change map on disk drops `snapshot_bytes` and
@@ -1969,10 +2026,76 @@ pub struct SnapshotFileSource {
     pub(crate) display: String,
 }
 
+/// The persisted snapshot bytes one recovery selected.
+///
+/// Recovery hashes these bytes and decodes the elements it needs from them, and
+/// both read a slice while the bytes stay whole. On a converted repository that
+/// is the highest moment of an authority open, so putting the bytes on the heap
+/// first stands a second copy of the store beside the decode it feeds.
+///
+/// A backend holding the snapshot in a file hands back a mapping, which costs
+/// no anonymous memory and leaves clean file pages the kernel may drop under
+/// pressure rather than swap. A backend with no file to map, or one that
+/// already has the bytes in hand, owns them exactly as before. Every reader
+/// sees `[u8]`.
+///
+/// Independent of [`SnapshotFileSource`] beside it, which exists so a reader
+/// can come back for one element after these bytes are gone. This is about how
+/// the bytes are held while they are here.
+pub enum SnapshotPayload {
+    /// Bytes this process allocated, for a backend with nothing to map.
+    Owned(Vec<u8>),
+    /// A read-only mapping of the persisted snapshot leaf.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::fmt::Debug for SnapshotPayload {
+    /// Its length and its shape, never its bytes: a converted repository's
+    /// snapshot is gigabytes, and a derived `Debug` puts all of it in one log
+    /// line the moment anything above formats the authority.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (shape, len) = match self {
+            Self::Owned(bytes) => ("owned", bytes.len()),
+            Self::Mapped(mapping) => ("mapped", mapping.len()),
+        };
+        formatter
+            .debug_struct("SnapshotPayload")
+            .field("shape", &shape)
+            .field("len", &len)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for SnapshotPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(mapping) => mapping,
+        }
+    }
+}
+
+impl From<Vec<u8>> for SnapshotPayload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+/// Required, and not merely convenient: `Sha256::digest(&payload)` resolves
+/// through `AsRef<[u8]>` rather than through `Deref`, so recovery cannot hash
+/// the snapshot without it. A grep for `.as_ref()` does not see that call.
+impl AsRef<[u8]> for SnapshotPayload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 /// Atomic persistence authority for a snapshot plus its acknowledged journal.
 #[derive(Debug)]
 pub struct SnapshotAuthority {
-    pub snapshot_bytes: Vec<u8>,
+    pub snapshot_bytes: SnapshotPayload,
     /// Where `snapshot_bytes` can be read again, when the backend has a file
     /// to hand back. `None` means every decode of this authority is whole.
     pub snapshot_source: Option<SnapshotFileSource>,
@@ -2615,7 +2738,7 @@ pub trait StorageBackend: Send + Sync {
         Ok(self
             .load_snapshot(repo_id)?
             .map(|(snapshot_bytes, generation)| SnapshotAuthority {
-                snapshot_bytes,
+                snapshot_bytes: snapshot_bytes.into(),
                 snapshot_source: None,
                 snapshot_generation: generation,
                 head_generation: generation,
@@ -2660,6 +2783,33 @@ pub trait StorageBackend: Send + Sync {
     ) -> SnapshotSaveOutcome {
         let _ = history_validator_version;
         self.save_snapshot_classified(repo_id, data, expected)
+    }
+
+    /// [`save_snapshot_validated`](Self::save_snapshot_validated) for a frame
+    /// the caller does not hold and should not have to.
+    ///
+    /// `produce` writes one complete snapshot frame to the writer it is given
+    /// and reports the frame's length and sha256, which it measured while
+    /// writing. A backend with a file to stream into never materializes the
+    /// frame at all: on a full VS Code tree that buffer is 2.24 GiB at the
+    /// commit and 3.59 GiB at the post-init graph-section rewrite, and it
+    /// stands on the heap at the highest moment of a conversion (FIR-3064).
+    ///
+    /// The default buffers and takes the ordinary path, which is correct for a
+    /// backend with nowhere to stream: a hosted object store and a SQL row both
+    /// need the bytes in hand before they can send them anywhere.
+    fn save_snapshot_streamed(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let mut buffer: Vec<u8> = Vec::new();
+        if let Err(error) = produce(&mut buffer) {
+            return SnapshotSaveOutcome::NotCommitted(error);
+        }
+        self.save_snapshot_validated(repo_id, &buffer, expected, history_validator_version)
     }
 
     /// Bind a validation record to the snapshot a repository already holds,
@@ -3954,27 +4104,79 @@ impl LocalSurfaceCapability {
         mmap::atomic_write_bytes_no_magic_at(&self.directory, leaf, &self.display_path, data)
     }
 
+    /// Stream a candidate for `leaf` into its own staging file, hashing as it
+    /// writes, and hand back what it wrote.
+    ///
+    /// The counterpart of [`atomic_write`](Self::atomic_write) for a payload
+    /// nobody should hold: a snapshot frame is the size of the repository, so
+    /// buffering one to pass a slice here is the largest allocation a
+    /// conversion makes.
+    fn stage_streamed(
+        &self,
+        leaf: &Path,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+    ) -> Result<mmap::StagedCandidate, KinDbError> {
+        Self::require_leaf(leaf)?;
+        mmap::capability_stage_recovery_candidate_streamed_at(
+            &self.directory,
+            leaf,
+            &self.display_path,
+            produce,
+        )
+    }
+
+    /// Map a staged candidate read-only, so the bytes about to be installed are
+    /// the bytes the caller's gates read.
+    fn map_staged(&self, staged: &mmap::StagedCandidate) -> Result<memmap2::Mmap, KinDbError> {
+        mmap::capability_map_staged_candidate_at(&self.directory, staged, &self.display_path)
+    }
+
+    /// Drop a staged candidate that will not be installed.
+    fn discard_staged(&self, staged: mmap::StagedCandidate) {
+        staged.discard(&self.directory);
+    }
+
+    /// Install a staged candidate at `leaf` through the same marker, rename and
+    /// promotion sequence a buffered write goes through.
+    fn install_staged(&self, leaf: &Path, staged: mmap::StagedCandidate) -> Result<(), KinDbError> {
+        Self::require_leaf(leaf)?;
+        match mmap::atomic_write_staged_outcome_at(
+            &self.directory,
+            leaf,
+            &self.display_path,
+            staged,
+        )? {
+            mmap::AtomicWriteOutcome::Durable => Ok(()),
+            mmap::AtomicWriteOutcome::InstalledButUnconfirmed(error) => Err(error),
+        }
+    }
+
     fn read_regular(&self, leaf: &Path, role: &str) -> Result<Vec<u8>, KinDbError> {
         Self::require_leaf(leaf)?;
         mmap::read_regular_file_at(&self.directory, leaf, &self.display_path, role)
     }
 
-    /// [`read_regular`](Self::read_regular), also returning the open handle
-    /// the bytes came through, so part of them can be read again later.
-    fn read_regular_keeping_handle(
+    /// [`read_regular`](Self::read_regular), mapped rather than copied, also
+    /// returning the open handle so part of the bytes can be read again later.
+    ///
+    /// This replaced a copying twin rather than sitting beside it. Everything
+    /// that reads a persisted snapshot either hashes it or decodes elements out
+    /// of it, and both take a slice, so the copy served no reader and cost a
+    /// whole store while the decode it fed was running.
+    fn map_regular_keeping_handle(
         &self,
         leaf: &Path,
         role: &str,
-    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
+    ) -> Result<(memmap2::Mmap, SnapshotFileSource), KinDbError> {
         Self::require_leaf(leaf)?;
-        let (bytes, file, display) = mmap::read_regular_file_keeping_handle_at(
+        let (mapping, file, display) = mmap::map_regular_file_keeping_handle_at(
             &self.directory,
             leaf,
             &self.display_path,
             role,
         )?;
         Ok((
-            bytes,
+            mapping,
             SnapshotFileSource {
                 file: std::sync::Arc::new(file),
                 display: display.display().to_string(),
@@ -5457,6 +5659,16 @@ impl LocalFileBackend {
         "snapshots"
     }
 
+    /// The destination name a streamed frame stages against.
+    ///
+    /// A staging leaf is derived from a destination leaf, and the generation a
+    /// save lands on is only known after its gates have run, so the frame is
+    /// streamed against this fixed name and the promotion renames it to the
+    /// versioned leaf. `clear_superseded_snapshots_unlocked` keeps only
+    /// `<20-digit generation>.kndb` and skips everything else, so a staging leaf
+    /// is invisible to it either way.
+    const STAGED_SNAPSHOT_LEAF: &'static str = "snapshot.staging";
+
     #[cfg(test)]
     fn versioned_snapshot_path(&self, repo_id: &str, generation: Generation) -> PathBuf {
         self.snapshots_dir(repo_id)
@@ -6805,7 +7017,7 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
-    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
+    ) -> Result<(SnapshotPayload, SnapshotFileSource), KinDbError> {
         let repo_id = &namespace.repo_id;
         let snapshots = namespace
             .surface(Self::snapshots_surface_name(), false)?
@@ -6815,8 +7027,13 @@ impl LocalFileBackend {
                 ))
             })?;
         let leaf = Path::new(&record.snapshot_file);
+        // Mapped rather than read: everything above this hashes the bytes or
+        // decodes elements out of them, and both take a slice. Copying them
+        // onto the heap first stood a whole second copy of the store beside the
+        // decode it feeds, which is where an authority open peaks.
         let (snapshot_bytes, source) =
-            snapshots.read_regular_keeping_handle(leaf, "authoritative snapshot")?;
+            snapshots.map_regular_keeping_handle(leaf, "authoritative snapshot")?;
+        let snapshot_bytes = SnapshotPayload::Mapped(snapshot_bytes);
         let digest = Self::snapshot_digest(&snapshot_bytes);
         if digest != record.snapshot_sha256 {
             return Err(KinDbError::StorageError(format!(
@@ -7063,7 +7280,7 @@ impl LocalFileBackend {
     fn save_snapshot_unlocked(
         &self,
         namespace: &LocalRepositoryCapability,
-        data: &[u8],
+        mut source: SnapshotSource<'_>,
         expected_gen: Generation,
         history_validator_version: Option<u32>,
     ) -> Result<Generation, KinDbError> {
@@ -7086,7 +7303,7 @@ impl LocalFileBackend {
         let current_gen = current
             .as_ref()
             .map_or(GENERATION_INIT, |authority| authority.head_generation);
-        let requested_digest = Self::snapshot_digest(data);
+        let requested_digest = Self::snapshot_digest(source.bytes());
         if let Some(record) = current_record.as_ref() {
             let retry_generation = expected_gen.checked_add(1);
             if retry_generation == Some(record.head_generation)
@@ -7160,12 +7377,12 @@ impl LocalFileBackend {
             // conversion's single largest allocation, about 855 MiB, and it set
             // the whole run's peak because it happens last, while every retained
             // byte underneath it is still live (FIR-2654).
-            Some(_) => GraphSnapshot::prove_pre_validated_round_trip(data)?,
+            Some(_) => GraphSnapshot::prove_pre_validated_round_trip(source.bytes())?,
             // Unvalidated bytes still owe the semantic admission pass, which
             // walks the assembled snapshot. That obligation needs the value, so
             // this arm keeps the full decode.
             None => {
-                let _snapshot = GraphSnapshot::from_bytes(data)?;
+                let _snapshot = GraphSnapshot::from_bytes(source.bytes())?;
             }
         };
         let new_gen = checked_next_generation(current_gen, "local snapshot")?;
@@ -7177,7 +7394,20 @@ impl LocalFileBackend {
                 ))
             })?;
         let versioned_leaf = Self::versioned_snapshot_leaf(new_gen);
-        snapshots.atomic_write(&versioned_leaf, data)?;
+        // The bytes every gate above read are the bytes installed here. A
+        // buffered source writes them out; a staged source has already written
+        // them and is renamed into place, so nothing is copied twice and the
+        // digest, the round-trip proof and the destination cannot disagree.
+        //
+        // The mapping is released before the rename, deliberately: a file with
+        // a live mapping cannot be renamed on Windows, and the nightly Windows
+        // job is where that would be discovered.
+        match &mut source {
+            SnapshotSource::Buffered(data) => snapshots.atomic_write(&versioned_leaf, data)?,
+            SnapshotSource::Staged(install) => {
+                snapshots.install_staged(&versioned_leaf, install.take_for_install()?)?
+            }
+        }
 
         #[cfg(test)]
         if self
@@ -7258,10 +7488,69 @@ impl LocalFileBackend {
         };
         self.save_snapshot_unlocked(
             &lock.namespace,
-            data,
+            SnapshotSource::Buffered(data),
             expected_gen,
             history_validator_version,
         )
+    }
+
+    /// [`save_snapshot_locked`](Self::save_snapshot_locked) for a frame nobody
+    /// holds.
+    ///
+    /// The frame is streamed into its staging leaf under the lock, mapped, and
+    /// then taken through the identical gate sequence: the same digest, the
+    /// same idempotent-retry test, the same generation check, the same
+    /// round-trip proof and the same promotion. What changes is that those
+    /// gates read the file the install will rename rather than a copy of it on
+    /// the heap.
+    ///
+    /// A staged candidate that no install consumed is removed here. A leftover
+    /// unique staging leaf is disk rather than authority, because recovery only
+    /// ever looks at the deterministic `.tmp` name and its marker, but leaving
+    /// a repository-sized file behind on every refused save is not a cost this
+    /// path may pay.
+    fn save_snapshot_streamed_locked(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
+        let namespace = &lock.namespace;
+        let snapshots = namespace
+            .surface(Self::snapshots_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "snapshot surface disappeared while creating repo {repo_id}"
+                ))
+            })?;
+        let staged = snapshots.stage_streamed(Path::new(Self::STAGED_SNAPSHOT_LEAF), produce)?;
+        let mapping = match snapshots.map_staged(&staged) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                snapshots.discard_staged(staged);
+                return Err(error);
+            }
+        };
+        let mut install = StagedInstall {
+            staged: Some(staged),
+            mapping: Some(mapping),
+        };
+        let outcome = self.save_snapshot_unlocked(
+            namespace,
+            SnapshotSource::Staged(&mut install),
+            expected_gen,
+            history_validator_version,
+        );
+        if let Some(unused) = install.into_unused() {
+            snapshots.discard_staged(unused);
+        }
+        outcome
     }
 
     /// Append one authority frame while the caller holds this repository's
@@ -7413,13 +7702,13 @@ impl LocalFileBackend {
         };
         let generation = self.save_snapshot_unlocked(
             &lock.namespace,
-            data,
+            SnapshotSource::Buffered(data),
             expected_gen,
             history_validator_version,
         )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
-            snapshot_bytes: data.to_vec(),
+            snapshot_bytes: data.to_vec().into(),
             snapshot_source: None,
             snapshot_generation: generation,
             head_generation: generation,
@@ -7757,9 +8046,12 @@ impl StorageBackend for LocalFileBackend {
     }
 
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        Ok(self
-            .load_snapshot_authority(repo_id)?
-            .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+        Ok(self.load_snapshot_authority(repo_id)?.map(|authority| {
+            (
+                authority.snapshot_bytes.to_vec(),
+                authority.snapshot_generation,
+            )
+        }))
     }
 
     fn save_source_blob(
@@ -8142,6 +8434,31 @@ impl StorageBackend for LocalFileBackend {
         match self.save_snapshot_locked(
             repo_id,
             data,
+            expected_cursor.backend_generation(),
+            history_validator_version,
+        ) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
+            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+        }
+    }
+
+    /// This backend has a file to stream into, so it does, and the frame never
+    /// exists as one contiguous allocation.
+    fn save_snapshot_streamed(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot_streamed_locked(
+            repo_id,
+            produce,
             expected_cursor.backend_generation(),
             history_validator_version,
         ) {
@@ -8738,16 +9055,110 @@ mod tests {
         files
     }
 
+    /// Whether a message is the backend refusing to serve a namespace that is
+    /// not the one it retained.
+    ///
+    /// Three wordings, because the refusal has three shapes and which one a
+    /// caller gets is not always its choice. A replacement under the SAME id
+    /// reads as the namespace having changed. The retained inode reached under
+    /// a SECOND id reads as an identity collision, which is what
+    /// `LocalFileBackend::list_repos` reports when it walks the renamed
+    /// directory before the replacement one.
+    ///
+    /// That order is the filesystem's, not the test's, and it is stable on
+    /// neither: on 2026-09-02 the same commit passed on macOS and failed twice
+    /// on Linux with the collision wording, on a branch whose only change was a
+    /// new test file. Accepting one wording and not the other made a correct
+    /// refusal look like a defect once the directory hashed the other way.
+    ///
+    /// Deliberately still narrow. A generic IO failure names none of these, so
+    /// a test that stopped reaching the backend at all still fails here rather
+    /// than passing on any error at all.
+    #[cfg(unix)]
+    fn is_repository_namespace_refusal(message: &str) -> bool {
+        let names_the_namespace = message.contains("repository namespace")
+            || message.contains("repository surface")
+            || message.contains("retained storage namespace");
+        let names_the_refusal = message.contains("changed")
+            || message.contains("detached")
+            || message.contains("resolve to the same");
+        names_the_namespace && names_the_refusal
+    }
+
     #[cfg(unix)]
     fn assert_repository_namespace_rejected<T: std::fmt::Debug>(result: Result<T, KinDbError>) {
         let error = result.expect_err("a retained backend must reject a replacement repository");
         assert!(
-            (error.to_string().contains("repository namespace")
-                || error.to_string().contains("repository surface"))
-                && (error.to_string().contains("changed")
-                    || error.to_string().contains("detached")),
+            is_repository_namespace_refusal(&error.to_string()),
             "unexpected descendant-namespace error: {error}"
         );
+    }
+
+    /// The refusal predicate accepts every wording the backend actually emits
+    /// and refuses an unrelated failure.
+    ///
+    /// Both accepted strings are copied from the two sites that build them, so
+    /// this fails if either message is reworded without this being updated,
+    /// which is the point: the predicate is only as good as its agreement with
+    /// the code it reads.
+    #[cfg(unix)]
+    #[test]
+    fn the_namespace_refusal_predicate_accepts_both_wordings_and_nothing_else() {
+        assert!(is_repository_namespace_refusal(
+            "local repository namespace /tmp/x/repo-a changed while listing repositories"
+        ));
+        assert!(is_repository_namespace_refusal(
+            "repository ids \"repo-a-detached\" and \"repo-a\" resolve to the same retained \
+             storage namespace"
+        ));
+        assert!(is_repository_namespace_refusal(
+            "retained repository surface /tmp/x/repo-a/snapshots detached from its namespace"
+        ));
+        // The negative control. Without it this predicate could be widened to
+        // `true` and every caller would still pass.
+        assert!(!is_repository_namespace_refusal(
+            "failed to read /tmp/x/repo-a/authority.json: No such file or directory"
+        ));
+        assert!(!is_repository_namespace_refusal(
+            "generation mismatch for repo repo-a: expected 1, found 2"
+        ));
+    }
+
+    /// The retained inode, reached under a second name, is refused by identity.
+    ///
+    /// This is the branch `list_repos` takes when the filesystem hands it the
+    /// renamed directory first, and until this test existed it was reachable
+    /// only by that accident. Naming it directly makes it run on every platform
+    /// on every commit rather than when a directory happens to hash that way.
+    #[cfg(unix)]
+    #[test]
+    fn the_retained_namespace_is_refused_under_a_second_repository_id() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+
+        // Rename the directory the backend retained. Its inode is now reachable
+        // only under a second name, which is the state a listing walks into
+        // after a replacement swap.
+        std::fs::rename(
+            directory.path().join("repo-a"),
+            directory.path().join("repo-a-detached"),
+        )
+        .unwrap();
+
+        let error = backend
+            .repository_capability("repo-a-detached", false)
+            .expect_err("the retained namespace must not be servable under a second id");
+        assert!(
+            error
+                .to_string()
+                .contains("resolve to the same retained storage namespace"),
+            "the refusal must name the identity collision: {error}"
+        );
+        assert_repository_namespace_rejected::<()>(Err(error));
     }
 
     struct RecoveryFixtureBackend {
@@ -8761,7 +9172,7 @@ mod tests {
         fn load_recovery_state(&self, _repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
             Ok((
                 Some(SnapshotAuthority {
-                    snapshot_bytes: self.snapshot_bytes.clone(),
+                    snapshot_bytes: self.snapshot_bytes.clone().into(),
                     snapshot_source: None,
                     snapshot_generation: self.snapshot_generation,
                     head_generation: self.head_generation,
@@ -8837,7 +9248,7 @@ mod tests {
     #[test]
     fn default_snapshot_cursor_probe_uses_the_coherent_recovery_read() {
         let backend = RecoveryFixtureBackend {
-            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap().into(),
             snapshot_generation: 9,
             head_generation: 9,
             deltas: Vec::new(),
@@ -8849,7 +9260,7 @@ mod tests {
         );
 
         let malformed = RecoveryFixtureBackend {
-            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap().into(),
             snapshot_generation: 7,
             head_generation: 9,
             deltas: Vec::new(),
@@ -8908,7 +9319,7 @@ mod tests {
             (
                 "wrong-base",
                 RecoveryFixtureBackend {
-                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_bytes: snapshot_bytes.clone().into(),
                     snapshot_generation: 1,
                     head_generation: 2,
                     deltas: vec![(wrong_base, 2)],
@@ -8918,7 +9329,7 @@ mod tests {
             (
                 "duplicate",
                 RecoveryFixtureBackend {
-                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_bytes: snapshot_bytes.clone().into(),
                     snapshot_generation: 1,
                     head_generation: 3,
                     deltas: vec![(valid.clone(), 2), (valid.clone(), 2)],

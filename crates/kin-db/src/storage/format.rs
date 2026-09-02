@@ -210,6 +210,183 @@ fn stream_change_map(
     }
 }
 
+/// What a frame turned out to be once it was written.
+///
+/// A buffering writer learns these two facts by measuring the buffer it is
+/// holding. A streaming writer never holds one, so it has to carry them out
+/// itself, and they are exactly what the durability sequence needs: the
+/// recovery marker records a length and a sha256, and the authority record
+/// stores the same digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotFrameShape {
+    /// Bytes the whole frame occupies: header, body, checksum and any trailer.
+    pub byte_len: u64,
+    /// sha256 over those bytes, in the order they were written.
+    pub sha256: [u8; 32],
+}
+
+/// A writer that passes bytes through, hashes them, and counts them.
+///
+/// Two hashers on purpose. The frame's own checksum field covers the BODY
+/// only, and the recovery marker covers the WHOLE frame including that
+/// checksum, so a single pass cannot serve both. The body hasher is switched on
+/// for the body and off again for the checksum and trailer that follow it,
+/// which is the same boundary the buffering writer expresses as `&buf[16..]`.
+struct FrameWriter<'w, W: std::io::Write + ?Sized> {
+    out: &'w mut W,
+    frame: Sha256,
+    body: Sha256,
+    hashing_body: bool,
+    total: u64,
+    body_written: u64,
+    /// The destination's own first failure, kept because the one above it will
+    /// not be.
+    ///
+    /// `rmp_serde` reports an IO failure during the body as "invalid value
+    /// write: error while writing multi-byte MessagePack value", which says
+    /// nothing about the disk being full or the file being gone. That message
+    /// is what an operator would have had to debug a failed conversion with,
+    /// so the real error is captured here as it happens and reported instead.
+    failure: Option<std::io::Error>,
+}
+
+impl<'w, W: std::io::Write + ?Sized> FrameWriter<'w, W> {
+    fn new(out: &'w mut W) -> Self {
+        Self {
+            out,
+            frame: Sha256::new(),
+            body: Sha256::new(),
+            hashing_body: false,
+            total: 0,
+            body_written: 0,
+            failure: None,
+        }
+    }
+
+    /// Turn a serializer's error into the destination's, when the destination
+    /// is what actually failed.
+    fn attribute(&mut self, error: crate::error::KinDbError) -> crate::error::KinDbError {
+        match self.failure.take() {
+            Some(io) => crate::error::KinDbError::StorageError(format!(
+                "failed to write snapshot frame after {} bytes: {io}",
+                self.total
+            )),
+            None => error,
+        }
+    }
+}
+
+impl<W: std::io::Write + ?Sized> std::io::Write for FrameWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `write_all` rather than `write`, so a short write from the
+        // destination cannot silently truncate the frame while this returns a
+        // count the serializer believes. The length this reports is therefore
+        // always the whole buffer.
+        if let Err(error) = self.out.write_all(buf) {
+            if self.failure.is_none() {
+                self.failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+            }
+            return Err(error);
+        }
+        self.frame.update(buf);
+        if self.hashing_body {
+            self.body.update(buf);
+            self.body_written += buf.len() as u64;
+        }
+        self.total += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush().inspect_err(|error| {
+            if self.failure.is_none() {
+                self.failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+            }
+        })
+    }
+}
+
+/// Write one `KNDB` frame around a serializable body straight to `out`.
+///
+/// The counterpart of [`assemble_snapshot_frame`], and the reason it has one:
+/// that function's buffer is exactly the size of the repository, 2.24 GiB at
+/// the commit and 3.59 GiB at the post-init graph-section rewrite of a full VS
+/// Code tree, and it stands on the heap while the persist that follows it is
+/// already the highest moment of a conversion. Streaming removes the whole
+/// allocation rather than shrinking it; nothing here scales with the store.
+///
+/// The bytes are the same bytes. Both paths write the same header, the same
+/// `write_snapshot_body` encoding, the same body checksum and the same
+/// trailer, in that order, and a test asserts the two are byte-identical over
+/// a snapshot carrying every optional field.
+///
+/// The counting pass is unchanged and still required: the body's length goes
+/// in a header that sits AHEAD of the body, so no single pass can know what to
+/// write there. What streaming removes is the second buffer, not the second
+/// walk.
+pub(crate) fn stream_snapshot_frame<W: std::io::Write + ?Sized, T: Serialize + ?Sized>(
+    out: &mut W,
+    body: &T,
+    version: u32,
+    persisted_root_hash: Option<[u8; 32]>,
+) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+    let mut counter = CountingWriter::default();
+    write_snapshot_body(&mut counter, body)?;
+    let body_len = counter.written() as u64;
+
+    let mut writer = FrameWriter::new(out);
+    let io = |error: std::io::Error| {
+        crate::error::KinDbError::StorageError(format!("failed to write snapshot frame: {error}"))
+    };
+    {
+        use std::io::Write as _;
+        writer.write_all(&GraphSnapshot::MAGIC).map_err(io)?;
+        writer.write_all(&version.to_le_bytes()).map_err(io)?;
+        writer.write_all(&body_len.to_le_bytes()).map_err(io)?;
+    }
+
+    writer.hashing_body = true;
+    if let Err(error) = write_snapshot_body(&mut writer, body) {
+        return Err(writer.attribute(error));
+    }
+    writer.hashing_body = false;
+
+    // The two passes have to agree, exactly as they do in the buffering path.
+    // A writing pass that produced a different number of bytes than the
+    // counting pass declared would mint a well-formed header describing a body
+    // nobody wrote, and every reader would slice the frame at the wrong offset.
+    //
+    // Streaming makes this check MORE load-bearing, not less: the buffering
+    // path could still be refused with nothing on disk, while here the bytes
+    // are already in a staged file. It fails loud, and the caller discards that
+    // file rather than promoting it, so a disagreeing frame is still never
+    // installed.
+    if writer.body_written != body_len {
+        return Err(crate::error::KinDbError::StorageError(format!(
+            "snapshot body length pass counted {body_len} bytes and the writing pass produced \
+             {}; refusing to frame a body the header does not describe",
+            writer.body_written
+        )));
+    }
+
+    let body_checksum: [u8; 32] = writer.body.clone().finalize().into();
+    {
+        use std::io::Write as _;
+        writer.write_all(&body_checksum).map_err(io)?;
+        if let Some(root_hash) = persisted_root_hash {
+            let mut trailer = Vec::with_capacity(GraphSnapshot::ROOT_HASH_TRAILER_LEN);
+            GraphSnapshot::append_root_hash_trailer(&mut trailer, body_checksum, root_hash);
+            writer.write_all(&trailer).map_err(io)?;
+        }
+        writer.flush().map_err(io)?;
+    }
+
+    Ok(SnapshotFrameShape {
+        byte_len: writer.total,
+        sha256: writer.frame.clone().finalize().into(),
+    })
+}
+
 fn assemble_snapshot_frame<T: Serialize + ?Sized>(
     body: &T,
     version: u32,
@@ -697,43 +874,100 @@ impl GraphSnapshot {
     /// The newest version this binary can write.
     ///
     /// A snapshot is NOT written at this version merely because the binary
-    /// knows it. The version a body is written at is derived from what the
-    /// body carries, by [`wire_version`](Self::wire_version): 13 without a
-    /// materialized graph section, 14 with one. So a store becomes v14 exactly
-    /// when it gains something a v13 reader could not represent, and a store
-    /// that never gains one stays readable by every shipped binary.
+    /// knows it. The version a body is written at is derived from what the body
+    /// carries, by [`wire_version`](Self::wire_version).
     ///
-    /// This constant moved from 13 to 14 in the change that started WRITING
-    /// sections. Before that the binary read v14 and never produced one, which
-    /// is why the reader landed first.
-    pub const CURRENT_VERSION: u32 = 14;
+    /// There are two independent facts to encode and four versions to encode
+    /// them in, which is deliberate. The first is whether the body carries a
+    /// materialized graph section, which decides its top-level element count.
+    /// The second is whether its commit receipts name their operation records
+    /// or repeat them, which decides whether an older reader can decode the
+    /// envelope at all (FIR-3064).
+    ///
+    /// ```text
+    ///        section   receipts        top-level elements
+    ///  v13    no        embedded        35
+    ///  v14    yes       embedded        36
+    ///  v15    no        trimmed         35
+    ///  v16    yes       trimmed         36
+    /// ```
+    ///
+    /// Folding the second fact onto the first would have made version and width
+    /// stop being a function of each other, and the reader's width check would
+    /// have had to accept two answers for one version. Four versions keeps that
+    /// check exact.
+    ///
+    /// v15 and v16 are the first that are not additive. They REMOVE an element
+    /// from each persisted receipt, so a v14 binary reading one would fail deep
+    /// inside the envelope with serde reporting an array of the wrong length.
+    /// Declaring the version turns that into a refusal at the frame header,
+    /// through
+    /// [`snapshot_schema_too_new`](crate::error::KinDbError::snapshot_schema_too_new),
+    /// which names the versions the binary can read.
+    pub const CURRENT_VERSION: u32 = 16;
+
+    /// A section, and receipts that still embed their operation records.
+    pub const SECTION_VERSION: u32 = 14;
+
+    /// No section, and receipts that name their operation records.
+    pub const TRIMMED_RECEIPT_VERSION: u32 = 15;
 
     /// The oldest on-disk format version this binary opens.
     pub const MIN_SUPPORTED_VERSION: u32 = 13;
 
     /// The on-disk version these exact contents serialize as.
     ///
-    /// Derived from the contents rather than from the binary. Version, width
-    /// and the section's presence are three readings of one fact and this is
-    /// where they are tied together: v13 is 35 elements with no section, v14 is
-    /// 36 with one. Both partial decoders below use that as their
-    /// discriminator, and `to_bytes` refuses any snapshot whose declared
-    /// version disagrees with this.
-    pub const fn wire_version(&self) -> u32 {
-        if self.materialized_graph.is_some() {
-            Self::CURRENT_VERSION
-        } else {
-            Self::MIN_SUPPORTED_VERSION
+    /// Derived from the contents rather than from the binary, over the two
+    /// facts the version ladder encodes. `to_bytes` refuses any snapshot whose
+    /// declared version disagrees with this.
+    ///
+    /// One trimmed receipt is enough to move the receipt axis: a pre-v15 binary
+    /// decodes receipts positionally, so the first seven-element one refuses
+    /// the whole envelope whether the rest are trimmed or not.
+    pub fn wire_version(&self) -> u32 {
+        match (
+            self.materialized_graph.is_some(),
+            self.persists_a_trimmed_receipt(),
+        ) {
+            (true, true) => Self::CURRENT_VERSION,
+            (false, true) => Self::TRIMMED_RECEIPT_VERSION,
+            (true, false) => Self::SECTION_VERSION,
+            (false, false) => Self::MIN_SUPPORTED_VERSION,
         }
+    }
+
+    /// Whether any persisted receipt names its operation rather than carrying
+    /// it, which is what a pre-v15 reader cannot decode.
+    fn persists_a_trimmed_receipt(&self) -> bool {
+        self.repository_authority.as_ref().is_some_and(|authority| {
+            authority
+                .receipts
+                .iter()
+                .any(|receipt| receipt.operation.is_none())
+        })
+    }
+
+    /// Whether a body at this version carries the materialized graph section
+    /// element, and therefore the wider top-level array.
+    ///
+    /// The one place the version-to-width mapping lives. It used to be an
+    /// equality against `MAX_SUPPORTED_VERSION`, which was correct while there
+    /// were two versions and would have silently demanded the narrow width from
+    /// a v14 body the moment a third arrived.
+    pub(crate) const fn version_carries_a_section(version: u32) -> bool {
+        matches!(version, Self::SECTION_VERSION | Self::CURRENT_VERSION)
     }
 
     /// The newest on-disk format version this binary READS.
     ///
     /// v14 APPENDS one element to the positional body, `materialized_graph`,
     /// and moves nothing, so a v13 body is a v14 body with its last element
-    /// missing and the field's `serde(default)` supplies it. One decoder reads
-    /// both widths and no second copy of the field list exists to drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = 14;
+    /// missing and the field's `serde(default)` supplies it. v15 and v16 leave
+    /// the top level alone and change only what each persisted receipt carries,
+    /// which the receipt's own trailing `serde(default)` reads either way. One
+    /// decoder reads all four and no second copy of the field list exists to
+    /// drift.
+    pub const MAX_SUPPORTED_VERSION: u32 = 16;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -952,23 +1186,72 @@ impl GraphSnapshot {
         self.to_bytes_inner(Some(root_hash), true)
     }
 
+    /// The version this snapshot serializes as, refusing when its declared
+    /// version and its contents disagree.
+    ///
+    /// Shared by the buffering and streaming write paths so one gate governs
+    /// both. A second copy of it would be the kind of guard that is right on
+    /// the day it is written and silently absent from one path a release later.
+    fn wire_version_checked(&self) -> Result<u32, crate::error::KinDbError> {
+        let wire_version = self.wire_version();
+        if self.version != wire_version {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "refusing to serialize a snapshot whose body declares v{} while its contents \
+                 serialize as v{}; a section with trimmed receipts makes a body v{}, trimmed \
+                 receipts alone make it v{}, a section alone makes it v{}, and neither makes \
+                 it v{}",
+                self.version,
+                wire_version,
+                Self::CURRENT_VERSION,
+                Self::TRIMMED_RECEIPT_VERSION,
+                Self::SECTION_VERSION,
+                Self::MIN_SUPPORTED_VERSION
+            )));
+        }
+        Ok(wire_version)
+    }
+
+    /// Write this snapshot's frame straight to `out`, revalidating storage
+    /// admission first.
+    ///
+    /// The streaming counterpart of [`Self::to_bytes`], and the public entry
+    /// point for a caller that has somewhere to write and no reason to hold a
+    /// copy of the repository while it does.
+    pub fn stream_to(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+        let wire_version = self.wire_version_checked()?;
+        self.validate_storage_admission()?;
+        stream_snapshot_frame(out, self, wire_version, None)
+    }
+
+    /// Write the frame for a snapshot whose storage admission the caller has
+    /// already validated on this exact object, straight to `out`.
+    ///
+    /// The streaming counterpart of [`Self::to_bytes_pre_validated`], and it
+    /// carries the same obligation: the caller validated THIS object under the
+    /// single-writer permit and nothing can mutate it between that gate and
+    /// this write. The version gate still runs, through the same helper the
+    /// buffering path uses.
+    ///
+    /// Returns what the frame turned out to be, because a streaming writer
+    /// never holds a buffer to measure and the durability sequence needs the
+    /// length and the digest it just wrote.
+    pub(crate) fn stream_pre_validated(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+        let wire_version = self.wire_version_checked()?;
+        stream_snapshot_frame(out, self, wire_version, None)
+    }
+
     fn to_bytes_inner(
         &self,
         persisted_root_hash: Option<[u8; 32]>,
         validate_admission: bool,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
-        let wire_version = self.wire_version();
-        if self.version != wire_version {
-            return Err(crate::error::KinDbError::StorageError(format!(
-                "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; a materialized graph section makes a body v{}, and its \
-                 absence makes it v{}",
-                self.version,
-                wire_version,
-                Self::CURRENT_VERSION,
-                Self::MIN_SUPPORTED_VERSION
-            )));
-        }
+        let wire_version = self.wire_version_checked()?;
         if validate_admission {
             self.validate_storage_admission()?;
         }
@@ -1071,7 +1354,7 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.walk_body_elements").entered();
             top_level_element_ranges(frame.body)?
         };
-        let expected_width = if frame.version == Self::MAX_SUPPORTED_VERSION {
+        let expected_width = if Self::version_carries_a_section(frame.version) {
             GRAPH_SNAPSHOT_FIELD_COUNT
         } else {
             GRAPH_SNAPSHOT_V13_FIELD_COUNT
@@ -1894,9 +2177,9 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     });
                 }
 
-                // The canonical body is 35 elements at v13 and 36 at v14; the
-                // appended element is the materialized graph, which locate does
-                // not read. This used to be a bare `35`, which would have made
+                // The canonical body is 35 elements at v13 and v15 and 36 at
+                // v14 and v16; the appended element is the materialized graph,
+                // which locate does not read. This used to be a bare `35`, which would have made
                 // every v14 store fail here with `invalid_length` while the
                 // named constant one screen up said 36.
                 let width = match seq.size_hint() {
@@ -2116,9 +2399,11 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // carries no envelope at all, so it is refused by name here
                 // rather than silently decoding as an absent authority.
                 // Width is the format discriminator and it is a function of
-                // the snapshot version alone: v13 bodies are 35 elements, v14
-                // bodies are 36, and nothing is skipped on serialize so the
-                // width never varies within a version. The eleven-field locate
+                // the snapshot version alone: v13 and v15 bodies are 35
+                // elements, v14 and v16 are 36, and nothing is skipped on
+                // serialize so the width never varies within a version. The
+                // ladder has four rungs because it encodes two independent
+                // bits, and keeping width a function of version is exactly why. The eleven-field locate
                 // projection carries no envelope at all, so it is refused by
                 // width here rather than silently decoding as an absent
                 // authority.
@@ -2140,7 +2425,7 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // made them agree. Requiring them to agree here is what stops a
                 // body that claims v13 while carrying a section, or claims v14
                 // while carrying none, from decoding as either.
-                let expected_width = if version == GraphSnapshot::MAX_SUPPORTED_VERSION {
+                let expected_width = if GraphSnapshot::version_carries_a_section(version) {
                     GRAPH_SNAPSHOT_FIELD_COUNT
                 } else {
                     GRAPH_SNAPSHOT_V13_FIELD_COUNT
@@ -3334,6 +3619,135 @@ mod tests {
         }
     }
 
+    /// The frame streamed to a writer must be byte-identical to the frame
+    /// assembled in a buffer, for every shape.
+    ///
+    /// This is the bar the streaming write has to clear before it can be the
+    /// path a store is written by, and it is compared against the retained
+    /// two-buffer reference rather than against the one-buffer assembly, so
+    /// both shipped paths are held to the implementation the stores on disk
+    /// were written under.
+    ///
+    /// The reported shape is checked too. A streaming writer never holds the
+    /// frame, so the length and digest it reports are the only description of
+    /// what it wrote, and the recovery marker and the authority record are both
+    /// written from them: a writer that framed correctly and reported a wrong
+    /// digest would install a snapshot no reader could confirm.
+    #[test]
+    fn the_streamed_frame_is_the_buffered_frame_for_every_corpus_shape() {
+        for (name, snapshot) in frame_corpus() {
+            let reference = reference_two_buffer_frame(&snapshot, None);
+
+            let mut streamed: Vec<u8> = Vec::new();
+            let shape = snapshot
+                .stream_to(&mut streamed)
+                .expect("streaming assembly serializes");
+            assert_eq!(
+                reference,
+                streamed,
+                "`{name}` streams differently than it buffers, over its {} byte frame",
+                reference.len()
+            );
+            assert_eq!(
+                shape.byte_len as usize,
+                reference.len(),
+                "`{name}` reported a frame length it did not write"
+            );
+            assert_eq!(
+                shape.sha256,
+                <[u8; 32]>::from(Sha256::digest(&reference)),
+                "`{name}` reported a digest that is not the digest of its own frame"
+            );
+
+            let mut pre_validated: Vec<u8> = Vec::new();
+            snapshot
+                .stream_pre_validated(&mut pre_validated)
+                .expect("streaming pre-validated assembly serializes");
+            assert_eq!(
+                reference, pre_validated,
+                "`{name}` streams differently on the pre-validated path"
+            );
+
+            // The streamed frame still decodes to the snapshot it was made
+            // from, which a byte comparison alone would not catch if BOTH
+            // implementations were wrong in the same way.
+            let decoded = GraphSnapshot::from_bytes(&streamed).expect("streamed frame decodes");
+            assert_eq!(
+                decoded.entities.len(),
+                snapshot.entities.len(),
+                "`{name}` streamed to a different entity count"
+            );
+            assert_eq!(
+                decoded.relations.len(),
+                snapshot.relations.len(),
+                "`{name}` streamed to a different relation count"
+            );
+        }
+    }
+
+    /// A destination that refuses a write must fail the frame loud, in the
+    /// destination's own words.
+    ///
+    /// The buffering path could not have this defect: a `Vec` does not fail.
+    /// A file does, and a streaming writer that swallowed the error would
+    /// report a length and a digest for bytes that are not on disk, which the
+    /// recovery marker would then record as truth.
+    ///
+    /// The message is named on purpose. `rmp_serde` reports an IO failure
+    /// during the body as "invalid value write: error while writing multi-byte
+    /// MessagePack value", so asserting only `is_err()` would pass while an
+    /// operator debugging a failed kernel-scale conversion was told nothing
+    /// about a full disk. This test is why the writer keeps the destination's
+    /// own error.
+    #[test]
+    fn a_refusing_destination_fails_the_streamed_frame() {
+        struct RefusingWriter {
+            allowed: usize,
+        }
+
+        impl std::io::Write for RefusingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.len() > self.allowed {
+                    return Err(std::io::Error::other("destination is full"));
+                }
+                self.allowed -= buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut snapshot = GraphSnapshot::empty();
+        for index in 0..64 {
+            let entity = test_entity(&format!("refuse_{index}"));
+            snapshot.entities.insert(entity.id, entity);
+        }
+
+        // The positive control: the same snapshot streams cleanly into a writer
+        // that accepts everything, so the refusal below is the destination and
+        // not the fixture.
+        let mut accepted: Vec<u8> = Vec::new();
+        snapshot
+            .stream_to(&mut accepted)
+            .expect("an accepting destination takes the whole frame");
+        assert!(
+            accepted.len() > 16,
+            "the fixture must have a body to refuse"
+        );
+
+        let mut refusing = RefusingWriter { allowed: 16 };
+        let error = snapshot
+            .stream_to(&mut refusing)
+            .expect_err("a destination that refuses the body must fail the frame");
+        assert!(
+            error.to_string().contains("destination is full"),
+            "the destination's own error must reach the caller rather than the \
+             serializer's paraphrase of it: {error}"
+        );
+    }
+
     /// The header must describe the body it is stapled to.
     ///
     /// Every assertion above proves sameness, and an assembly that emitted a
@@ -3924,7 +4338,7 @@ mod tests {
     fn a_v14_snapshot(entity_name: &str) -> GraphSnapshot {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.materialized_graph = Some(Arc::new(a_section(a_change_id(0x11), entity_name)));
-        snapshot.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        snapshot.version = GraphSnapshot::SECTION_VERSION;
         snapshot
     }
 
@@ -3950,7 +4364,7 @@ mod tests {
             snapshot.materialized_graph.is_some(),
             "a v14 body is one that carries a section"
         );
-        assert_eq!(snapshot.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(snapshot.version, GraphSnapshot::SECTION_VERSION);
         let body = rmp_serde::to_vec(snapshot).expect("a snapshot serializes");
         assert_eq!(
             encoded_field_count(&body),
@@ -3959,7 +4373,7 @@ mod tests {
         );
         let mut frame = Vec::new();
         frame.extend_from_slice(&GraphSnapshot::MAGIC);
-        frame.extend_from_slice(&GraphSnapshot::MAX_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&GraphSnapshot::SECTION_VERSION.to_le_bytes());
         frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
         frame.extend_from_slice(&body);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -4011,10 +4425,7 @@ mod tests {
         let with = a_v14_snapshot("served");
         assert_eq!(
             frame_shape(&with.to_bytes_pre_validated().expect("serializes")),
-            (
-                GraphSnapshot::MAX_SUPPORTED_VERSION,
-                GRAPH_SNAPSHOT_FIELD_COUNT
-            ),
+            (GraphSnapshot::SECTION_VERSION, GRAPH_SNAPSHOT_FIELD_COUNT),
             "a section means v14 and 36 elements"
         );
 
@@ -4024,7 +4435,7 @@ mod tests {
         lying_low.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
         assert!(lying_low.to_bytes_pre_validated().is_err());
         let mut lying_high = GraphSnapshot::empty();
-        lying_high.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        lying_high.version = GraphSnapshot::SECTION_VERSION;
         assert!(lying_high.to_bytes().is_err());
     }
 
@@ -4053,7 +4464,7 @@ mod tests {
     fn a_v14_store_round_trips_its_section() {
         let bytes = v14_frame(&a_v14_snapshot("served"));
         let decoded = GraphSnapshot::from_bytes(&bytes).expect("a v14 body decodes");
-        assert_eq!(decoded.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(decoded.version, GraphSnapshot::SECTION_VERSION);
         let section = decoded
             .materialized_graph
             .as_ref()
@@ -4073,7 +4484,7 @@ mod tests {
 
         let v14 = v14_frame(&a_v14_snapshot("served"));
         let envelope = AuthorityEnvelopeSnapshot::from_bytes(&v14).expect("v14 decodes");
-        assert_eq!(envelope.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(envelope.version, GraphSnapshot::SECTION_VERSION);
         assert!(envelope.materialized_graph.is_some());
     }
 
@@ -4087,7 +4498,7 @@ mod tests {
         // Patching the header instead would prove nothing here: the envelope
         // decoder never sees it.
         let mut narrow = GraphSnapshot::empty();
-        narrow.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        narrow.version = GraphSnapshot::SECTION_VERSION;
         let narrow_body = rmp_serde::to_vec(&narrow).expect("serializes");
         assert_eq!(
             encoded_field_count(&narrow_body),
@@ -4221,7 +4632,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&GraphSnapshot::MAGIC);
         // The header says v14 while the body says v13.
-        frame.extend_from_slice(&GraphSnapshot::MAX_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&GraphSnapshot::SECTION_VERSION.to_le_bytes());
         frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
         frame.extend_from_slice(&body);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -4291,11 +4702,21 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
+        // Four contiguous rungs encoding two independent bits, and the
+        // width is a function of the version rather than a second opinion
+        // about it. Asserted rather than described, because the reader's
+        // width check reads the version and would silently demand the wrong
+        // element count if a rung were added without updating it.
         assert_eq!(
-            GraphSnapshot::MIN_SUPPORTED_VERSION + 1,
-            GraphSnapshot::MAX_SUPPORTED_VERSION,
-            "the two supported versions are adjacent, which is what makes one \
-             decoder with one defaulted field enough"
+            [
+                GraphSnapshot::MIN_SUPPORTED_VERSION,
+                GraphSnapshot::SECTION_VERSION,
+                GraphSnapshot::TRIMMED_RECEIPT_VERSION,
+                GraphSnapshot::CURRENT_VERSION,
+            ],
+            [13, 14, 15, 16],
+            "the ladder is contiguous, which is what lets one decoder read every \
+             rung with defaulted trailing fields"
         );
         assert_eq!(
             GraphSnapshot::CURRENT_VERSION,
@@ -4304,6 +4725,18 @@ mod tests {
              is the newest it can read; which version a given body gets is \
              decided by `wire_version` from its contents, not by this constant"
         );
+        for (version, wide) in [
+            (GraphSnapshot::MIN_SUPPORTED_VERSION, false),
+            (GraphSnapshot::SECTION_VERSION, true),
+            (GraphSnapshot::TRIMMED_RECEIPT_VERSION, false),
+            (GraphSnapshot::CURRENT_VERSION, true),
+        ] {
+            assert_eq!(
+                GraphSnapshot::version_carries_a_section(version),
+                wide,
+                "v{version} disagrees with the ladder about whether it carries a section"
+            );
+        }
     }
 
     // FIR-3064: an open leaves the change map on disk.
@@ -4448,7 +4881,7 @@ mod tests {
         }
         let frame = encode_snapshot_without_admission_validation(&with_section);
         let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
-        assert_eq!(lazy.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(lazy.version, GraphSnapshot::SECTION_VERSION);
         assert!(lazy.materialized_graph.is_some(), "the section rides along");
         assert_eq!(visited.len(), 2);
         assert!(!lazy.changes.is_decoded());
