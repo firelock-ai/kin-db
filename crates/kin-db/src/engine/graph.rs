@@ -20840,7 +20840,12 @@ mod tests {
             let entity = test_entity_with_id(0xc1, "drifted");
             let (g, head) = graph_with_embedded_entity_and_head_revision(&entity, &entity_vector);
             {
-                let mut ent = g.entities.write();
+                // Through the truth-write guard rather than the raw lock: the
+                // guard is the only writer, so the truth epoch stays a complete
+                // record of truth movement. `the_entity_write_guard_is_the_only_writer`
+                // counts raw acquisitions in this file's own text, so even a
+                // comment must not spell one.
+                let mut ent = g.entities_write();
                 let live = ent.entities.get_mut(&entity.id).expect("live entity");
                 live.fingerprint.behavior_hash = Hash256::from_bytes([9; 32]);
             }
@@ -20905,7 +20910,7 @@ mod tests {
             let entity = test_entity_with_id(0xc3, "retired");
             let (g, head) = graph_with_embedded_entity_and_head_revision(&entity, &entity_vector);
             {
-                let mut ent = g.entities.write();
+                let mut ent = g.entities_write();
                 ent.entities.remove(&entity.id);
             }
             let prepared = prepare_one(&g, RetrievalKey::EntityRevision(head));
