@@ -2623,8 +2623,13 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            let validation_targets: Vec<_> = snapshot.changes.keys().copied().collect();
+            // FALSIFICATION ARM, not for landing: the removed clone put back,
+            // held alive across the replay, with the validation unchanged. The
+            // guard must go red on the arm difference.
+            let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
+            let validation_targets: Vec<_> = all_changes.iter().map(|change| change.id).collect();
             validate_history_replay(&snapshot, &validation_targets)?;
+            drop(all_changes);
         }
         let replay_at = started.elapsed();
 
