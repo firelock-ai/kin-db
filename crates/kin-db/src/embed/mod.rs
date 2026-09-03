@@ -3884,6 +3884,10 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
 
     let mut out = String::with_capacity(capacity);
     out.push_str(kind_label);
+    if let Some(origin) = entity.file_origin.as_ref() {
+        out.push('\n');
+        out.push_str(origin.0.as_str());
+    }
     if !entity.name.is_empty() {
         out.push('\n');
         push_bounded_embed_field(&mut out, &entity.name, EMBED_NAME_MAX_CHARS);
@@ -3898,7 +3902,7 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     }
     if let Some(field) = body_preview {
         out.push('\n');
-        push_bounded_embed_field(&mut out, field, EMBED_BODY_PREVIEW_MAX_CHARS);
+        push_bounded_embed_field(&mut out, field, EMBED_DOC_SUMMARY_MAX_CHARS);
     }
     debug_assert!(
         out.chars().count() <= EMBED_TEXT_MAX_CHARS,
@@ -3916,8 +3920,13 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
 /// boundary's file. The parameter is retained rather than removed so those
 /// callers compile unchanged; the lines themselves belong to
 /// [`format_graph_entity_volatile_context`] now, which is what hashes them.
-pub fn format_graph_entity_text_with_context(entity: &Entity, _context_lines: &[String]) -> String {
-    format_graph_entity_text(entity)
+pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
+    let mut out = format_graph_entity_text(entity);
+    for line in context_lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 /// Read a non-empty string field out of an entity's metadata.
@@ -3968,9 +3977,7 @@ pub fn format_graph_entity_volatile_context(entity: &Entity, context_lines: &[St
             parts.push(field);
         }
     }
-    for line in context_lines {
-        parts.push(line.as_str());
-    }
+    let _ = context_lines;
     parts.join("\n")
 }
 
