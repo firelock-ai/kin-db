@@ -3721,7 +3721,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // names neither. Any other write to a root's inputs between those two
     // points restores this caller's obligation to
     // `RootRecomputation::Required`.
-    snapshot.validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven)?;
+    snapshot.validate_storage_admission_with(GitProjectionTreeReplay::Proven)?;
     let storage_admission_ms = timer.lap_ms();
     drop(lap);
 
