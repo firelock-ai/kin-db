@@ -732,13 +732,19 @@ impl PersistedRepositoryAuthority {
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
         let admitted = AdmittedChangeMap::admit(&snapshot.changes, "snapshot")?;
-        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required, &admitted)
+        self.validate_against_snapshot_with(
+            snapshot,
+            GitProjectionTreeReplay::Required,
+            RootRecomputation::Required,
+            &admitted,
+        )
     }
 
     pub(crate) fn validate_against_snapshot_with(
         &self,
         snapshot: &GraphSnapshot,
         replay: GitProjectionTreeReplay,
+        roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
@@ -915,11 +921,18 @@ impl PersistedRepositoryAuthority {
         validate_workspace_authority(snapshot, self, Some(admitted))?;
         let workspace_authority_ms = timer.lap_ms();
 
-        let computed = compute_roots(snapshot, self, self.roots.generation)?;
-        if computed != self.roots {
-            return Err(storage(
-                "repository root bundle does not recompute from the persisted envelope".to_string(),
-            ));
+        // Skipped only on an exact obligation the caller discharged over this
+        // same snapshot and envelope; see `RootRecomputation`. An open always
+        // owes it, so a store whose bundle does not derive from its contents is
+        // still refused, just not once per commit as well.
+        if roots == RootRecomputation::Required {
+            let computed = compute_roots(snapshot, self, self.roots.generation)?;
+            if computed != self.roots {
+                return Err(storage(
+                    "repository root bundle does not recompute from the persisted envelope"
+                        .to_string(),
+                ));
+            }
         }
         let compute_roots_ms = timer.lap_ms();
         tracing::debug!(
@@ -3698,7 +3711,17 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // aliases after `admit_aliases`, and the authority itself after the delta is
     // applied. A write to any of them between that call and this line restores
     // this caller's obligation to `GitProjectionTreeReplay::Required`.
-    snapshot.validate_storage_admission_with(GitProjectionTreeReplay::Proven)?;
+    //
+    // The root bundle is proven on the same terms. `metadata.roots` was set
+    // from `compute_roots` over this exact snapshot and this exact envelope in
+    // the `kindb.prepare.roots` lap above, and the only write between that call
+    // and this line is `roots_after` on the operation record appended there,
+    // which no root reads: `RepositoryOperationRecord::identity_hash` excludes
+    // both root bundles by construction, and `RefLogProjection::from_operation`
+    // names neither. Any other write to a root's inputs between those two
+    // points restores this caller's obligation to
+    // `RootRecomputation::Required`.
+    snapshot.validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven)?;
     let storage_admission_ms = timer.lap_ms();
     drop(lap);
 
@@ -4027,6 +4050,43 @@ fn validate_transaction_git_projection_membership(
 /// byte-identical inputs and no write to any of the four has intervened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitProjectionTreeReplay {
+    Required,
+    Proven,
+}
+
+/// Whether a caller still owes the root-bundle recomputation.
+///
+/// [`compute_roots`] folds every leaf of every domain into six SHA-256 roots
+/// through [`canonical_leaf_hash`], which buffers one copy of the canonical
+/// payload of each leaf it hashes (see `canonical_hash`'s module header). The
+/// change map is ONE leaf, not one leaf per change, so the buffer is the size
+/// of the whole history: measured by walking the persisted frames of two real
+/// stores, that leaf is 85,429,663 bytes on a converted VS Code tree and
+/// 410,546,852 bytes on a converted Linux subtree, in bodies of 420,187,160
+/// and 2,043,051,848 bytes.
+///
+/// A commit paid that twice over identical content. `prepare_successor`
+/// computes the bundle in its `kindb.prepare.roots` lap and stores it as
+/// `metadata.roots`, and the storage-admission gate it runs a few statements
+/// later recomputed the same bundle from the same snapshot to compare it with
+/// itself. Recomputation is what proves a snapshot READ from disk agrees with
+/// the envelope beside it, which is why every open still owes it.
+///
+/// [`RootRecomputation::Proven`] therefore states an exact obligation rather
+/// than a preference: the caller has already run [`compute_roots`] over this
+/// exact snapshot and this exact envelope, stored the result as the envelope's
+/// `roots`, and written nothing since to any input a root reads. Filling in
+/// `roots_after` on the appended operation record does not break it, because
+/// `RepositoryOperationRecord::identity_hash` excludes `roots_before` and
+/// `roots_after` by construction and `RefLogProjection::from_operation` reads
+/// neither.
+///
+/// The failure mode if an obligation is ever stated wrongly is loud and it is
+/// at the next open, not at the write: an open passes
+/// [`RootRecomputation::Required`], recomputes, and refuses a store whose
+/// bundle does not derive from its own contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootRecomputation {
     Required,
     Proven,
 }
@@ -8051,11 +8111,32 @@ fn placeholder_roots(generation: u64) -> RootBundle {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROOT_BUNDLES_FOLDED_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many root bundles this thread folded out of a snapshot.
+///
+/// This is the instrument behind "a commit folds its roots once": a test that
+/// commits and then reads the counter can tell one fold from two directly,
+/// rather than inferring it from a duration or a resident set. Counted at the
+/// one place a fold happens, so a recomputation re-enabled anywhere upstream is
+/// visible here. Per thread, because the test suite runs in parallel and a fold
+/// on another thread is another test's.
+#[cfg(test)]
+pub(crate) fn root_bundles_folded_on_this_thread() -> usize {
+    ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.get())
+}
+
 fn compute_roots(
     snapshot: &GraphSnapshot,
     authority: &PersistedRepositoryAuthority,
     generation: u64,
 ) -> Result<RootBundle, KinDbError> {
+    #[cfg(test)]
+    ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     // One span per root, for the reason `prepare_successor`'s laps carry one:
     // a root that costs a conversion real memory must be nameable by whatever
     // reads spans, and `kindb.roots.replication` is what the memory guard in
@@ -20422,6 +20503,59 @@ mod tests {
 
     fn decoded_on_this_thread() -> usize {
         crate::storage::change_map::change_maps_decoded_on_this_thread()
+    }
+
+    fn root_folds_on_this_thread() -> usize {
+        super::root_bundles_folded_on_this_thread()
+    }
+
+    /// FIR-3064: a commit folds its root bundle once, not twice.
+    ///
+    /// `prepare_successor` folds it in the `kindb.prepare.roots` lap, and the
+    /// storage-admission gate a few statements later used to fold it again from
+    /// the same snapshot and the same envelope in order to compare it with
+    /// itself. `history_root` hands the change map to `canonical_leaf_hash` as
+    /// ONE leaf rather than one leaf per change, and `canonical_hash` buffers a
+    /// copy of the canonical payload of every leaf it hashes, so the second
+    /// fold serialized the whole history again: measured by walking the
+    /// persisted frames, that leaf is 85,429,663 bytes on a converted VS Code
+    /// tree and 410,546,852 bytes on a converted Linux subtree.
+    ///
+    /// The second assertion is the half that must not move. Recomputation is
+    /// what proves a snapshot READ from disk agrees with the envelope beside
+    /// it, so an open still owes it and this test fails if a change ever buys
+    /// the commit's fold by giving up the open's.
+    #[test]
+    fn a_commit_folds_its_root_bundle_once_and_an_open_still_folds_its_own() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = arbitrary_repository_transaction(&manager);
+
+        let before_commit = root_folds_on_this_thread();
+        manager
+            .commit_repository_transaction(transaction)
+            .expect("the fixture commits");
+        let commit_folds = root_folds_on_this_thread() - before_commit;
+        assert_eq!(
+            commit_folds, 1,
+            "a commit folds the root bundle once; this one folded it {commit_folds} times"
+        );
+
+        let before_open = root_folds_on_this_thread();
+        let reopened = reopen(&directory);
+        let open_folds = root_folds_on_this_thread() - before_open;
+        assert!(
+            open_folds >= 1,
+            "the control: an open still recomputes the bundle it read, and this one folded \
+             {open_folds}"
+        );
+        assert_eq!(
+            reopened.read_authority().roots().generation,
+            1,
+            "the control: the store this graded is the one the commit produced"
+        );
     }
 
     #[test]
