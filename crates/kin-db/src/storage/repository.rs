@@ -8370,6 +8370,91 @@ fn replication_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256,
     Ok(root.finish())
 }
 
+/// How many operation identities this thread computed rather than remembered.
+///
+/// The instrument behind "a fold hashes only the operations it has not seen".
+/// It counts ONLY the compute branch: the `cfg(test)` verification recompute on
+/// a memo HIT deliberately does not increment it, because a counter that
+/// counted those would report no saving while the memo worked perfectly, which
+/// is a check that cannot fail.
+#[cfg(test)]
+thread_local! {
+    static OPERATION_IDENTITIES_COMPUTED_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn operation_identities_computed_on_this_thread() -> usize {
+    OPERATION_IDENTITIES_COMPUTED_ON_THIS_THREAD.with(|count| count.get())
+}
+
+/// Upper bound on remembered identities.
+///
+/// A daemon serving many repositories would otherwise grow this without limit.
+/// At 48 bytes per entry this caps the memo near 3 MB, against the hundreds of
+/// megabytes a single miss can cost, so the bound is cheap insurance rather
+/// than a tuning knob. Past the cap the memo stops accepting new entries and
+/// keeps the ones it has, which favours the oldest operations, and those are
+/// the ones a growing log re-folds most often.
+const OPERATION_IDENTITY_MEMO_CAP: usize = 65_536;
+
+/// Remembered operation identity digests, keyed by operation id.
+///
+/// `local_state_root` folds one identity per logged operation, and
+/// [`RepositoryOperationRecord::identity_hash`] is expensive in a way its name
+/// hides: it calls `canonicalized()`, which CLONES the whole record in order to
+/// sort two of its collections, and then serializes that copy. Measured by
+/// walking the persisted frame of a converted Linux subtree, one operation
+/// record is **411,771,106 bytes** on the wire, so a single identity costs a
+/// clone of that plus a canonical serialization of it. Arm zero measured the
+/// warm roots fold at 4,342 ms with a 9.52 GiB peak while every other input to
+/// the five remaining roots totalled under 2 MB.
+///
+/// Sound on the same argument as the change-map memo: **an operation record is
+/// immutable once logged.** The envelope validation walks `operation_log` as an
+/// append-only chain in which each entry's `roots_before` must equal its
+/// predecessor's `roots_after`, and no code path rewrites a logged operation.
+/// So a digest filed under an `OperationId` can never describe different bytes
+/// than the record now under it. That invariant is checked rather than trusted:
+/// under `cfg(test)` every memo HIT is recomputed and compared.
+///
+/// Process-wide rather than carried on the envelope, deliberately. An envelope
+/// is cloned at every commit, so a per-envelope memo would start empty each
+/// time and never save anything; and a field on `PersistedRepositoryAuthority`
+/// would have to be excluded from both its wire format and its `PartialEq`,
+/// the second because `first_difference` compares envelopes whole and a memo
+/// populated on one side only would make a writer refuse its own frame. An
+/// `OperationId` is a UUID, so entries cannot collide between repositories.
+static OPERATION_IDENTITY_MEMO: std::sync::LazyLock<Mutex<HashMap<OperationId, Hash256>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`RepositoryOperationRecord::identity_hash`], remembered per operation.
+fn memoized_operation_identity(
+    operation: &RepositoryOperationRecord,
+) -> kin_model::Result<Hash256> {
+    if let Some(known) = OPERATION_IDENTITY_MEMO.lock().get(&operation.operation_id) {
+        let known = *known;
+        #[cfg(test)]
+        {
+            let recomputed = operation.identity_hash()?;
+            assert_eq!(
+                recomputed, known,
+                "a remembered operation identity no longer describes the record under its id; \
+                 a logged operation was rewritten"
+            );
+        }
+        return Ok(known);
+    }
+    let computed = operation.identity_hash()?;
+    #[cfg(test)]
+    OPERATION_IDENTITIES_COMPUTED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    let mut memo = OPERATION_IDENTITY_MEMO.lock();
+    if memo.len() < OPERATION_IDENTITY_MEMO_CAP {
+        memo.insert(operation.operation_id, computed);
+    }
+    Ok(computed)
+}
+
 fn local_state_root(
     snapshot: &GraphSnapshot,
     authority: &PersistedRepositoryAuthority,
@@ -8377,7 +8462,7 @@ fn local_state_root(
     let operation_identities = authority
         .operation_log
         .iter()
-        .map(RepositoryOperationRecord::identity_hash)
+        .map(memoized_operation_identity)
         .collect::<kin_model::Result<Vec<_>>>()?;
     let mut root = DomainRoot::new(b"kin-repository-local-root-v2\0");
     root.unordered("sessions", &snapshot.sessions.iter().collect::<Vec<_>>())?;
@@ -20833,6 +20918,88 @@ mod tests {
         root.unordered("admission_policies", &authority.admission_policies)
             .expect("the oracle folds admission policies");
         root.finish()
+    }
+
+    fn operation_identities_computed() -> usize {
+        super::operation_identities_computed_on_this_thread()
+    }
+
+    /// FIR-3064: the local-state root remembers each operation's identity
+    /// instead of re-deriving it.
+    ///
+    /// `RepositoryOperationRecord::identity_hash` calls `canonicalized()`,
+    /// which CLONES the whole record to sort two of its collections, and then
+    /// serializes the copy. On a converted Linux subtree one operation record
+    /// is 411,771,106 bytes, and arm zero measured the warm roots fold there at
+    /// 4,342 ms with a 9.52 GiB peak while every other input to the five
+    /// remaining roots totalled under 2 MB.
+    ///
+    /// The ORACLE is `identity_hash` itself, called directly and compared, so
+    /// the memo is graded against the function it replaces rather than against
+    /// a constant this binary produced.
+    #[test]
+    fn the_local_state_root_remembers_each_operation_identity() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commits");
+        let snapshot = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let authority = snapshot
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+        assert_eq!(
+            authority.operation_log.len(),
+            1,
+            "the control: the fixture logs the one operation this counts against"
+        );
+
+        // The oracle: the memo must return what the function it replaces returns.
+        let operation = &authority.operation_log[0];
+        let direct = operation.identity_hash().expect("the oracle hashes");
+        assert_eq!(
+            memoized_operation_identity(operation).expect("the memo hashes"),
+            direct,
+            "the remembered identity must be the identity `identity_hash` produces"
+        );
+
+        // And the fold is O(new): a first fold computes, a second remembers.
+        let before_first = operation_identities_computed();
+        let first = local_state_root(&snapshot, &authority).expect("the local root folds");
+        let first_computes = operation_identities_computed() - before_first;
+        let before_second = operation_identities_computed();
+        let second = local_state_root(&snapshot, &authority).expect("the local root folds again");
+        let second_computes = operation_identities_computed() - before_second;
+
+        assert_eq!(
+            first, second,
+            "a warm memo must not change the local-state root"
+        );
+        assert_eq!(
+            second_computes, 0,
+            "a second fold of an unchanged log must compute no identity, and it computed \
+             {second_computes}"
+        );
+        // `before_first` is taken AFTER the oracle above already warmed this
+        // operation, so `first_computes` is legitimately zero here. Asserting it
+        // is zero rather than one is the honest reading of this fixture, and the
+        // assertion that carries the property is `second_computes`.
+        assert_eq!(
+            first_computes, 0,
+            "the oracle above already remembered this operation, so the first fold recomputes \
+             nothing; it computed {first_computes}"
+        );
     }
 
     fn root_folds_on_this_thread() -> usize {
