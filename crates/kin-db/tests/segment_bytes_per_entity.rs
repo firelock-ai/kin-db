@@ -56,6 +56,19 @@ const NAME_BYTES: usize = 20;
 const SIGNATURE_BYTES: usize = 77;
 const DOC_BYTES: usize = 223;
 
+/// Measured metadata, per key, on the Linux subtree: `file_import_context`
+/// 455.2 bytes per entity, `embedding_body_preview` 275.0,
+/// `file_surface_context` 77.7, and two small integer counters whose per-entity
+/// bytes are mostly their key names.
+///
+/// The corpus carries this because without it the guard cannot fail in the one
+/// direction that matters most: `metadata` is 64.2 to 79.3 percent of a real
+/// entity, and a corpus with none of it would stay under the ceiling even if
+/// the metadata side table were moved into the hot set.
+const IMPORT_CONTEXT_BYTES: usize = 455;
+const BODY_PREVIEW_BYTES: usize = 275;
+const SURFACE_CONTEXT_BYTES: usize = 78;
+
 /// The registered width of every fixed-width column, and how many records it
 /// holds relative to the entity and relation counts.
 #[derive(Clone, Copy)]
@@ -150,7 +163,7 @@ fn corpus() -> InMemoryGraph {
                 } else {
                     None
                 },
-                metadata: EntityMetadata::default(),
+                metadata: metadata_like_a_real_store(index),
                 lineage_parent: None,
                 created_in: None,
                 superseded_by: None,
@@ -183,6 +196,39 @@ fn corpus() -> InMemoryGraph {
     }
 
     graph
+}
+
+/// The six keys a real store carries, at their measured sizes. Three strings
+/// and two integers, matching the census in the module doc.
+fn metadata_like_a_real_store(index: u32) -> EntityMetadata {
+    let mut metadata = EntityMetadata::default();
+    metadata.extra.insert(
+        "file_import_context".to_string(),
+        serde_json::Value::String(pad(
+            &format!("module ./m{index}.h names "),
+            IMPORT_CONTEXT_BYTES,
+        )),
+    );
+    metadata.extra.insert(
+        "embedding_body_preview".to_string(),
+        serde_json::Value::String(pad(
+            &format!("static int fn_{index}(void) {{"),
+            BODY_PREVIEW_BYTES,
+        )),
+    );
+    metadata.extra.insert(
+        "file_surface_context".to_string(),
+        serde_json::Value::String(pad(&format!("surface fn_{index} "), SURFACE_CONTEXT_BYTES)),
+    );
+    metadata.extra.insert(
+        "file_parsed_import_statements".to_string(),
+        serde_json::Value::from(8u32),
+    );
+    metadata.extra.insert(
+        "file_parsed_call_sites".to_string(),
+        serde_json::Value::from(26u32),
+    );
+    metadata
 }
 
 fn pad(seed: &str, target: usize) -> String {
