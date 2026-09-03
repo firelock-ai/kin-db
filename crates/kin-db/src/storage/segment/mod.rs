@@ -40,6 +40,33 @@
 //! entities on the first store and one of 5,818 across 264,615 on the second,
 //! a 20.3x and 46.4x repeat, which is why paths are an ordinal into a table.
 //!
+//! # `entity_revisions` is an exact duplicate, measured
+//!
+//! Walked over every revision in both stores, comparing a per-field digest of
+//! the entity inside each revision against the same digest of the head entity
+//! with that id:
+//!
+//! | | VS Code `src/vs` | Linux subtree |
+//! |---|---|---|
+//! | revisions | 29,392 | 264,615 |
+//! | revisions per entity | mean 1.000, max 1 | same |
+//! | bytes per revision | 2,546.7 | 1,448.4 |
+//! | of which the embedded `Entity` | 95.2% | 91.6% |
+//! | fields differing from the head | **zero, on every revision** | same |
+//! | `previous_revision` present | 0 | 0 |
+//! | distinct `introduced_by` | 1 | 1 |
+//!
+//! So the domain carries no information `entities` does not already hold. A
+//! revision here is a 77-byte row rather than a second `Entity`: the sorted
+//! 32-byte id, a 4-byte entity ordinal, a 4-byte change-dictionary ordinal, one
+//! flag byte, and two cold columns. That is 49 bytes hot and reachable, against
+//! 1,448.4 on the kernel-nearest subject.
+//!
+//! Both stores are one-commit conversions, so one revision per entity and an
+//! empty delta table are properties of those subjects rather than of the
+//! format. A revision whose head has moved carries its own entity in the delta
+//! side table, and the design's floor is that case for every revision.
+//!
 //! # The three properties that make it a format rather than a cache
 //!
 //! **The version check is a range, and a bump inside it may only add columns.**

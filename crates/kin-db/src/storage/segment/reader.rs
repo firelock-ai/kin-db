@@ -29,9 +29,9 @@ use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, GraphNodeId, Hash256,
-    LanguageId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
-    SemanticChangeId, SemanticFingerprint, SourceSpan, Visibility,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRevision, EntityRevisionId, EntityRole,
+    FilePathId, GraphNodeId, Hash256, LanguageId, Relation, RelationEvidence, RelationId,
+    RelationKind, RelationOrigin, SemanticChangeId, SemanticFingerprint, SourceSpan, Visibility,
 };
 
 use crate::error::KinDbError;
@@ -43,7 +43,7 @@ use crate::storage::segment::format::{
     COLD_HAS_SUPERSEDED, DIGEST_LEN, FLAG_HAS_DOC, FLAG_HAS_PATH, FLAG_HAS_SPAN, FLAG_ROLE_MASK,
     FLAG_ROLE_SHIFT, FLAG_VISIBILITY_MASK, HEADER_LEN, MANIFEST_ENTRY_LEN, MANIFEST_FILE,
     MANIFEST_PREAMBLE_LEN, REL_ENTITY_ENDPOINTS, REL_HAS_CREATED_IN, REL_HAS_EVIDENCE,
-    REL_HAS_IMPORT_SOURCE,
+    REL_HAS_IMPORT_SOURCE, REV_ENTITY_DIFFERS, REV_HAS_ENDED, REV_HAS_PREVIOUS,
 };
 
 /// Which columns an open maps.
@@ -95,6 +95,14 @@ const HOT_ALSO: &[u32] = &[
     column::REL_ORIGIN,
     column::REL_SRC,
     column::REL_FLAGS,
+    // Revision lookup. Deliberately in HOT_ALSO and NOT in HOT_REQUIRED: a
+    // segment written before these columns existed has no rows for them, and a
+    // hot open of it must still answer every entity query.
+    column::REV_ID,
+    column::REV_ENTITY_ORD,
+    column::REV_INTRODUCED_ORD,
+    column::REV_FLAGS,
+    column::CHANGE_IDS,
 ];
 
 /// A u32 ordinal list borrowed from a mapping.
@@ -651,6 +659,164 @@ impl SegmentReader {
     }
 
     // -----------------------------------------------------------------------
+    // Entity revisions
+    // -----------------------------------------------------------------------
+
+    /// Revisions the segment carries. Zero for a segment written before the
+    /// revision columns existed.
+    pub fn revision_count(&self) -> u64 {
+        self.manifest_count(column::REV_ID)
+    }
+
+    /// Distinct `SemanticChangeId` values in the change dictionary.
+    pub fn change_count(&self) -> u64 {
+        self.manifest_count(column::CHANGE_IDS)
+    }
+
+    /// The ordinal of `id`, by binary search over the sorted revision-id
+    /// column.
+    ///
+    /// This is the whole of what a `RetrievalKey::EntityRevision` lookup costs:
+    /// revisions are written sorted by id, so the ordinal is the id rank and
+    /// the lookup structure IS the data. No separate index exists.
+    pub fn ordinal_of_revision(&self, id: &EntityRevisionId) -> Result<Option<u32>, KinDbError> {
+        let ids = self.column(column::REV_ID)?;
+        let needle = id.0.as_bytes();
+        let payload = ids.payload();
+        let mut low = 0usize;
+        let mut high = ids.count as usize;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let start = middle * 32;
+            let candidate = payload.get(start..start + 32).ok_or_else(|| {
+                KinDbError::StorageError(
+                    "segment revision id column is shorter than the count its header declares"
+                        .into(),
+                )
+            })?;
+            match candidate.cmp(needle.as_slice()) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => return Ok(Some(middle as u32)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The revision id at `revision_ordinal`.
+    pub fn revision_id(&self, revision_ordinal: u32) -> Result<EntityRevisionId, KinDbError> {
+        let bytes = self.fixed(column::REV_ID, revision_ordinal, "revision id")?;
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(bytes);
+        Ok(EntityRevisionId(Hash256::from_bytes(raw)))
+    }
+
+    /// The entity ordinal the revision at `revision_ordinal` anchors on.
+    pub fn revision_entity_ordinal(&self, revision_ordinal: u32) -> Result<u32, KinDbError> {
+        read_u32(
+            self.fixed(column::REV_ENTITY_ORD, revision_ordinal, "revision entity")?,
+            0,
+        )
+    }
+
+    /// Whether the revision's own entity differs from the head entity.
+    ///
+    /// When this is false, every field of the revision's entity is served from
+    /// the head entity's own columns and no second entity exists to decode. On
+    /// both real stores it is false on every revision.
+    pub fn revision_entity_differs_from_head(
+        &self,
+        revision_ordinal: u32,
+    ) -> Result<bool, KinDbError> {
+        Ok(self.revision_flags(revision_ordinal)? & REV_ENTITY_DIFFERS != 0)
+    }
+
+    /// The change that introduced the revision at `revision_ordinal`.
+    pub fn revision_introduced_by(
+        &self,
+        revision_ordinal: u32,
+    ) -> Result<SemanticChangeId, KinDbError> {
+        let slot = read_u32(
+            self.fixed(
+                column::REV_INTRODUCED_ORD,
+                revision_ordinal,
+                "revision introduced by",
+            )?,
+            0,
+        )?;
+        self.change_id(slot).map(SemanticChangeId)
+    }
+
+    /// The previous revision's id, or `None`.
+    pub fn revision_previous(
+        &self,
+        revision_ordinal: u32,
+    ) -> Result<Option<EntityRevisionId>, KinDbError> {
+        if self.revision_flags(revision_ordinal)? & REV_HAS_PREVIOUS == 0 {
+            return Ok(None);
+        }
+        let bytes = self.fixed(
+            column::REV_PREVIOUS_ID,
+            revision_ordinal,
+            "revision previous id",
+        )?;
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(bytes);
+        Ok(Some(EntityRevisionId(Hash256::from_bytes(raw))))
+    }
+
+    /// The change that ended the revision at `revision_ordinal`, or `None`.
+    pub fn revision_ended_by(
+        &self,
+        revision_ordinal: u32,
+    ) -> Result<Option<SemanticChangeId>, KinDbError> {
+        if self.revision_flags(revision_ordinal)? & REV_HAS_ENDED == 0 {
+            return Ok(None);
+        }
+        let slot = read_u32(
+            self.fixed(column::REV_ENDED_ORD, revision_ordinal, "revision ended by")?,
+            0,
+        )?;
+        self.change_id(slot).map(SemanticChangeId).map(Some)
+    }
+
+    /// Rebuild the whole [`EntityRevision`] at `revision_ordinal`. Needs
+    /// [`OpenProfile::Full`], because it reconstructs an [`Entity`].
+    pub fn entity_revision(&self, revision_ordinal: u32) -> Result<EntityRevision, KinDbError> {
+        let entity_ordinal = self.revision_entity_ordinal(revision_ordinal)?;
+        let entity = if self.revision_entity_differs_from_head(revision_ordinal)? {
+            let bytes = self.side_table(
+                column::REV_DELTA_OFF,
+                column::REV_DELTA_ARENA,
+                revision_ordinal,
+                "revision entity delta",
+            )?;
+            serde_json::from_slice(bytes)?
+        } else {
+            self.entity(entity_ordinal)?
+        };
+        Ok(EntityRevision {
+            revision_id: self.revision_id(revision_ordinal)?,
+            entity_id: self.entity_id(entity_ordinal)?,
+            entity,
+            introduced_by: self.revision_introduced_by(revision_ordinal)?,
+            previous_revision: self.revision_previous(revision_ordinal)?,
+            ended_by: self.revision_ended_by(revision_ordinal)?,
+        })
+    }
+
+    fn revision_flags(&self, revision_ordinal: u32) -> Result<u8, KinDbError> {
+        Ok(self.fixed(column::REV_FLAGS, revision_ordinal, "revision flags")?[0])
+    }
+
+    fn change_id(&self, slot: u32) -> Result<Hash256, KinDbError> {
+        let bytes = self.fixed(column::CHANGE_IDS, slot, "change dictionary entry")?;
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(bytes);
+        Ok(Hash256::from_bytes(raw))
+    }
+
+    // -----------------------------------------------------------------------
     // Full reconstruction, which needs OpenProfile::Full
     // -----------------------------------------------------------------------
 
@@ -809,12 +975,31 @@ impl SegmentReader {
     // -----------------------------------------------------------------------
 
     fn column(&self, id: u32) -> Result<&MappedColumn, KinDbError> {
-        self.columns.get(&id).ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "segment column {id} is not mapped by this open; it belongs to the full profile \
-                 rather than the hot one"
-            ))
-        })
+        if let Some(mapped) = self.columns.get(&id) {
+            return Ok(mapped);
+        }
+        // Two different diagnoses, and conflating them is how an absent column
+        // reads as a profile mistake. A column the segment does not carry at all
+        // was written by a layout older than this binary's.
+        if self.manifest.iter().any(|record| record.id == id) {
+            Err(KinDbError::StorageError(format!(
+                "segment column {id} is present but not mapped by this open; it belongs to the \
+                 full profile rather than the hot one"
+            )))
+        } else {
+            Err(KinDbError::StorageError(format!(
+                "segment carries no column {id}; it was written by a layout that did not have \
+                 that column, so rebuild the segment to gain it"
+            )))
+        }
+    }
+
+    fn manifest_count(&self, id: u32) -> u64 {
+        self.manifest
+            .iter()
+            .find(|record| record.id == id)
+            .map(|record| record.count)
+            .unwrap_or(0)
     }
 
     fn entity_flags(&self, ordinal: u32) -> Result<u8, KinDbError> {
@@ -1018,6 +1203,15 @@ fn is_known_column(id: u32) -> bool {
         column::REL_ENDPOINTS_ARENA,
         column::REL_EVIDENCE_OFF,
         column::REL_EVIDENCE_ARENA,
+        column::REV_ID,
+        column::REV_ENTITY_ORD,
+        column::REV_INTRODUCED_ORD,
+        column::REV_FLAGS,
+        column::REV_PREVIOUS_ID,
+        column::REV_ENDED_ORD,
+        column::CHANGE_IDS,
+        column::REV_DELTA_OFF,
+        column::REV_DELTA_ARENA,
     ];
     KNOWN.contains(&id)
 }

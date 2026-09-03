@@ -857,3 +857,353 @@ fn an_empty_graph_writes_and_opens() {
     assert!(reader.entities_by_name("anything").unwrap().is_empty());
     assert_eq!(reader.unknown_columns(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Entity revisions
+// ---------------------------------------------------------------------------
+
+/// A graph whose revisions were produced the way a real store produces them,
+/// by admitting a `SemanticChange`, rather than by constructing
+/// `EntityRevision` values by hand. The expected revisions are then read back
+/// from the graph's own snapshot, so the proof compares the segment against the
+/// graph rather than against the test's own idea of a revision.
+fn revision_fixture(modify_head: bool) -> (InMemoryGraph, Vec<(EntityId, EntityRevision)>) {
+    use kin_model::{
+        AuthorId, ChangeOrigin, ChangeStore, EntityDelta, SemanticChange, SemanticChangeId,
+        Timestamp, TreeEntry,
+    };
+
+    let graph = InMemoryGraph::new();
+    let anchored = entity(9, "revised", "src/revised.rs");
+    let mut floating = entity(10, "floating", "src/unused.rs");
+    floating.file_origin = None;
+    floating.span = None;
+
+    graph.admit_artifact_for_test("src/revised.rs", TreeEntry::blob(hash(0x33), false));
+    graph.upsert_entity(&anchored).unwrap();
+    graph.upsert_entity(&floating).unwrap();
+
+    let change = SemanticChange {
+        id: SemanticChangeId::from_hash(hash(0)),
+        parents: Vec::new(),
+        timestamp: Timestamp::now(),
+        author: AuthorId::new("memarena"),
+        message: "record a revision for each entity".into(),
+        entity_deltas: vec![
+            EntityDelta::Added {
+                new: anchored.clone(),
+            },
+            EntityDelta::Added {
+                new: floating.clone(),
+            },
+        ],
+        relation_deltas: Vec::new(),
+        tree_deltas: Vec::new(),
+        projected_files: Vec::new(),
+        spec_link: None,
+        evidence: Vec::new(),
+        risk_summary: None,
+        origin: ChangeOrigin::Native,
+        admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
+    };
+    let sealed = kin_model::compute_semantic_change_id(&change).expect("a valid change fixture");
+    let change = SemanticChange {
+        id: sealed,
+        ..change
+    };
+    graph.create_change(&change).expect("the change must admit");
+
+    if modify_head {
+        // Move the head out from under its own revision, which is the only way
+        // the differs bit is ever set. Same id, different content.
+        let mut moved = anchored.clone();
+        moved.signature = "fn revised(argument: &str, extra: u8) -> usize".to_string();
+        moved.doc_summary = Some("the head moved after its revision".to_string());
+        graph.upsert_entity(&moved).unwrap();
+    }
+
+    let expected: Vec<(EntityId, EntityRevision)> = graph
+        .to_snapshot()
+        .entity_revisions
+        .into_iter()
+        .flat_map(|(id, revisions)| revisions.into_iter().map(move |rev| (id, rev)))
+        .collect();
+    assert!(
+        !expected.is_empty(),
+        "the fixture must produce at least one revision, or every assertion below is vacuous"
+    );
+    (graph, expected)
+}
+
+#[test]
+fn every_revision_reads_back_through_the_mapped_views() {
+    let (graph, expected) = revision_fixture(false);
+    let dir = tempfile::tempdir().unwrap();
+    let stats = write_segment(&graph, dir.path()).unwrap();
+    assert_eq!(stats.revision_count, expected.len() as u64);
+    assert_eq!(
+        stats.change_count, 1,
+        "one commit means one distinct change id in the dictionary, which is what both real \
+         stores measure"
+    );
+
+    let reader = written(dir.path());
+    assert_eq!(reader.revision_count(), expected.len() as u64);
+
+    let mut seen = 0usize;
+    for (entity_id, want) in &expected {
+        let ordinal = reader
+            .ordinal_of_revision(&want.revision_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("revision {} has no ordinal", want.revision_id.0));
+
+        assert_eq!(reader.revision_id(ordinal).unwrap(), want.revision_id);
+        assert_eq!(
+            reader
+                .entity_id(reader.revision_entity_ordinal(ordinal).unwrap())
+                .unwrap(),
+            *entity_id
+        );
+        assert_eq!(
+            reader.revision_introduced_by(ordinal).unwrap(),
+            want.introduced_by
+        );
+        assert_eq!(
+            reader.revision_previous(ordinal).unwrap(),
+            want.previous_revision
+        );
+        assert_eq!(reader.revision_ended_by(ordinal).unwrap(), want.ended_by);
+
+        let actual = reader.entity_revision(ordinal).unwrap();
+        assert_eq!(actual.revision_id, want.revision_id);
+        assert_eq!(actual.entity_id, want.entity_id);
+        assert_eq!(actual.entity, want.entity, "the revision's entity differs");
+        // Metadata is held to content rather than to bytes for the reason the
+        // entity round trip records: a `HashMap`'s iteration order is not part
+        // of its value.
+        let mut actual_without = actual.entity.clone();
+        let mut want_without = want.entity.clone();
+        actual_without.metadata = EntityMetadata::default();
+        want_without.metadata = EntityMetadata::default();
+        assert_eq!(
+            rmp_serde::to_vec(&actual_without).unwrap(),
+            rmp_serde::to_vec(&want_without).unwrap(),
+            "the revision's entity did not serialize identically outside its metadata"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, expected.len());
+}
+
+#[test]
+fn a_revision_lookup_costs_a_binary_search_and_reads_no_second_entity() {
+    let (graph, expected) = revision_fixture(false);
+    let dir = tempfile::tempdir().unwrap();
+    write_segment(&graph, dir.path()).unwrap();
+    let reader = written(dir.path());
+
+    // The revision id column is sorted, which is what makes the ordinal the id
+    // rank and the lookup an index-free binary search.
+    let mut previous: Option<Vec<u8>> = None;
+    for ordinal in 0..reader.revision_count() as u32 {
+        let raw = reader.revision_id(ordinal).unwrap().0.as_bytes().to_vec();
+        if let Some(before) = &previous {
+            assert!(
+                before < &raw,
+                "the revision id column is not strictly ascending at ordinal {ordinal}, so a \
+                 binary search over it cannot be the revision index"
+            );
+        }
+        previous = Some(raw);
+    }
+
+    // This is the property the captain asked about: with the differs bit clear,
+    // the revision's entity IS the head entity, so every field comes from the
+    // head's own columns and there is no second entity in the segment at all.
+    let delta_bytes = write_segment(&graph, tempfile::tempdir().unwrap().path())
+        .unwrap()
+        .columns
+        .iter()
+        .find(|column| column.id == crate::storage::segment::format::column::REV_DELTA_ARENA)
+        .map(|column| column.payload_len)
+        .expect("the delta side table column must exist");
+    assert_eq!(
+        delta_bytes, 0,
+        "no revision in this fixture differs from its head, so the delta side table must be \
+         empty, which is what both real stores measure over 294,007 revisions"
+    );
+
+    for (entity_id, want) in &expected {
+        let ordinal = reader
+            .ordinal_of_revision(&want.revision_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !reader.revision_entity_differs_from_head(ordinal).unwrap(),
+            "revision {} should match its head",
+            want.revision_id.0
+        );
+        let entity_ordinal = reader.revision_entity_ordinal(ordinal).unwrap();
+        assert_eq!(reader.entity_id(entity_ordinal).unwrap(), *entity_id);
+        assert_eq!(
+            reader.entity_name(entity_ordinal).unwrap(),
+            want.entity.name,
+            "the head's own name column must answer for the revision"
+        );
+    }
+
+    // The negative, with the sorted-column control above it.
+    let absent = kin_model::EntityRevisionId(Hash256::from_bytes([0xCD; 32]));
+    assert!(!expected.iter().any(|(_, r)| r.revision_id == absent));
+    assert_eq!(reader.ordinal_of_revision(&absent).unwrap(), None);
+}
+
+#[test]
+fn a_revision_whose_head_moved_carries_its_own_entity_in_the_side_table() {
+    let (graph, expected) = revision_fixture(true);
+    let dir = tempfile::tempdir().unwrap();
+    let stats = write_segment(&graph, dir.path()).unwrap();
+    let reader = written(dir.path());
+
+    // The control that makes this test able to fail: the delta side table is
+    // NOT empty here, unlike the fixture above.
+    let delta_bytes = stats
+        .columns
+        .iter()
+        .find(|column| column.id == crate::storage::segment::format::column::REV_DELTA_ARENA)
+        .map(|column| column.payload_len)
+        .unwrap();
+    assert!(
+        delta_bytes > 0,
+        "moving the head must put at least one revision's entity in the delta side table"
+    );
+
+    let mut differing = 0usize;
+    for (_, want) in &expected {
+        let ordinal = reader
+            .ordinal_of_revision(&want.revision_id)
+            .unwrap()
+            .unwrap();
+        let actual = reader.entity_revision(ordinal).unwrap();
+        assert_eq!(
+            actual.entity, want.entity,
+            "a revision whose head moved must still read back its OWN entity, not the head's"
+        );
+        if reader.revision_entity_differs_from_head(ordinal).unwrap() {
+            differing += 1;
+            let head_ordinal = reader.revision_entity_ordinal(ordinal).unwrap();
+            assert_ne!(
+                reader.entity_signature(head_ordinal).unwrap(),
+                want.entity.signature,
+                "the head's signature must have moved, or this arm proves nothing"
+            );
+        }
+    }
+    assert_eq!(
+        differing, 1,
+        "exactly one fixture entity's head was moved out from under its revision"
+    );
+}
+
+#[test]
+fn a_segment_with_no_revisions_reports_none_and_still_opens() {
+    let (graph, _, _) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let stats = write_segment(&graph, dir.path()).unwrap();
+    assert_eq!(stats.revision_count, 0);
+    assert_eq!(stats.change_count, 0);
+
+    let reader = SegmentReader::open(dir.path()).unwrap();
+    assert_eq!(reader.revision_count(), 0);
+    assert_eq!(reader.change_count(), 0);
+    let absent = kin_model::EntityRevisionId(Hash256::from_bytes([0x01; 32]));
+    assert_eq!(reader.ordinal_of_revision(&absent).unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Forward compatibility, which is the property no fixture can prove alone
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_manifest_row_this_binary_does_not_know_is_skipped_and_counted() {
+    let (graph, entities, _) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    write_segment(&graph, dir.path()).unwrap();
+
+    // The control: before the injection, nothing is unknown.
+    assert_eq!(
+        SegmentReader::open(dir.path()).unwrap().unknown_columns(),
+        0
+    );
+
+    // Append one manifest row for a column id no version of this binary knows,
+    // naming a file that does not exist. A reader that tried to map every row
+    // rather than the rows its profile wants would fail on the missing file;
+    // the additive contract says it must skip the row and count it.
+    let path = dir.path().join(MANIFEST_FILE);
+    let bytes = std::fs::read(&path).unwrap();
+    let payload_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&bytes[..HEADER_LEN + payload_len]);
+    rebuilt.extend_from_slice(&9_999u32.to_le_bytes()); // column id
+    rebuilt.extend_from_slice(&4u32.to_le_bytes()); // width
+    rebuilt.extend_from_slice(&1u64.to_le_bytes()); // count
+    rebuilt.extend_from_slice(&4u64.to_le_bytes()); // payload_len
+    rebuilt.extend_from_slice(&[0u8; 32]); // digest
+    let new_payload = payload_len + 56;
+    rebuilt[16..24].copy_from_slice(&(count + 1).to_le_bytes());
+    rebuilt[24..32].copy_from_slice(&(new_payload as u64).to_le_bytes());
+    let digest = Sha256::digest(&rebuilt[..HEADER_LEN + new_payload]);
+    rebuilt.extend_from_slice(&digest);
+    std::fs::write(&path, &rebuilt).unwrap();
+
+    let reader = SegmentReader::open(dir.path()).unwrap();
+    assert_eq!(
+        reader.unknown_columns(),
+        1,
+        "the unknown row must be counted, so a reader can say a newer layout wrote this segment"
+    );
+    // And every entity query still answers, which is the whole point of the
+    // additive rule.
+    for ordinal in 0..reader.entity_count() {
+        reader.entity_name(ordinal).unwrap();
+        reader.outgoing(ordinal).unwrap();
+    }
+    assert!(!reader
+        .entities_by_name(&entities[0].name)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_column_the_segment_does_not_carry_refuses_differently_from_one_the_profile_skips() {
+    let (graph, _, _) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    write_segment(&graph, dir.path()).unwrap();
+    let hot = SegmentReader::open_with_profile(dir.path(), OpenProfile::Hot).unwrap();
+
+    // Present in the segment, not mapped by this profile.
+    let present = hot
+        .entity(0)
+        .expect_err("a hot open must not reconstruct a whole entity")
+        .to_string();
+    assert!(
+        present.contains("full profile"),
+        "a present-but-unmapped column must name the profile, and said: {present}"
+    );
+
+    // Absent from the segment entirely. `fixture()` admits no change, so it
+    // produces no revisions, but the columns exist with zero rows, so the
+    // absent case is reached by asking for an ordinal past their end instead.
+    let absent = hot
+        .revision_id(0)
+        .expect_err("a segment with no revisions has no revision 0")
+        .to_string();
+    assert!(
+        absent.contains("past the end") || absent.contains("carries no column"),
+        "the refusal must say which of the two faults it is, and said: {absent}"
+    );
+}

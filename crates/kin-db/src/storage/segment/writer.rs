@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use kin_model::{Entity, GraphNodeId, Relation};
+use kin_model::{Entity, EntityRevision, GraphNodeId, Relation};
 use sha2::{Digest, Sha256};
 
 use crate::engine::InMemoryGraph;
@@ -55,6 +55,10 @@ pub struct SegmentWriteStats {
     pub columns: Vec<ColumnStat>,
     /// Bytes across every column file plus the manifest.
     pub total_bytes: u64,
+    /// Revisions the segment carries.
+    pub revision_count: u64,
+    /// Distinct `SemanticChangeId` values in the change dictionary.
+    pub change_count: u64,
     /// Bytes across the columns a hot read touches: the entity columns, the
     /// arenas they index, the path table, the name index and the CSR. Cold
     /// columns and the side tables are excluded because a hot read never maps
@@ -94,6 +98,11 @@ const HOT_COLUMNS: &[u32] = &[
     column::REL_ORIGIN,
     column::REL_SRC,
     column::REL_FLAGS,
+    column::REV_ID,
+    column::REV_ENTITY_ORD,
+    column::REV_INTRODUCED_ORD,
+    column::REV_FLAGS,
+    column::CHANGE_IDS,
 ];
 
 /// A staged entity: fixed fields resolved, variable fields as ranges into the
@@ -508,6 +517,11 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
     let relation_count = relation_records.relation_count;
     written.extend(relation_records.columns);
 
+    let revision_records = write_revisions(graph, dir, &ordinal_of_id)?;
+    let revision_count = revision_records.revision_count;
+    let change_count = revision_records.change_count;
+    written.extend(revision_records.columns);
+
     let shape = SegmentShape {
         entity_count: entity_count as u64,
         relation_count,
@@ -539,6 +553,8 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
 
     Ok(SegmentWriteStats {
         shape,
+        revision_count,
+        change_count,
         columns,
         total_bytes: total,
         hot_bytes: hot,
@@ -984,6 +1000,211 @@ fn write_bytes_column(
         count,
         payload_len,
         digest: digest_bytes,
+    })
+}
+
+struct RevisionColumns {
+    columns: Vec<ColumnRecord>,
+    revision_count: u64,
+    change_count: u64,
+}
+
+/// One staged revision. The whole `Entity` is carried only when it differs from
+/// the head, which is measured to be never on either real store.
+struct StagedRevision {
+    id: [u8; 32],
+    entity_ord: u32,
+    introduced: [u8; 32],
+    previous: Option<[u8; 32]>,
+    ended: Option<[u8; 32]>,
+    delta: Option<Vec<u8>>,
+}
+
+fn write_revisions(
+    graph: &InMemoryGraph,
+    dir: &Path,
+    ordinal_of_id: &HashMap<[u8; 16], u32>,
+) -> Result<RevisionColumns, KinDbError> {
+    let mut staged: Vec<StagedRevision> = Vec::new();
+    let mut failure: Option<KinDbError> = None;
+
+    graph.for_each_entity_revision(|entity_id, revision, head| {
+        if failure.is_some() {
+            return;
+        }
+        match stage_revision(entity_id, revision, head, ordinal_of_id) {
+            Ok(row) => staged.push(row),
+            Err(error) => failure = Some(error),
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+
+    // Revisions sorted by id, so the revision ordinal is the id rank and a
+    // `RetrievalKey::EntityRevision` lookup is a binary search over the id
+    // column itself, exactly as entities work.
+    staged.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+    // The change dictionary. Distinct count is bounded by the commit count and
+    // is measured ONE on both real stores.
+    let mut changes: BTreeMap<[u8; 32], u32> = BTreeMap::new();
+    for row in &staged {
+        changes.entry(row.introduced).or_insert(0);
+        if let Some(ended) = row.ended {
+            changes.entry(ended).or_insert(0);
+        }
+    }
+    let mut change_bytes: Vec<u8> = Vec::with_capacity(changes.len() * 32);
+    for (index, (change, slot)) in changes.iter_mut().enumerate() {
+        *slot = index as u32;
+        change_bytes.extend_from_slice(change);
+    }
+    let change_count = changes.len();
+
+    let revision_count = staged.len();
+    let mut ids: Vec<u8> = Vec::with_capacity(revision_count * 32);
+    let mut entity_ords: Vec<u8> = Vec::with_capacity(revision_count * 4);
+    let mut introduced: Vec<u8> = Vec::with_capacity(revision_count * 4);
+    let mut flags: Vec<u8> = Vec::with_capacity(revision_count);
+    let mut previous: Vec<u8> = Vec::with_capacity(revision_count * 32);
+    let mut ended: Vec<u8> = Vec::with_capacity(revision_count * 4);
+    let mut delta_off: Vec<u8> = Vec::with_capacity((revision_count + 1) * 8);
+    let mut delta_arena: Vec<u8> = Vec::new();
+    delta_off.extend_from_slice(&0u64.to_le_bytes());
+
+    for row in &staged {
+        ids.extend_from_slice(&row.id);
+        entity_ords.extend_from_slice(&row.entity_ord.to_le_bytes());
+        let introduced_ord = changes.get(&row.introduced).copied().ok_or_else(|| {
+            KinDbError::StorageError(
+                "segment writer staged a revision whose introducing change is not in the \
+                 dictionary it just built"
+                    .to_string(),
+            )
+        })?;
+        introduced.extend_from_slice(&introduced_ord.to_le_bytes());
+
+        let mut bits = 0u8;
+        match row.previous {
+            Some(id) => {
+                bits |= REV_HAS_PREVIOUS;
+                previous.extend_from_slice(&id);
+            }
+            None => previous.extend_from_slice(&[0u8; 32]),
+        }
+        match row.ended {
+            Some(change) => {
+                bits |= REV_HAS_ENDED;
+                let slot = changes.get(&change).copied().ok_or_else(|| {
+                    KinDbError::StorageError(
+                        "segment writer staged a revision whose ending change is not in the \
+                         dictionary it just built"
+                            .to_string(),
+                    )
+                })?;
+                ended.extend_from_slice(&slot.to_le_bytes());
+            }
+            None => ended.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+        if let Some(encoded) = &row.delta {
+            bits |= REV_ENTITY_DIFFERS;
+            delta_arena.extend_from_slice(encoded);
+        }
+        delta_off.extend_from_slice(&(delta_arena.len() as u64).to_le_bytes());
+        flags.push(bits);
+    }
+
+    let columns = vec![
+        write_bytes_column(dir, column::REV_ID, 32, revision_count as u64, ids)?,
+        write_bytes_column(
+            dir,
+            column::REV_ENTITY_ORD,
+            4,
+            revision_count as u64,
+            entity_ords,
+        )?,
+        write_bytes_column(
+            dir,
+            column::REV_INTRODUCED_ORD,
+            4,
+            revision_count as u64,
+            introduced,
+        )?,
+        write_bytes_column(dir, column::REV_FLAGS, 1, revision_count as u64, flags)?,
+        write_bytes_column(
+            dir,
+            column::REV_PREVIOUS_ID,
+            32,
+            revision_count as u64,
+            previous,
+        )?,
+        write_bytes_column(dir, column::REV_ENDED_ORD, 4, revision_count as u64, ended)?,
+        write_bytes_column(
+            dir,
+            column::CHANGE_IDS,
+            32,
+            change_count as u64,
+            change_bytes,
+        )?,
+        write_bytes_column(
+            dir,
+            column::REV_DELTA_OFF,
+            8,
+            revision_count as u64 + 1,
+            delta_off,
+        )?,
+        {
+            let len = delta_arena.len() as u64;
+            write_bytes_column(dir, column::REV_DELTA_ARENA, 1, len, delta_arena)?
+        },
+    ];
+
+    Ok(RevisionColumns {
+        columns,
+        revision_count: revision_count as u64,
+        change_count: change_count as u64,
+    })
+}
+
+fn stage_revision(
+    entity_id: &kin_model::EntityId,
+    revision: &EntityRevision,
+    head: Option<&Entity>,
+    ordinal_of_id: &HashMap<[u8; 16], u32>,
+) -> Result<StagedRevision, KinDbError> {
+    let entity_ord = ordinal_of_id
+        .get(entity_id.0.as_bytes())
+        .copied()
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "entity revision {} anchors on entity {entity_id}, which the graph does not \
+                 hold, so the segment has no ordinal to point it at",
+                revision.revision_id.0
+            ))
+        })?;
+
+    // Compared by value, NOT by serialized bytes. `EntityMetadata` wraps a
+    // `HashMap`, whose iteration order is not part of its value, so two equal
+    // entities can serialize two ways and a byte comparison would set the
+    // differs bit on entities that are the same.
+    let differs = match head {
+        Some(head) => &revision.entity != head,
+        None => true,
+    };
+    let delta = if differs {
+        Some(serde_json::to_vec(&revision.entity)?)
+    } else {
+        None
+    };
+
+    Ok(StagedRevision {
+        id: *revision.revision_id.0.as_bytes(),
+        entity_ord,
+        introduced: *revision.introduced_by.0.as_bytes(),
+        previous: revision.previous_revision.map(|id| *id.0.as_bytes()),
+        ended: revision.ended_by.map(|id| *id.0.as_bytes()),
+        delta,
     })
 }
 

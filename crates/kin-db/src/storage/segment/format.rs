@@ -126,6 +126,42 @@ pub mod column {
     pub const REL_ENDPOINTS_ARENA: u32 = 63;
     pub const REL_EVIDENCE_OFF: u32 = 64;
     pub const REL_EVIDENCE_ARENA: u32 = 65;
+
+    // Entity revisions, addressed by revision ordinal.
+    //
+    // These are ADDITIVE: a reader that does not know them skips their manifest
+    // rows and counts them in `unknown_columns`, and a hot open still answers
+    // every entity query. That is why adding them does not move
+    // `CURRENT_SEGMENT_VERSION`, and why the revision counts live in their
+    // columns' own manifest rows rather than in the manifest preamble, which
+    // could not grow without reinterpreting bytes a v1 reader already parses.
+    pub const REV_ID: u32 = 70;
+    pub const REV_ENTITY_ORD: u32 = 71;
+    pub const REV_INTRODUCED_ORD: u32 = 72;
+    pub const REV_FLAGS: u32 = 73;
+    /// The previous revision's raw 32-byte id, not an ordinal.
+    ///
+    /// A previous-revision reference can point at a revision outside this
+    /// segment, from a retired generation, and an ordinal cannot represent
+    /// that. Deriving it instead is unsound: the id IS
+    /// `sha256(entity_id || introduced_by)` for a revision built by
+    /// `EntityRevision::new`, but a caller can construct the struct with any
+    /// id, so a reader that recomputed one would silently substitute a
+    /// different revision. Thirty-two raw bytes in a COLD column, measured
+    /// absent on all 294,007 revisions across both real stores, is cheaper than
+    /// a verify-then-compress path plus the side table its failure case needs.
+    pub const REV_PREVIOUS_ID: u32 = 74;
+    pub const REV_ENDED_ORD: u32 = 75;
+    /// Distinct `SemanticChangeId` values, sorted. `introduced_by` and
+    /// `ended_by` are u32 ordinals into this table rather than 32-byte hashes,
+    /// because the distinct count is bounded by the commit count and measured
+    /// ONE on both real stores against 264,615 and 29,392 revisions.
+    pub const CHANGE_IDS: u32 = 76;
+    /// Side table by revision ordinal, carrying the revision's whole `Entity`
+    /// only when it differs from the head. Measured EMPTY on both real stores:
+    /// all 294,007 revisions are byte-identical to their head entity.
+    pub const REV_DELTA_OFF: u32 = 77;
+    pub const REV_DELTA_ARENA: u32 = 78;
 }
 
 /// File name a column is stored under inside the segment directory.
@@ -168,6 +204,19 @@ pub const REL_HAS_EVIDENCE: u8 = 0b0000_0100;
 /// Both endpoints are entities, so `REL_SRC` and the CSR describe them and the
 /// endpoint side table holds nothing for this ordinal.
 pub const REL_ENTITY_ENDPOINTS: u8 = 0b0000_1000;
+
+/// The revision carries a `previous_revision`.
+pub const REV_HAS_PREVIOUS: u8 = 0b0000_0001;
+/// The revision carries an `ended_by`.
+pub const REV_HAS_ENDED: u8 = 0b0000_0010;
+/// The revision's `entity` is NOT byte-identical to the head entity, so the
+/// delta side table carries it. When this bit is CLEAR the head entity's own
+/// columns answer every field and no second entity exists to decode.
+///
+/// A one-bit answer rather than a content hash on purpose: the comparison is
+/// made once at write time, and a hash would add nothing the bit does not
+/// already say. Detecting corruption is `verify_all`'s job, not this column's.
+pub const REV_ENTITY_DIFFERS: u8 = 0b0000_0100;
 
 // ---------------------------------------------------------------------------
 // Wire codes for the enums the columns carry
