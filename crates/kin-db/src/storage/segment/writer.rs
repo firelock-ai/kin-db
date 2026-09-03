@@ -19,13 +19,15 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::mmap::atomic_write_bytes_no_magic;
 use crate::storage::segment::format::{
-    column, column_file_name, encode_header, relation_kind_code, relation_origin_code, ColumnRecord,
-    SegmentShape, COLD_HAS_CREATED_IN, COLD_HAS_LINEAGE, COLD_HAS_METADATA, COLD_HAS_SUPERSEDED,
-    DIGEST_LEN, FLAG_HAS_DOC, FLAG_HAS_PATH, FLAG_HAS_SPAN, FLAG_ROLE_SHIFT, HEADER_LEN,
-    MANIFEST_ENTRY_LEN, MANIFEST_FILE, MANIFEST_PREAMBLE_LEN, REL_ENTITY_ENDPOINTS,
+    column, column_file_name, encode_header, relation_kind_code, relation_origin_code,
+    ColumnRecord, SegmentShape, COLD_HAS_CREATED_IN, COLD_HAS_LINEAGE, COLD_HAS_METADATA,
+    COLD_HAS_SUPERSEDED, DIGEST_LEN, FLAG_HAS_DOC, FLAG_HAS_PATH, FLAG_HAS_SPAN, FLAG_ROLE_SHIFT,
+    HEADER_LEN, MANIFEST_ENTRY_LEN, MANIFEST_FILE, MANIFEST_PREAMBLE_LEN, REL_ENTITY_ENDPOINTS,
     REL_HAS_CREATED_IN, REL_HAS_EVIDENCE, REL_HAS_IMPORT_SOURCE,
 };
-use crate::storage::segment::format::{entity_kind_code, language_code, role_code, visibility_code};
+use crate::storage::segment::format::{
+    entity_kind_code, language_code, role_code, visibility_code,
+};
 
 /// What one column cost on disk, so a caller can hold the layout to the
 /// per-column sizes it registered before the run.
@@ -164,16 +166,20 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
     let mut path_list: Vec<String> = Vec::new();
 
     graph.for_each_entity(|entity| {
-        staged.push(stage_entity(entity, &mut arenas, &mut path_slots, &mut path_list));
+        staged.push(stage_entity(
+            entity,
+            &mut arenas,
+            &mut path_slots,
+            &mut path_list,
+        ));
     });
 
     // The ordinal IS the id rank, so `id -> ordinal` is a binary search over
     // the id column and costs no separate index. Ids are 16 fixed bytes, which
     // is why this beats an FST here rather than merely avoiding a dependency.
     let mut order: Vec<u32> = (0..staged.len() as u32).collect();
-    order.sort_unstable_by(|left, right| {
-        staged[*left as usize].id.cmp(&staged[*right as usize].id)
-    });
+    order
+        .sort_unstable_by(|left, right| staged[*left as usize].id.cmp(&staged[*right as usize].id));
     let mut ordinal_of_slot = vec![0u32; staged.len()];
     for (ordinal, slot) in order.iter().enumerate() {
         ordinal_of_slot[*slot as usize] = ordinal as u32;
@@ -188,9 +194,8 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
     // Paths are written in sorted order so a later reader can binary-search a
     // path to its ordinal without a second index.
     let mut path_order: Vec<u32> = (0..path_list.len() as u32).collect();
-    path_order.sort_unstable_by(|left, right| {
-        path_list[*left as usize].cmp(&path_list[*right as usize])
-    });
+    path_order
+        .sort_unstable_by(|left, right| path_list[*left as usize].cmp(&path_list[*right as usize]));
     let mut path_ordinal_of_slot = vec![0u32; path_list.len()];
     for (ordinal, slot) in path_order.iter().enumerate() {
         path_ordinal_of_slot[*slot as usize] = ordinal as u32;
@@ -198,12 +203,20 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
 
     let mut written: Vec<ColumnRecord> = Vec::new();
 
-    written.push(write_fixed(dir, column::ENTITY_ID, 16, entity_count, |ordinal| {
-        staged[order[ordinal] as usize].id.to_vec()
-    })?);
-    written.push(write_fixed(dir, column::ENTITY_KIND, 1, entity_count, |ordinal| {
-        vec![staged[order[ordinal] as usize].kind]
-    })?);
+    written.push(write_fixed(
+        dir,
+        column::ENTITY_ID,
+        16,
+        entity_count,
+        |ordinal| staged[order[ordinal] as usize].id.to_vec(),
+    )?);
+    written.push(write_fixed(
+        dir,
+        column::ENTITY_KIND,
+        1,
+        entity_count,
+        |ordinal| vec![staged[order[ordinal] as usize].kind],
+    )?);
     written.push(write_fixed(
         dir,
         column::ENTITY_LANGUAGE,
@@ -211,9 +224,13 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
         entity_count,
         |ordinal| vec![staged[order[ordinal] as usize].language],
     )?);
-    written.push(write_fixed(dir, column::ENTITY_FLAGS, 1, entity_count, |ordinal| {
-        vec![staged[order[ordinal] as usize].flags]
-    })?);
+    written.push(write_fixed(
+        dir,
+        column::ENTITY_FLAGS,
+        1,
+        entity_count,
+        |ordinal| vec![staged[order[ordinal] as usize].flags],
+    )?);
     written.push(write_fixed(
         dir,
         column::ENTITY_AST_HASH,
@@ -235,14 +252,20 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
             resolved.to_le_bytes().to_vec()
         },
     )?);
-    written.push(write_fixed(dir, column::ENTITY_SPAN, 24, entity_count, |ordinal| {
-        let span = staged[order[ordinal] as usize].span;
-        let mut bytes = Vec::with_capacity(24);
-        for value in span {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes
-    })?);
+    written.push(write_fixed(
+        dir,
+        column::ENTITY_SPAN,
+        24,
+        entity_count,
+        |ordinal| {
+            let span = staged[order[ordinal] as usize].span;
+            let mut bytes = Vec::with_capacity(24);
+            for value in span {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        },
+    )?);
 
     written.push(write_fixed(
         dir,
@@ -423,7 +446,12 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
         column::ENTITY_STABILITY,
         4,
         entity_count,
-        |ordinal| staged[order[ordinal] as usize].stability.to_le_bytes().to_vec(),
+        |ordinal| {
+            staged[order[ordinal] as usize]
+                .stability
+                .to_le_bytes()
+                .to_vec()
+        },
     )?);
     written.push(write_fixed(
         dir,
@@ -454,7 +482,9 @@ pub fn write_segment(graph: &InMemoryGraph, dir: &Path) -> Result<SegmentWriteSt
     meta_off.extend_from_slice(&0u64.to_le_bytes());
     for slot in &order {
         let entry = &staged[*slot as usize];
-        meta_arena.extend_from_slice(&arenas.metadata[entry.metadata.0..entry.metadata.0 + entry.metadata.1]);
+        meta_arena.extend_from_slice(
+            &arenas.metadata[entry.metadata.0..entry.metadata.0 + entry.metadata.1],
+        );
         meta_off.extend_from_slice(&(meta_arena.len() as u64).to_le_bytes());
     }
     written.push(write_bytes_column(
@@ -534,12 +564,10 @@ fn write_relations(
     let mut other: Vec<Relation> = Vec::new();
     graph.for_each_relation(|relation| {
         let endpoints = match (relation.src, relation.dst) {
-            (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) => {
-                ordinal_of_id
-                    .get(src.0.as_bytes())
-                    .zip(ordinal_of_id.get(dst.0.as_bytes()))
-                    .map(|(source, target)| (*source, *target))
-            }
+            (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) => ordinal_of_id
+                .get(src.0.as_bytes())
+                .zip(ordinal_of_id.get(dst.0.as_bytes()))
+                .map(|(source, target)| (*source, *target)),
             _ => None,
         };
         if endpoints.is_some() {
@@ -652,7 +680,8 @@ fn write_relations(
             flags |= REL_HAS_IMPORT_SOURCE;
             import_arena.extend_from_slice(source.as_bytes());
         }
-        import_off.extend_from_slice(&checked_u32(import_arena.len(), "import arena")?.to_le_bytes());
+        import_off
+            .extend_from_slice(&checked_u32(import_arena.len(), "import arena")?.to_le_bytes());
 
         if !is_entity_edge {
             let encoded = serde_json::to_vec(&(relation.src, relation.dst))?;
@@ -700,7 +729,13 @@ fn write_relations(
             relation_count as u64,
             rel_confidence,
         )?,
-        write_bytes_column(dir, column::REL_ORIGIN, 1, relation_count as u64, rel_origin)?,
+        write_bytes_column(
+            dir,
+            column::REL_ORIGIN,
+            1,
+            relation_count as u64,
+            rel_origin,
+        )?,
         write_bytes_column(dir, column::REL_SRC, 4, relation_count as u64, rel_src)?,
         write_bytes_column(dir, column::REL_FLAGS, 1, relation_count as u64, rel_flags)?,
         write_bytes_column(
@@ -752,10 +787,7 @@ fn write_relations(
     })
 }
 
-fn endpoint_ordinal(
-    node: &GraphNodeId,
-    ordinal_of_id: &HashMap<[u8; 16], u32>,
-) -> Option<u32> {
+fn endpoint_ordinal(node: &GraphNodeId, ordinal_of_id: &HashMap<[u8; 16], u32>) -> Option<u32> {
     match node {
         GraphNodeId::Entity(id) => ordinal_of_id.get(id.0.as_bytes()).copied(),
         _ => None,

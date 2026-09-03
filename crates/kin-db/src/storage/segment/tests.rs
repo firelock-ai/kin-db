@@ -129,7 +129,14 @@ fn fixture() -> (InMemoryGraph, Vec<Entity>, Vec<Relation>) {
 
     let relations = vec![
         relation(0x11, RelationKind::Calls, alpha.id, gamma.id, 0.9, true),
-        relation(0x12, RelationKind::References, alpha.id, beta.id, 0.5, false),
+        relation(
+            0x12,
+            RelationKind::References,
+            alpha.id,
+            beta.id,
+            0.5,
+            false,
+        ),
         relation(0x13, RelationKind::Contains, alpha.id, delta.id, 1.0, false),
         relation(0x14, RelationKind::Imports, gamma.id, beta.id, 0.25, false),
         relation(0x15, RelationKind::Calls, gamma.id, dangling, 0.75, false),
@@ -275,7 +282,11 @@ fn every_relation_reads_back_byte_identical_through_the_mapped_views() {
         );
         seen.insert(key);
     }
-    assert_eq!(seen.len(), relations.len(), "every relation must appear once");
+    assert_eq!(
+        seen.len(),
+        relations.len(),
+        "every relation must appear once"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +382,11 @@ fn the_csr_answers_the_same_adjacency_the_graph_does() {
             .iter()
             .map(|source| reader.entity_id(source).unwrap().0.as_bytes().to_vec())
             .collect();
-        assert_eq!(got_in, want_in, "incoming set differs for {}", expected.name);
+        assert_eq!(
+            got_in, want_in,
+            "incoming set differs for {}",
+            expected.name
+        );
 
         // The relation ordinals an entity's outgoing range names must be
         // exactly the relations whose source is that entity.
@@ -429,7 +444,10 @@ fn a_duplicated_name_returns_every_ordinal_that_carries_it() {
         .collect();
     assert_eq!(mixed, ordinals);
 
-    assert!(reader.entities_by_name("no_such_symbol").unwrap().is_empty());
+    assert!(reader
+        .entities_by_name("no_such_symbol")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -443,7 +461,9 @@ fn the_counts_come_from_scanning_the_columns_rather_than_a_persisted_tally() {
     let mut want_languages: BTreeMap<u8, u32> = BTreeMap::new();
     for item in &entities {
         *want_kinds.entry(entity_kind_code(item.kind)).or_default() += 1;
-        *want_languages.entry(language_code(item.language)).or_default() += 1;
+        *want_languages
+            .entry(language_code(item.language))
+            .or_default() += 1;
     }
     assert!(want_kinds.len() > 1 && want_languages.len() > 1);
     assert_eq!(reader.kind_counts().unwrap(), want_kinds);

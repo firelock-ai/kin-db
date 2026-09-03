@@ -34,11 +34,6 @@ pub use storage::format::{
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
-pub use storage::{
-    write_segment, ColumnStat, OpenProfile, Ordinals, SegmentReader, SegmentShape,
-    SegmentWriteStats,
-    CURRENT_SEGMENT_VERSION, MAX_SUPPORTED_SEGMENT_VERSION, MIN_SUPPORTED_SEGMENT_VERSION,
-};
 pub use storage::SnapshotManager;
 pub use storage::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
@@ -65,6 +60,11 @@ pub use storage::{
     read_hosted_vector_artifact_actual_producers, validate_hosted_vector_artifact_inner,
     validate_hosted_vector_artifact_inner_for_producers,
     validate_hosted_vector_artifact_inner_with_producers, VECTOR_INDEX_METADATA_VERSION,
+};
+pub use storage::{
+    write_segment, ColumnStat, OpenProfile, Ordinals, SegmentReader, SegmentShape,
+    SegmentWriteStats, CURRENT_SEGMENT_VERSION, MAX_SUPPORTED_SEGMENT_VERSION,
+    MIN_SUPPORTED_SEGMENT_VERSION,
 };
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,

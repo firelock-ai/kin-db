@@ -222,14 +222,12 @@ impl SegmentReader {
         for index in 0..header.count as usize {
             let base = MANIFEST_PREAMBLE_LEN + index * MANIFEST_ENTRY_LEN;
             let digest_at = base + 24;
-            let digest_bytes = payload
-                .get(digest_at..digest_at + 32)
-                .ok_or_else(|| {
-                    KinDbError::StorageError(format!(
-                        "segment manifest declares {} columns and its table stops at entry {index}",
-                        header.count
-                    ))
-                })?;
+            let digest_bytes = payload.get(digest_at..digest_at + 32).ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "segment manifest declares {} columns and its table stops at entry {index}",
+                    header.count
+                ))
+            })?;
             let mut digest = [0u8; 32];
             digest.copy_from_slice(digest_bytes);
             manifest.push(ColumnRecord {
@@ -242,7 +240,11 @@ impl SegmentReader {
         }
 
         let wanted: Vec<u32> = match profile {
-            OpenProfile::Hot => HOT_REQUIRED.iter().chain(HOT_ALSO.iter()).copied().collect(),
+            OpenProfile::Hot => HOT_REQUIRED
+                .iter()
+                .chain(HOT_ALSO.iter())
+                .copied()
+                .collect(),
             OpenProfile::Full => manifest.iter().map(|record| record.id).collect(),
         };
 
@@ -443,7 +445,10 @@ impl SegmentReader {
         if self.entity_flags(ordinal)? & FLAG_HAS_PATH == 0 {
             return Ok(None);
         }
-        let slot = read_u32(self.fixed(column::ENTITY_PATH_ORD, ordinal, "entity path")?, 0)?;
+        let slot = read_u32(
+            self.fixed(column::ENTITY_PATH_ORD, ordinal, "entity path")?,
+            0,
+        )?;
         self.path(slot).map(Some)
     }
 
@@ -539,12 +544,9 @@ impl SegmentReader {
             })?,
             0,
         )? as usize;
-        let bytes = postings
-            .payload()
-            .get(start * 4..end * 4)
-            .ok_or_else(|| {
-                KinDbError::StorageError("segment name postings run past the column".into())
-            })?;
+        let bytes = postings.payload().get(start * 4..end * 4).ok_or_else(|| {
+            KinDbError::StorageError("segment name postings run past the column".into())
+        })?;
         Ok(Ordinals(bytes))
     }
 
@@ -601,7 +603,11 @@ impl SegmentReader {
 
     /// The confidence at `relation_ordinal`.
     pub fn relation_confidence(&self, relation_ordinal: u32) -> Result<f32, KinDbError> {
-        let bytes = self.fixed(column::REL_CONFIDENCE, relation_ordinal, "relation confidence")?;
+        let bytes = self.fixed(
+            column::REL_CONFIDENCE,
+            relation_ordinal,
+            "relation confidence",
+        )?;
         let mut raw = [0u8; 4];
         raw.copy_from_slice(bytes);
         Ok(f32::from_le_bytes(raw))
@@ -657,13 +663,16 @@ impl SegmentReader {
                 behavior_hash: self.cold_hash(column::ENTITY_BEHAVIOR_HASH, ordinal)?,
                 equivalence_hash: self.cold_hash(column::ENTITY_EQUIVALENCE_HASH, ordinal)?,
                 stability_score: {
-                    let bytes = self.fixed(column::ENTITY_STABILITY, ordinal, "entity stability")?;
+                    let bytes =
+                        self.fixed(column::ENTITY_STABILITY, ordinal, "entity stability")?;
                     let mut raw = [0u8; 4];
                     raw.copy_from_slice(bytes);
                     f32::from_le_bytes(raw)
                 },
             },
-            file_origin: self.entity_path(ordinal)?.map(|p| FilePathId(p.to_string())),
+            file_origin: self
+                .entity_path(ordinal)?
+                .map(|p| FilePathId(p.to_string())),
             span: self.entity_span(ordinal)?,
             signature: self.entity_signature(ordinal)?.to_string(),
             visibility: self.entity_visibility(ordinal)?,
