@@ -164,6 +164,23 @@ pub struct SegmentReader {
     unknown_columns: usize,
 }
 
+impl std::fmt::Debug for SegmentReader {
+    /// The shape and the mapped column ids. Deliberately not a derive: the
+    /// derive would print every mapping, and what a failing assertion needs to
+    /// read is which columns this open holds.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentReader")
+            .field("dir", &self.dir)
+            .field("profile", &self.profile)
+            .field("shape", &self.shape)
+            .field("mapped_columns", &self.columns.keys().collect::<Vec<_>>())
+            .field("manifest_columns", &self.manifest.len())
+            .field("unknown_columns", &self.unknown_columns)
+            .finish()
+    }
+}
+
 impl SegmentReader {
     /// Open the segment in `dir` with the hot profile.
     pub fn open(dir: &Path) -> Result<Self, KinDbError> {
