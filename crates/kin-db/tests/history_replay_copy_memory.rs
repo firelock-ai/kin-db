@@ -234,7 +234,10 @@ fn publish_bootstrap(directory: &std::path::Path, repository: &RepositoryId, mes
     let receipt = manager
         .commit_repository_transaction(transaction)
         .expect("whole-history bootstrap commits");
-    assert_eq!(receipt.generation, 1, "the bootstrap publishes generation 1");
+    assert_eq!(
+        receipt.generation, 1,
+        "the bootstrap publishes generation 1"
+    );
 }
 
 /// Break the durable validation record so the next open cannot reuse it and has
@@ -251,8 +254,11 @@ fn retire_the_validation_record(directory: &std::path::Path, repository: &Reposi
     );
     record["history_validation"]["snapshot_sha256"] =
         serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
-    std::fs::write(&path, serde_json::to_vec(&record).expect("record serializes"))
-        .expect("authority.json is writable");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&record).expect("record serializes"),
+    )
+    .expect("authority.json is writable");
 }
 
 /// Build a store whose changes each carry `message_bytes`, retire its
