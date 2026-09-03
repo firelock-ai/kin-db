@@ -729,16 +729,58 @@ impl PersistedRepositoryAuthority {
         Ok(authority)
     }
 
+    /// Drop the operation record embedded in every receipt whose operation the
+    /// log beside it already holds.
+    ///
+    /// FIR-3064 stopped a receipt EMBEDDING its operation record, but
+    /// `PersistedCommitReceipt::trimmed` is only ever pushed, so a store
+    /// written before that change carried its fat receipts through every
+    /// rewrite. Measured by walking the persisted frame of a converted Linux
+    /// subtree: `receipts[0]` alone is 411,771,864 bytes of a 2,043,051,848
+    /// byte body, 20.15 percent of the store, and it is a verbatim second copy
+    /// of a record in the operation log a few elements away.
+    ///
+    /// Nothing reads the embedded copy. In kin-db the field's only reader is
+    /// `GraphSnapshot::persists_a_trimmed_receipt`, which asks whether ANY
+    /// receipt is trimmed and only becomes more true here;
+    /// [`PersistedCommitReceipt::validate_against`] compares against the log
+    /// entry and never touches it; and kin's `rejoined_receipt` takes the
+    /// record from the log. No root folds `receipts`, so this moves no
+    /// identity and needs no schema or wire version.
+    ///
+    /// A receipt whose operation the log does NOT hold keeps its copy. The
+    /// envelope requires every operation to have a receipt and not the reverse,
+    /// so that case is representable, and dropping a record nothing else holds
+    /// would be destroying the only copy rather than removing a duplicate.
+    pub(crate) fn trim_receipts_the_log_already_holds(&mut self) {
+        let logged: BTreeSet<_> = self
+            .operation_log
+            .iter()
+            .map(|operation| operation.operation_id)
+            .collect();
+        for receipt in &mut self.receipts {
+            if receipt.operation.is_some() && logged.contains(&receipt.operation_id) {
+                receipt.operation = None;
+            }
+        }
+    }
+
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
         let admitted = AdmittedChangeMap::admit(&snapshot.changes, "snapshot")?;
-        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required, &admitted)
+        self.validate_against_snapshot_with(
+            snapshot,
+            GitProjectionTreeReplay::Required,
+            RootRecomputation::Required,
+            &admitted,
+        )
     }
 
     pub(crate) fn validate_against_snapshot_with(
         &self,
         snapshot: &GraphSnapshot,
         replay: GitProjectionTreeReplay,
+        roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
@@ -915,11 +957,19 @@ impl PersistedRepositoryAuthority {
         validate_workspace_authority(snapshot, self, Some(admitted))?;
         let workspace_authority_ms = timer.lap_ms();
 
-        let computed = compute_roots(snapshot, self, self.roots.generation)?;
-        if computed != self.roots {
-            return Err(storage(
-                "repository root bundle does not recompute from the persisted envelope".to_string(),
-            ));
+        // Skipped only on an exact obligation the caller discharged over this
+        // same snapshot and envelope; see `RootRecomputation`. Every caller
+        // that reads a bundle it did not just compute still passes `Required`,
+        // so a store whose bundle does not derive from its contents is still
+        // refused, just not once per commit as well.
+        if roots == RootRecomputation::Required {
+            let computed = compute_roots(snapshot, self, self.roots.generation)?;
+            if computed != self.roots {
+                return Err(storage(
+                    "repository root bundle does not recompute from the persisted envelope"
+                        .to_string(),
+                ));
+            }
         }
         let compute_roots_ms = timer.lap_ms();
         tracing::debug!(
@@ -3679,6 +3729,15 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     metadata
         .receipts
         .sort_by_key(|persisted| persisted.operation_id);
+    // And the ones this store inherited, for the reason on the method: a store
+    // written before the receipt trim carried its fat receipts through every
+    // rewrite, and on a converted Linux subtree that is 411,771,864 bytes of a
+    // 2,043,051,848 byte body. `AuthorityFrame::apply_to_envelope` calls the
+    // same function on the reader's side, and it has to: `first_difference`
+    // compares the reconstructed envelope with this one by `PartialEq`, so a
+    // trim on one side only would make the writer refuse its own frame and
+    // rewrite the whole base instead.
+    metadata.trim_receipts_the_log_already_holds();
     snapshot.repository_authority = Some(metadata);
     // A publish carries whatever section its base already had, or none, and
     // never writes one: see the note in `apply_workspace`. The version still
@@ -3698,7 +3757,18 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     // aliases after `admit_aliases`, and the authority itself after the delta is
     // applied. A write to any of them between that call and this line restores
     // this caller's obligation to `GitProjectionTreeReplay::Required`.
-    snapshot.validate_storage_admission_with(GitProjectionTreeReplay::Proven)?;
+    //
+    // The root bundle is proven on the same terms. `metadata.roots` was set
+    // from `compute_roots` over this exact snapshot and this exact envelope in
+    // the `kindb.prepare.roots` lap above, and the only write between that call
+    // and this line is `roots_after` on the operation record appended there,
+    // which no root reads: `RepositoryOperationRecord::identity_hash` excludes
+    // both root bundles by construction, and `RefLogProjection::from_operation`
+    // names neither. Any other write to a root's inputs between those two
+    // points restores this caller's obligation to
+    // `RootRecomputation::Required`. This is the ONE caller entitled to state
+    // it, because it is the only one holding a bundle it folded itself.
+    snapshot.validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven)?;
     let storage_admission_ms = timer.lap_ms();
     drop(lap);
 
@@ -4027,6 +4097,53 @@ fn validate_transaction_git_projection_membership(
 /// byte-identical inputs and no write to any of the four has intervened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitProjectionTreeReplay {
+    Required,
+    Proven,
+}
+
+/// Whether a caller still owes the root-bundle recomputation.
+///
+/// [`compute_roots`] folds every leaf of every domain into six SHA-256 roots
+/// through [`canonical_leaf_hash`], which buffers one copy of the canonical
+/// payload of each leaf it hashes (see `canonical_hash`'s module header). The
+/// change map is ONE leaf, not one leaf per change, so the buffer is the size
+/// of the whole history: measured by walking the persisted frames of two real
+/// stores, that leaf is 85,429,663 bytes on a converted VS Code tree and
+/// 410,546,852 bytes on a converted Linux subtree, in bodies of 420,187,160
+/// and 2,043,051,848 bytes.
+///
+/// A commit paid that twice over identical content. `prepare_successor`
+/// computes the bundle in its `kindb.prepare.roots` lap and stores it as
+/// `metadata.roots`, and the storage-admission gate it runs a few statements
+/// later recomputed the same bundle from the same snapshot to compare it with
+/// itself.
+///
+/// Recomputation is what proves a snapshot READ from disk agrees with the
+/// envelope beside it, and it stays on every path that has no durable
+/// history-validation record to trust instead: a first open, a recovery, a
+/// record that does not verify, and
+/// [`PersistedRepositoryAuthority::validate_against_snapshot`] itself. It is
+/// worth being exact about the path that does NOT recompute, because it is not
+/// this change's doing: a reopen carrying a valid record folds nothing, since
+/// that record is this validator's own verdict on those exact bytes (FIR-3064).
+/// So the recomputation guards precisely the openings where the bytes cannot be
+/// taken on trust, and a commit's own fresh arithmetic was never one of them.
+///
+/// [`RootRecomputation::Proven`] therefore states an exact obligation rather
+/// than a preference: the caller has already run [`compute_roots`] over this
+/// exact snapshot and this exact envelope, stored the result as the envelope's
+/// `roots`, and written nothing since to any input a root reads. Filling in
+/// `roots_after` on the appended operation record does not break it, because
+/// `RepositoryOperationRecord::identity_hash` excludes `roots_before` and
+/// `roots_after` by construction and `RefLogProjection::from_operation` reads
+/// neither.
+///
+/// The failure mode if an obligation is ever stated wrongly is loud and it is
+/// at the next open, not at the write: an open passes
+/// [`RootRecomputation::Required`], recomputes, and refuses a store whose
+/// bundle does not derive from its own contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootRecomputation {
     Required,
     Proven,
 }
@@ -8051,11 +8168,32 @@ fn placeholder_roots(generation: u64) -> RootBundle {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROOT_BUNDLES_FOLDED_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many root bundles this thread folded out of a snapshot.
+///
+/// This is the instrument behind "a commit folds its roots once": a test that
+/// commits and then reads the counter can tell one fold from two directly,
+/// rather than inferring it from a duration or a resident set. Counted at the
+/// one place a fold happens, so a recomputation re-enabled anywhere upstream is
+/// visible here. Per thread, because the test suite runs in parallel and a fold
+/// on another thread is another test's.
+#[cfg(test)]
+pub(crate) fn root_bundles_folded_on_this_thread() -> usize {
+    ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.get())
+}
+
 fn compute_roots(
     snapshot: &GraphSnapshot,
     authority: &PersistedRepositoryAuthority,
     generation: u64,
 ) -> Result<RootBundle, KinDbError> {
+    #[cfg(test)]
+    ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     // One span per root, for the reason `prepare_successor`'s laps carry one:
     // a root that costs a conversion real memory must be nameable by whatever
     // reads spans, and `kindb.roots.replication` is what the memory guard in
@@ -8101,7 +8239,23 @@ fn history_root(
     authority: &PersistedRepositoryAuthority,
 ) -> Result<Hash256, KinDbError> {
     let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
-    root.unordered("changes", &snapshot.changes.iter().collect::<Vec<_>>())?;
+    // Memoized per change rather than recomputed. `DomainRoot::unordered`
+    // SORTS its leaf digests before folding them, so the fold is a pure
+    // function of the digest multiset and cannot observe which digests were
+    // computed here and which were remembered from an earlier fold. That is
+    // what makes this byte-identical to the fold it replaces rather than merely
+    // close to it, and it is the whole reason a memo is admissible on a
+    // persisted authority root at all.
+    //
+    // The leaf is the (id, change) PAIR, exactly as `unordered` built it from
+    // `snapshot.changes.iter().collect::<Vec<_>>()`, so the bytes handed to
+    // `canonical_leaf_hash` are unchanged.
+    let changes = snapshot
+        .changes
+        .sorted_leaf_digests("changes", |id, change| {
+            canonical_leaf_hash("changes", &(id, change))
+        })?;
+    root.fold("changes", &changes);
     root.unordered("admission_policies", &authority.admission_policies)?;
     Ok(root.finish())
 }
@@ -20422,6 +20576,379 @@ mod tests {
 
     fn decoded_on_this_thread() -> usize {
         crate::storage::change_map::change_maps_decoded_on_this_thread()
+    }
+
+    /// FIR-3064: a commit trims the receipts it INHERITED, not only the one it
+    /// writes.
+    ///
+    /// `PersistedCommitReceipt::trimmed` is only ever pushed, so a store
+    /// written before the receipt trim carried its fat receipts through every
+    /// rewrite. Measured by walking a converted Linux subtree's persisted
+    /// frame, `receipts[0]` alone is 411,771,864 bytes of a 2,043,051,848 byte
+    /// body, 20.15 percent, and it is a verbatim second copy of a record in the
+    /// operation log a few elements away.
+    ///
+    /// The store is AGED on purpose, the way PR 271's own compatibility test
+    /// ages one: the operation record is put back into the receipt, which is
+    /// exactly the shape every store written before that change has on disk.
+    /// Without that, this test would grade a receipt the binary under test just
+    /// wrote trimmed, and would pass with the trim removed.
+    #[test]
+    fn a_commit_trims_the_receipts_it_inherited_and_keeps_one_the_log_cannot_replace() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commits");
+
+        let committed = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let envelope = committed
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+
+        // The integration half: what this binary writes carries no embedded
+        // record at all.
+        assert!(
+            !envelope.receipts.is_empty(),
+            "the control: the fixture wrote a receipt"
+        );
+        assert!(
+            !envelope.operation_log.is_empty(),
+            "the control: and an operation log to name it from"
+        );
+        assert!(
+            envelope
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "no receipt this binary writes embeds its operation record"
+        );
+
+        // Age it: put every record back, which is what every pre-trim store on
+        // disk looks like.
+        let mut aged = envelope.clone();
+        for receipt in &mut aged.receipts {
+            let record = aged_record(&envelope, receipt.operation_id);
+            receipt.operation = Some(record);
+        }
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "the control: the aged envelope really is fat before the trim runs"
+        );
+
+        aged.trim_receipts_the_log_already_holds();
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "an inherited receipt whose record the log holds must be trimmed"
+        );
+
+        // The control that stops this from being a blanket delete: a receipt
+        // whose record the log does NOT hold keeps its only copy. Same fat
+        // envelope with the log emptied, so nothing can replace what is dropped.
+        let mut orphaned = envelope.clone();
+        for receipt in &mut orphaned.receipts {
+            let record = aged_record(&envelope, receipt.operation_id);
+            receipt.operation = Some(record);
+        }
+        orphaned.operation_log.clear();
+        orphaned.trim_receipts_the_log_already_holds();
+        assert!(
+            orphaned
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "a receipt whose record the log cannot replace must keep it"
+        );
+    }
+
+    /// The operation record the log holds for `operation_id`, for aging a
+    /// receipt back into its pre-trim shape.
+    fn aged_record(
+        envelope: &PersistedRepositoryAuthority,
+        operation_id: OperationId,
+    ) -> RepositoryOperationRecord {
+        envelope
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("every receipt in the fixture names an operation the log holds")
+            .clone()
+    }
+
+    fn leaf_digests_computed_on_this_thread() -> usize {
+        crate::storage::change_map::leaf_digests_computed_on_this_thread()
+    }
+
+    /// FIR-3064: the history root folds memoized per-change leaf digests, and
+    /// the root it produces is the root a scratch fold produces.
+    ///
+    /// `history_root` hands each change to `canonical_leaf_hash`, which
+    /// serializes that change's whole canonical payload. On a converted Linux
+    /// subtree one change's leaf is 410,546,852 bytes, so a commit
+    /// re-serialized the entire history to arrive at 32 bytes for changes that
+    /// had not moved.
+    ///
+    /// The ORACLE is the fold this replaced, `DomainRoot::unordered` over the
+    /// collected pairs, kept live by the other five roots and run here from
+    /// scratch. Comparing against it rather than against a checked-in constant
+    /// is the point: a constant would have been produced by the binary under
+    /// test, which is the hole FIR-3104 names.
+    #[test]
+    fn a_memoized_history_root_equals_the_root_a_scratch_fold_produces() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commits");
+        let mut snapshot = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let authority = snapshot
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+        assert_eq!(
+            snapshot.changes.len(),
+            1,
+            "the control: the fixture's history is the one change this counts against"
+        );
+
+        // The oracle, and the root under test, over one change.
+        let scratch = scratch_history_root(&snapshot, &authority);
+        let computes_before = leaf_digests_computed_on_this_thread();
+        let memoized = history_root(&snapshot, &authority).expect("the root folds");
+        let first_computes = leaf_digests_computed_on_this_thread() - computes_before;
+        assert_eq!(
+            memoized, scratch,
+            "the memoized root must be the scratch root"
+        );
+        assert_eq!(
+            first_computes, 1,
+            "a first fold computes every leaf, and this one computed {first_computes}"
+        );
+
+        // A second fold of the same history computes nothing.
+        let before_second = leaf_digests_computed_on_this_thread();
+        assert_eq!(
+            history_root(&snapshot, &authority).expect("the root folds again"),
+            scratch,
+            "a warm memo must not change the root"
+        );
+        assert_eq!(
+            leaf_digests_computed_on_this_thread() - before_second,
+            0,
+            "a second fold of unchanged history must compute no leaf at all"
+        );
+
+        // Grow the history and only the new changes are hashed. This is the
+        // property the whole change exists for: O(new), not O(store).
+        for index in 1..=3u8 {
+            let change = a_change_with_a_distinct_id(index);
+            snapshot.changes.insert(change.id, change);
+        }
+        assert_eq!(
+            snapshot.changes.len(),
+            4,
+            "the control: three changes landed"
+        );
+        let grown_scratch = scratch_history_root(&snapshot, &authority);
+        let before_grown = leaf_digests_computed_on_this_thread();
+        let grown = history_root(&snapshot, &authority).expect("the grown root folds");
+        let grown_computes = leaf_digests_computed_on_this_thread() - before_grown;
+        assert_eq!(
+            grown, grown_scratch,
+            "the root over grown history must still be the scratch root"
+        );
+        assert_eq!(
+            grown_computes, 3,
+            "only the three new leaves may be computed, and this computed {grown_computes}"
+        );
+        assert_ne!(
+            grown, memoized,
+            "the control: growing the history must move the root, or the two roots above \
+             agreeing would prove nothing"
+        );
+    }
+
+    /// A change with a distinct identity, for folding.
+    ///
+    /// The id is synthetic rather than content-derived, and that is enough
+    /// here: `history_root` folds whatever the map holds and never re-derives
+    /// an id, so what this test needs from a change is that its identity
+    /// differs from its siblings'. `mod fir2334_attribution`'s
+    /// `synthetic_change` builds content-addressed ones but is private to that
+    /// module, so it is not reachable from here.
+    fn a_change_with_a_distinct_id(index: u8) -> kin_model::SemanticChange {
+        kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([index; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("memhistory-leaf-digest-fold"),
+            message: format!("a change with a distinct id {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        }
+    }
+
+    /// The history fold as it stood before the memo: every leaf hashed here and
+    /// now, through the same `DomainRoot::unordered` the other five roots use.
+    fn scratch_history_root(
+        snapshot: &GraphSnapshot,
+        authority: &PersistedRepositoryAuthority,
+    ) -> Hash256 {
+        let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
+        root.unordered("changes", &snapshot.changes.iter().collect::<Vec<_>>())
+            .expect("the oracle folds changes");
+        root.unordered("admission_policies", &authority.admission_policies)
+            .expect("the oracle folds admission policies");
+        root.finish()
+    }
+
+    fn root_folds_on_this_thread() -> usize {
+        super::root_bundles_folded_on_this_thread()
+    }
+
+    /// FIR-3064: a commit folds its root bundle once, not twice.
+    ///
+    /// `prepare_successor` folds it in the `kindb.prepare.roots` lap, and the
+    /// storage-admission gate a few statements later used to fold it again from
+    /// the same snapshot and the same envelope in order to compare it with
+    /// itself. `history_root` hands the change map to `canonical_leaf_hash` as
+    /// ONE leaf rather than one leaf per change, and `canonical_hash` buffers a
+    /// copy of the canonical payload of every leaf it hashes, so the second
+    /// fold serialized the whole history again: measured by walking the
+    /// persisted frames, that leaf is 85,429,663 bytes on a converted VS Code
+    /// tree and 410,546,852 bytes on a converted Linux subtree.
+    ///
+    /// The controls are the half that must not move. Recomputation is what
+    /// proves a snapshot READ from disk agrees with the envelope beside it, so
+    /// this test asserts the recomputation is still wired AND still bites. A
+    /// change that bought the commit's fold by making the check unreachable, or
+    /// reachable but toothless, fails here.
+    ///
+    /// The controls deliberately do NOT assert that a reopen folds. Measured on
+    /// CI while writing this: a reopen of a store carrying a valid durable
+    /// history-validation record folds ZERO bundles, because that record is the
+    /// validator's own verdict on those exact bytes and the open trusts it
+    /// rather than re-deriving it (FIR-3064, PR 265). So the recomputation's
+    /// live callers are the paths with no such record to trust, which is
+    /// exactly when the bytes cannot be taken on trust, and those are what the
+    /// controls below exercise.
+    #[test]
+    fn a_commit_folds_its_root_bundle_once_and_the_recomputation_still_bites() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = arbitrary_repository_transaction(&manager);
+
+        let before_commit = root_folds_on_this_thread();
+        manager
+            .commit_repository_transaction(transaction)
+            .expect("the fixture commits");
+        let commit_folds = root_folds_on_this_thread() - before_commit;
+        assert_eq!(
+            commit_folds, 1,
+            "a commit folds the root bundle once; this one folded it {commit_folds} times"
+        );
+        assert_eq!(
+            manager.read_authority().roots().generation,
+            1,
+            "the control: the store this graded is the one the commit produced"
+        );
+
+        let committed = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let envelope = committed
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+
+        // Control one: the recomputation is still reachable and still runs.
+        let before_check = root_folds_on_this_thread();
+        envelope
+            .validate_against_snapshot(&committed)
+            .expect("a committed store validates against its own envelope");
+        let check_folds = root_folds_on_this_thread() - before_check;
+        assert_eq!(
+            check_folds, 1,
+            "the control: validating a snapshot against its envelope still folds the bundle, and \
+             this folded {check_folds}"
+        );
+
+        // Control two: and it still refuses a bundle that does not derive from
+        // the contents. A check that runs and cannot fail is not a check.
+        //
+        // The tamper has to leave the envelope INTERNALLY consistent or an
+        // earlier check catches it and this control grades that check instead.
+        // Moving `roots.history` alone was refused with "repository root bundle
+        // does not match the last operation", which is the operation-record
+        // match three checks upstream. So the wrong root goes everywhere the
+        // envelope repeats it, and then the only thing left that can notice is
+        // folding the contents again.
+        assert_eq!(
+            envelope.operation_log.len(),
+            1,
+            "the tamper below rewrites every roots_after, which only preserves the root chain \
+             while the log holds one operation"
+        );
+        let mut tampered = envelope.clone();
+        let wrong = AuthorityRoot::new(
+            REPOSITORY_ROOT_SCHEMA_VERSION,
+            Hash256::from_bytes([0xAB; 32]),
+        );
+        tampered.roots.history = wrong;
+        for operation in &mut tampered.operation_log {
+            operation.roots_after.history = wrong;
+        }
+        for receipt in &mut tampered.receipts {
+            receipt.roots_after.history = wrong;
+        }
+        let refusal = tampered
+            .validate_against_snapshot(&committed)
+            .expect_err("a tampered root bundle must be refused");
+        assert!(
+            refusal.to_string().contains("does not recompute"),
+            "the control: the refusal must be the root recomputation's own, got {refusal}"
+        );
     }
 
     #[test]
