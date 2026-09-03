@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kin_model::{
-    CallArgShape, Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore,
-    FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationEvidence,
-    RelationId, RelationKind, RelationOrigin, SemanticChangeId, SemanticFingerprint, SourceSpan,
-    Visibility,
+    CallArgShape, Entity, EntityId, EntityKind, EntityMetadata, EntityRevision, EntityRole,
+    EntityStore, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation,
+    RelationEvidence, RelationId, RelationKind, RelationOrigin, SemanticChangeId,
+    SemanticFingerprint, SourceSpan, Visibility,
 };
 use sha2::{Digest, Sha256};
 
