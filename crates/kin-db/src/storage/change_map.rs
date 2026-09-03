@@ -397,6 +397,9 @@ impl ChangeMap {
             memo.domain = Some(domain);
             memo.digests.clear();
         }
+        // FALSIFICATION ARM: the memo always misses, so every fold recomputes
+        // every leaf. Every assertion in the guard is left in place.
+        memo.digests.clear();
         let mut digests = Vec::with_capacity(entries.len());
         for (id, change) in entries {
             match memo.digests.get(id) {
