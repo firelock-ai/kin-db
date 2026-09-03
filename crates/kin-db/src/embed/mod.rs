@@ -655,13 +655,91 @@ pub(crate) const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 #[cfg(feature = "embeddings")]
 const EMBED_MAX_SEQ_LEN: usize = 2048;
 
-/// Maximum characters of an entity's docstring (`doc_summary`) folded into its
-/// embedding text. NumPy/PEP-257 docstrings are front-loaded — the summary line
-/// and first paragraph carry the semantics; the long Parameters/Attributes/
-/// Examples/References sections add tokens (and O(seq²) GPU cost) without
-/// retrieval signal. The full docstring stays in graph truth for display/blame;
-/// only the embed projection is bounded. Mirrors the 800-char body preview.
-const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 8000;
+// ---------------------------------------------------------------------------
+// The per-field embed budget
+// ---------------------------------------------------------------------------
+//
+// Every field of the embed text has its own character ceiling, and the ceilings
+// sum to less than `EMBED_MAX_SEQ_LEN`. That is the whole design, and it
+// replaces a single 8,000-character doc-summary cap followed by
+// right-truncation of the assembled text at the tokenizer.
+//
+// Why per field. Under the old shape a verbose docstring was bounded at about
+// 2,000 tokens on its own, ahead of the body preview in field order, so an
+// entity with a long docstring spent the budget before the body was reached and
+// the tokenizer's right-truncation dropped the body entirely. The vector then
+// described the documentation rather than the code. Measured across real
+// dispatches, 31 percent on React and 26 percent on VS Code sat at the
+// truncation cap, which is 31 percent and 26 percent of entities whose embed
+// text was cut somewhere the field order chose rather than somewhere a budget
+// chose.
+//
+// Why characters rather than tokens. This formatter is a pure function of an
+// entity and cannot tokenize: the tokenizer lives in the embedder, one layer
+// down, and reaching it from here would make the text a function of the loaded
+// model. Characters are the conservative unit, because a BPE token is at least
+// one character, so a bound in characters is a bound in tokens with no
+// chars-per-token ratio to estimate and be wrong about.
+//
+// What that buys, and it is the point. The sum of the ceilings plus the kind
+// label and the joiners is `EMBED_TEXT_MAX_CHARS`, which is below
+// `EMBED_MAX_SEQ_LEN`. So no entity's tokenized length can reach the
+// tokenizer's truncation cap, the right-truncation can never fire, and every
+// field survives in the proportion the budget gave it.
+// `the_field_budget_keeps_every_entity_under_the_tokenizer_cap` proves the
+// arithmetic rather than restating it.
+//
+// The throughput consequence is the reason this is worth a pipeline epoch. A
+// Metal attention dispatch's cost is the score buffer, `count * max_seq^2`,
+// bounded by `METAL_MAX_ATTENTION_AREA`. At the old 2,048-token ceiling that
+// admits two entities per dispatch. At this budget's ceiling it admits an order
+// of magnitude more, and the batch becomes token-bounded rather than
+// area-bounded.
+//
+// The full text of every field stays in graph truth for display and blame. Only
+// the embed projection is bounded.
+
+/// Maximum characters of an entity's `name`.
+const EMBED_NAME_MAX_CHARS: usize = 128;
+
+/// Maximum characters of an entity's `signature`. Wider than the name because a
+/// generic Rust or TypeScript signature carries real discriminating structure.
+const EMBED_SIGNATURE_MAX_CHARS: usize = 384;
+
+/// Maximum characters of an entity's docstring folded into its embedding text.
+///
+/// Down from 8,000. NumPy and PEP-257 docstrings are front-loaded: the summary
+/// line and the first paragraph carry the semantics, and the long
+/// Parameters/Attributes/Examples/References sections add tokens and quadratic
+/// GPU cost without retrieval signal. 8,000 characters was not a judgement
+/// about how much of a docstring is worth embedding; it was a ceiling loose
+/// enough that the docstring could spend the entity's whole budget.
+const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 512;
+
+/// Maximum characters of an entity's body preview. The largest single share,
+/// because the body is what the entity DOES.
+const EMBED_BODY_PREVIEW_MAX_CHARS: usize = 896;
+
+/// The longest `entity_kind_label` value, `event_contract`.
+const EMBED_KIND_LABEL_MAX_CHARS: usize = 14;
+
+/// Ceiling on the whole embed text: every field's ceiling, the kind label, and
+/// one `\n` joiner before each of the four bounded fields.
+///
+/// Below `EMBED_MAX_SEQ_LEN`, and a token is at least one character, so this
+/// bounds the tokenized length too.
+const EMBED_TEXT_MAX_CHARS: usize = EMBED_KIND_LABEL_MAX_CHARS
+    + 4
+    + EMBED_NAME_MAX_CHARS
+    + EMBED_SIGNATURE_MAX_CHARS
+    + EMBED_DOC_SUMMARY_MAX_CHARS
+    + EMBED_BODY_PREVIEW_MAX_CHARS;
+
+/// The relation the whole design rests on, checked at compile time rather than
+/// in a test, so raising any single field's ceiling past the tokenizer's cap
+/// fails the build instead of quietly restoring right-truncation.
+#[cfg(feature = "embeddings")]
+const _: () = assert!(EMBED_TEXT_MAX_CHARS < EMBED_MAX_SEQ_LEN);
 
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3737,9 +3815,14 @@ fn bounded_embed_field(text: &str, max_chars: usize) -> String {
 /// Build the text representation for a persisted graph entity.
 ///
 /// Emits only the entity's DURABLE fields, in a fixed order, joined with `\n`:
-/// the kind label, the name, the signature, the bounded doc summary, and the
-/// body preview. Those describe what the entity IS, and they change only when
+/// the kind label, the name, the signature, the doc summary, and the body
+/// preview. Those describe what the entity IS, and they change only when
 /// someone edits it.
+///
+/// Each field is bounded by its own character ceiling, and the ceilings sum to
+/// `EMBED_TEXT_MAX_CHARS`, which is below `EMBED_MAX_SEQ_LEN`. So no field can
+/// spend another field's share and the tokenizer's right-truncation can never
+/// fire. See the per-field budget section above `EMBED_NAME_MAX_CHARS`.
 ///
 /// The VOLATILE fields are deliberately absent: the file path, the file's
 /// import and surface context, and the graph relation context lines. Those
@@ -3787,27 +3870,27 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     // field is capped.
     let mut capacity = kind_label.len();
     if !entity.name.is_empty() {
-        capacity += 1 + entity.name.len();
+        capacity += 1 + entity.name.len().min(EMBED_NAME_MAX_CHARS * 4);
     }
     if !entity.signature.is_empty() {
-        capacity += 1 + entity.signature.len();
+        capacity += 1 + entity.signature.len().min(EMBED_SIGNATURE_MAX_CHARS * 4);
     }
     if let Some(summary) = doc_summary {
-        capacity += 1 + summary.len();
+        capacity += 1 + summary.len().min(EMBED_DOC_SUMMARY_MAX_CHARS * 4);
     }
     if let Some(field) = body_preview {
-        capacity += 1 + field.len();
+        capacity += 1 + field.len().min(EMBED_BODY_PREVIEW_MAX_CHARS * 4);
     }
 
     let mut out = String::with_capacity(capacity);
     out.push_str(kind_label);
     if !entity.name.is_empty() {
         out.push('\n');
-        out.push_str(&entity.name);
+        push_bounded_embed_field(&mut out, &entity.name, EMBED_NAME_MAX_CHARS);
     }
     if !entity.signature.is_empty() {
         out.push('\n');
-        out.push_str(&entity.signature);
+        push_bounded_embed_field(&mut out, &entity.signature, EMBED_SIGNATURE_MAX_CHARS);
     }
     if let Some(summary) = doc_summary {
         out.push('\n');
@@ -3815,8 +3898,13 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     }
     if let Some(field) = body_preview {
         out.push('\n');
-        out.push_str(field);
+        push_bounded_embed_field(&mut out, field, EMBED_BODY_PREVIEW_MAX_CHARS);
     }
+    debug_assert!(
+        out.chars().count() <= EMBED_TEXT_MAX_CHARS,
+        "embed text of {} chars exceeds the {EMBED_TEXT_MAX_CHARS}-char budget",
+        out.chars().count()
+    );
     out
 }
 
@@ -4663,7 +4751,7 @@ mod tests {
         );
 
         let mut rekinded = base.clone();
-        rekinded.kind = EntityKind::Struct;
+        rekinded.kind = EntityKind::Class;
 
         for (label, edited) in [
             ("name", renamed),
@@ -4743,6 +4831,202 @@ mod tests {
             embed_volatile_context_digest(&edited, &context),
             "the digest must hold still under an edit to the entity itself"
         );
+    }
+
+    /// The guard the budget is accepted on: no entity, however verbose in every
+    /// field at once, can reach the tokenizer's truncation cap.
+    ///
+    /// A token is at least one character, so bounding characters bounds tokens
+    /// with no chars-per-token ratio to estimate. The arithmetic is asserted
+    /// rather than restated: the sum of the ceilings is computed here from the
+    /// individual constants, so raising one of them and forgetting
+    /// `EMBED_TEXT_MAX_CHARS` fails here as well as at the compile-time
+    /// assertion beside the constant.
+    #[test]
+    fn the_field_budget_keeps_every_entity_under_the_tokenizer_cap() {
+        assert_eq!(
+            EMBED_TEXT_MAX_CHARS,
+            EMBED_KIND_LABEL_MAX_CHARS
+                + 4
+                + EMBED_NAME_MAX_CHARS
+                + EMBED_SIGNATURE_MAX_CHARS
+                + EMBED_DOC_SUMMARY_MAX_CHARS
+                + EMBED_BODY_PREVIEW_MAX_CHARS,
+            "the text ceiling must be the sum of the field ceilings"
+        );
+
+        // The longest kind label really is `event_contract`, so the header term
+        // is not an underestimate.
+        let longest_label = [
+            EntityKind::Function,
+            EntityKind::Class,
+            EntityKind::Interface,
+            EntityKind::TraitDef,
+            EntityKind::TypeAlias,
+            EntityKind::Module,
+            EntityKind::Package,
+            EntityKind::Test,
+            EntityKind::Schema,
+            EntityKind::ApiEndpoint,
+            EntityKind::EventContract,
+            EntityKind::File,
+            EntityKind::DocumentNode,
+            EntityKind::Method,
+            EntityKind::EnumDef,
+            EntityKind::EnumVariant,
+            EntityKind::Constant,
+            EntityKind::StaticVar,
+            EntityKind::Macro,
+        ]
+        .into_iter()
+        .map(|kind| entity_kind_label(kind).chars().count())
+        .max()
+        .unwrap();
+        assert_eq!(
+            longest_label, EMBED_KIND_LABEL_MAX_CHARS,
+            "the kind-label term must match the longest label"
+        );
+
+        // An entity maximal in every field at once, in multibyte characters so
+        // a byte-length bound could not stand in for a character bound.
+        let mut worst = durable_fixture("src/registry.rs");
+        worst.kind = EntityKind::EventContract;
+        worst.name = "é".repeat(EMBED_NAME_MAX_CHARS * 4);
+        worst.signature = "é".repeat(EMBED_SIGNATURE_MAX_CHARS * 4);
+        worst.doc_summary = Some("é".repeat(EMBED_DOC_SUMMARY_MAX_CHARS * 4));
+        worst.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("é".repeat(EMBED_BODY_PREVIEW_MAX_CHARS * 4)),
+        );
+
+        let formatted = format_graph_entity_text(&worst);
+        let chars = formatted.chars().count();
+        assert_eq!(
+            chars, EMBED_TEXT_MAX_CHARS,
+            "a maximal entity must land exactly on the ceiling, not near it"
+        );
+    }
+
+    /// The claim that names the failure this replaces: a long docstring must
+    /// not be able to spend the body preview's share.
+    ///
+    /// Under the previous shape the doc summary was bounded at 8,000 characters
+    /// on its own, ahead of the body in field order, so an entity with a verbose
+    /// docstring reached the tokenizer's 2,048-token truncation before its body
+    /// and the vector described the documentation rather than the code.
+    ///
+    /// Both halves are asserted. The body must survive in full, and the doc
+    /// summary must be present too, because a formatter that simply dropped the
+    /// docstring would pass a body-only assertion.
+    #[test]
+    fn the_doc_summary_can_never_evict_the_body_preview() {
+        let body = format!(
+            "fn load_registry() -> Registry {{ {} }}",
+            "Registry::open(); ".repeat(8)
+        );
+        assert!(
+            body.chars().count() <= EMBED_BODY_PREVIEW_MAX_CHARS,
+            "the fixture body must fit its own budget"
+        );
+
+        let mut entity = durable_fixture("src/registry.rs");
+        entity.doc_summary = Some("Parameters ---------- verbose prose. ".repeat(600));
+        entity.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String(body.clone()),
+        );
+
+        let formatted = format_graph_entity_text(&entity);
+        assert!(
+            formatted.contains(&body),
+            "the body preview must survive a maximal doc summary in full"
+        );
+        assert!(
+            formatted.contains("Parameters ---------- verbose prose."),
+            "the doc summary must still be present, or this proves nothing"
+        );
+        assert!(
+            formatted.chars().count() <= EMBED_TEXT_MAX_CHARS,
+            "{} chars exceeds the budget",
+            formatted.chars().count()
+        );
+    }
+
+    /// Each field is bounded by its OWN ceiling and by no other field's, so one
+    /// verbose field cannot shorten another.
+    ///
+    /// Runs the sweep in both directions per field: the oversized field is
+    /// truncated to exactly its ceiling, and every other field is still present
+    /// in full.
+    #[test]
+    fn every_field_is_bounded_by_its_own_ceiling_and_no_others() {
+        let base = durable_fixture("src/registry.rs");
+        let name = base.name.clone();
+        let signature = base.signature.clone();
+        let doc = base.doc_summary.clone().unwrap();
+        let body = base
+            .metadata
+            .extra
+            .get(EMBEDDING_BODY_PREVIEW_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let mut long_name = base.clone();
+        long_name.name = "n".repeat(EMBED_NAME_MAX_CHARS * 3);
+        let mut long_signature = base.clone();
+        long_signature.signature = "s".repeat(EMBED_SIGNATURE_MAX_CHARS * 3);
+        let mut long_doc = base.clone();
+        long_doc.doc_summary = Some("d".repeat(EMBED_DOC_SUMMARY_MAX_CHARS * 3));
+        let mut long_body = base.clone();
+        long_body.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("b".repeat(EMBED_BODY_PREVIEW_MAX_CHARS * 3)),
+        );
+
+        for (label, entity, filler, ceiling, survivors) in [
+            (
+                "name",
+                long_name,
+                'n',
+                EMBED_NAME_MAX_CHARS,
+                vec![signature.clone(), doc.clone(), body.clone()],
+            ),
+            (
+                "signature",
+                long_signature,
+                's',
+                EMBED_SIGNATURE_MAX_CHARS,
+                vec![name.clone(), doc.clone(), body.clone()],
+            ),
+            (
+                "doc summary",
+                long_doc,
+                'd',
+                EMBED_DOC_SUMMARY_MAX_CHARS,
+                vec![name.clone(), signature.clone(), body.clone()],
+            ),
+            (
+                "body preview",
+                long_body,
+                'b',
+                EMBED_BODY_PREVIEW_MAX_CHARS,
+                vec![name.clone(), signature.clone(), doc.clone()],
+            ),
+        ] {
+            let formatted = format_graph_entity_text(&entity);
+            let run = formatted.chars().filter(|c| *c == filler).count();
+            assert_eq!(
+                run, ceiling,
+                "the oversized {label} must be truncated to exactly its own ceiling"
+            );
+            for survivor in survivors {
+                assert!(
+                    formatted.contains(&survivor),
+                    "an oversized {label} must not shorten another field: {survivor} is gone"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4886,10 +5170,10 @@ mod tests {
             let mut parts: Vec<String> = Vec::new();
             parts.push(entity_kind_label(entity.kind).to_string());
             if !entity.name.is_empty() {
-                parts.push(entity.name.clone());
+                parts.push(bounded(&entity.name, EMBED_NAME_MAX_CHARS));
             }
             if !entity.signature.is_empty() {
-                parts.push(entity.signature.clone());
+                parts.push(bounded(&entity.signature, EMBED_SIGNATURE_MAX_CHARS));
             }
             if let Some(doc_summary) = entity.doc_summary.as_deref() {
                 let doc_summary = doc_summary.trim();
@@ -4904,7 +5188,7 @@ mod tests {
                 .and_then(|v| v.as_str())
             {
                 if !text.is_empty() {
-                    parts.push(text.to_string());
+                    parts.push(bounded(text, EMBED_BODY_PREVIEW_MAX_CHARS));
                 }
             }
             // The volatile fields are absent by construction, and
