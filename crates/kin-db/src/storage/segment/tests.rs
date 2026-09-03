@@ -1207,3 +1207,98 @@ fn a_column_the_segment_does_not_carry_refuses_differently_from_one_the_profile_
         "the refusal must say which of the two faults it is, and said: {absent}"
     );
 }
+
+#[test]
+fn a_segment_written_without_the_revision_columns_still_opens_hot() {
+    use crate::storage::segment::format::{MANIFEST_ENTRY_LEN, MANIFEST_PREAMBLE_LEN};
+
+    let (graph, expected) = revision_fixture(false);
+    let dir = tempfile::tempdir().unwrap();
+    write_segment(&graph, dir.path()).unwrap();
+
+    // The control: with the revision columns present, they are readable.
+    let before = SegmentReader::open(dir.path()).unwrap();
+    assert_eq!(before.revision_count(), expected.len() as u64);
+    assert!(before.revision_count() > 0);
+    drop(before);
+
+    // Now age the segment backwards into the layout that existed before the
+    // revision columns did: drop their manifest rows and delete their files.
+    // This is the only way to prove the property without a second binary, and
+    // it is the property `HOT_REQUIRED` would break if a revision column were
+    // ever added to it.
+    let retired = [
+        column::REV_ID,
+        column::REV_ENTITY_ORD,
+        column::REV_INTRODUCED_ORD,
+        column::REV_FLAGS,
+        column::REV_PREVIOUS_ID,
+        column::REV_ENDED_ORD,
+        column::CHANGE_IDS,
+        column::REV_DELTA_OFF,
+        column::REV_DELTA_ARENA,
+    ];
+
+    let path = dir.path().join(MANIFEST_FILE);
+    let bytes = std::fs::read(&path).unwrap();
+    let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+    let payload =
+        &bytes[HEADER_LEN..HEADER_LEN + MANIFEST_PREAMBLE_LEN + count * MANIFEST_ENTRY_LEN];
+
+    let mut kept_rows: Vec<u8> = Vec::new();
+    let mut kept = 0u64;
+    for index in 0..count {
+        let base = MANIFEST_PREAMBLE_LEN + index * MANIFEST_ENTRY_LEN;
+        let id = u32::from_le_bytes(payload[base..base + 4].try_into().unwrap());
+        if retired.contains(&id) {
+            continue;
+        }
+        kept_rows.extend_from_slice(&payload[base..base + MANIFEST_ENTRY_LEN]);
+        kept += 1;
+    }
+    assert_eq!(
+        kept as usize,
+        count - retired.len(),
+        "every retired column must have had a manifest row to drop"
+    );
+
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&bytes[..HEADER_LEN]);
+    rebuilt.extend_from_slice(&payload[..MANIFEST_PREAMBLE_LEN]);
+    rebuilt.extend_from_slice(&kept_rows);
+    let new_payload = MANIFEST_PREAMBLE_LEN + kept_rows.len();
+    rebuilt[16..24].copy_from_slice(&kept.to_le_bytes());
+    rebuilt[24..32].copy_from_slice(&(new_payload as u64).to_le_bytes());
+    let digest = Sha256::digest(&rebuilt[..HEADER_LEN + new_payload]);
+    rebuilt.extend_from_slice(&digest);
+    std::fs::write(&path, &rebuilt).unwrap();
+    for id in retired {
+        std::fs::remove_file(dir.path().join(column_file_name(id))).unwrap();
+    }
+
+    // The property: a hot open succeeds and answers every entity query.
+    let after = SegmentReader::open(dir.path()).unwrap();
+    assert_eq!(after.unknown_columns(), 0);
+    assert_eq!(after.revision_count(), 0);
+    assert_eq!(after.change_count(), 0);
+    assert!(after.entity_count() > 0);
+    for ordinal in 0..after.entity_count() {
+        after.entity_id(ordinal).unwrap();
+        after.entity_name(ordinal).unwrap();
+        after.entity_kind(ordinal).unwrap();
+        after.outgoing(ordinal).unwrap();
+        after.incoming(ordinal).unwrap();
+    }
+    after.kind_counts().unwrap();
+
+    // And a revision read names the fault as an absent column rather than as a
+    // profile mistake, which is the branch `column()` gained for exactly this.
+    let error = after
+        .ordinal_of_revision(&expected[0].1.revision_id)
+        .expect_err("a segment with no revision columns cannot answer a revision lookup")
+        .to_string();
+    assert!(
+        error.contains("carries no column"),
+        "the refusal must say the column is absent from the segment, and said: {error}"
+    );
+}
