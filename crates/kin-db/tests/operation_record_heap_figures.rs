@@ -147,6 +147,40 @@ fn one_operation_record_costs_this_much_decoded_and_this_much_to_identify() {
         .first()
         .expect("a converted store carries at least one operation");
 
+    // Figure zero, and it decides what a separate change is worth: does a REAL
+    // record take the borrowing path?
+    //
+    // kin-model's clone-free identity makes `canonicalized()` borrow instead of
+    // cloning when `ref_mutations` and `tree_deltas` are already in canonical
+    // order. The semantic delta is always already ordered, because
+    // `validate` enforces exactly the order `sort_canonical` imposes, so those
+    // two small collections are the whole question. It is asked HERE because
+    // the only fixture kin-model's own tests have is deliberately
+    // non-canonical (`canonicalizable_transaction` says so in its source) and
+    // therefore cannot answer it. A guess would have been worse than a gap.
+    let refs_sorted = operation
+        .ref_mutations
+        .windows(2)
+        .all(|pair| pair[0].name <= pair[1].name);
+    let tree_deltas = operation
+        .workspace_mutation
+        .as_ref()
+        .map_or(0, |workspace| workspace.tree_deltas.len());
+    let tree_sorted = operation
+        .workspace_mutation
+        .as_ref()
+        .is_none_or(|workspace| {
+            workspace
+                .tree_deltas
+                .windows(2)
+                .all(|pair| pair[0].artifact_id() <= pair[1].artifact_id())
+        });
+    println!("REF_MUTATIONS {}", operation.ref_mutations.len());
+    println!("REF_MUTATIONS_ALREADY_SORTED {refs_sorted}");
+    println!("TREE_DELTAS {tree_deltas}");
+    println!("TREE_DELTAS_ALREADY_SORTED {tree_sorted}");
+    println!("BORROW_PATH_WOULD_FIRE {}", refs_sorted && tree_sorted);
+
     // Figure one: what a fat receipt's embedded copy weighs DECODED.
     //
     // Measured as the live-heap growth of cloning the record, which is exactly
