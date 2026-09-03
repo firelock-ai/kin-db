@@ -719,10 +719,21 @@ const EMBED_MAX_SEQ_LEN: usize = 2048;
 ///
 /// Changing this changes every vector, so it moves with
 /// `EMBEDDING_CACHE_PIPELINE_EPOCH` in the same commit.
+/// Public rather than private, and not because a caller sets it: the constant
+/// below is what selects a setting, and there is no environment variable on
+/// purpose. It is public because the three settings are a documented property
+/// of what a vector in this store MEANS, and because a private enum whose other
+/// two arms are reachable only by editing a constant reads to the compiler as
+/// two dead variants. An `allow(dead_code)` would silence that; saying the type
+/// is part of the crate's described surface is truer, since the setting is the
+/// kind of thing a reader of the store's semantics needs to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathInEmbedText {
+pub enum PathInEmbedText {
+    /// No part of the path reaches the vector.
     None,
+    /// The filename reaches the vector; the directory does not.
     Basename,
+    /// The whole path reaches the vector.
     Full,
 }
 
@@ -4859,6 +4870,21 @@ mod tests {
         let here = durable_fixture("src/registry.rs");
         let moved = durable_fixture("crates/kin-core/src/registry.rs");
         let renamed = durable_fixture("src/registry_loader.rs");
+
+        // Construct all three, so the two that are not the default are
+        // exercised rather than only named, and assert they are distinct: a
+        // dial whose settings compare equal is not a dial.
+        let settings = [
+            PathInEmbedText::None,
+            PathInEmbedText::Basename,
+            PathInEmbedText::Full,
+        ];
+        for (i, a) in settings.iter().enumerate() {
+            for b in settings.iter().skip(i + 1) {
+                assert_ne!(a, b, "the dial's settings must be distinct");
+            }
+        }
+        assert!(settings.contains(&EMBED_PATH_POLICY));
 
         assert_eq!(path_basename("src/engine/graph.rs"), "graph.rs");
         assert_eq!(path_directory("src/engine/graph.rs"), "src/engine/");
