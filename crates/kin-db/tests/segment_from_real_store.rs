@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use kin_db::storage::format::GraphSnapshot;
-use kin_db::storage::ChangeMap;
 use kin_db::{write_segment, InMemoryGraph};
 
 #[test]
@@ -42,19 +41,19 @@ fn write_a_segment_from_a_real_store_and_price_every_column() {
     let store_bytes = bytes.len();
     let mut snapshot = GraphSnapshot::from_bytes(&bytes).expect("the snapshot must decode");
     let decode_ms = read_started.elapsed().as_millis();
-    // Free the file bytes and the history as soon as the section is reachable.
-    // `from_bytes` decodes the whole body, and on the Linux subject the change
-    // map is 410,546,852 persisted bytes and the authority envelope 826,205,148,
-    // none of which this measurement reads. Holding them through the graph build
-    // would double the peak for nothing.
+    // Free the file bytes, which is a real saving and a safe one.
+    //
+    // Dropping the CHANGE MAP here as well was tried and reverted. The graph
+    // build refuses without it, `ChangeNotFound(0eabdc10...)`, because a
+    // revision names the change that introduced it and the load resolves that
+    // name. It also saved almost nothing: `from_bytes` has already decoded the
+    // whole body by this line, so the peak is behind us and dropping a domain
+    // afterwards only shortens how long it is held.
     drop(bytes);
-    snapshot.changes = ChangeMap::default();
-    snapshot.change_children = Default::default();
     println!(
         "store          {} bytes, decoded in {decode_ms} ms, wire version {}",
         store_bytes, snapshot.version
     );
-    println!("               history dropped before the graph build; it is not measured here");
 
     let section = snapshot
         .materialized_graph
