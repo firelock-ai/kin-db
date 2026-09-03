@@ -63,10 +63,14 @@ fn write_a_segment_from_a_real_store_and_price_every_column() {
         .map(|owned| owned.state)
         .unwrap_or_else(|shared| shared.state.clone());
 
+    // Captured before the move below, so the graph built from this same
+    // state can be checked against the shape it was resolved with.
+    let section_entity_count = state.entities.len();
+    let section_relation_count = state.relations.len();
     println!(
         "section        {} entities, {} relations, {} revision keys",
-        state.entities.len(),
-        state.relations.len(),
+        section_entity_count,
+        section_relation_count,
         state.entity_revisions.len()
     );
 
@@ -90,6 +94,27 @@ fn write_a_segment_from_a_real_store_and_price_every_column() {
     snapshot.outgoing = outgoing;
     snapshot.incoming = incoming;
 
+    // A populated entity/relation view plus a live `repository_authority`
+    // envelope is what `validate_unscoped_history_caches`
+    // (kin-db/src/storage/repository.rs) refuses: a multi-ref repository has
+    // no single current graph, so an authority snapshot is only allowed to
+    // carry prepared state once it names the one change it was resolved at.
+    // `MaterializedGraphSection::state` is exactly that: "Exactly what
+    // `ChangeStore::resolve_graph_at(resolved_at)` returns" (format.rs), the
+    // same resolved-state value `resolve_workspace_base_graph_snapshot`
+    // (repository.rs) serves from this same section for a workspace's base.
+    // That function's resolved base always sets `repository_authority: None`
+    // before handing the snapshot to `InMemoryGraph`, "because a workspace
+    // base is not a published authority snapshot: it carries no envelope, so
+    // there is no change it can claim to be the resolution at" (same file).
+    // `RepositoryAuthorityState::workspace_graph_snapshot` documents the same
+    // contract publicly: "The result has no repository authority envelope
+    // and is safe to hand to InMemoryGraph". This measurement already holds
+    // a resolution at one named change, so it clears the field the same way
+    // rather than asking the unscoped-view check to validate a view that is
+    // not unscoped.
+    snapshot.repository_authority = None;
+
     let build_started = std::time::Instant::now();
     let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot)
         .expect("the materialized graph must load");
@@ -98,6 +123,25 @@ fn write_a_segment_from_a_real_store_and_price_every_column() {
         "graph          {} entities, {} relations, built in {build_ms} ms",
         graph.entity_count(),
         graph.relation_count()
+    );
+    // Clearing `repository_authority` above must not be allowed to paper over
+    // a resolution that quietly came back empty or short: the graph this
+    // measurement prices has to be the same shape as the section it was
+    // resolved from, not merely "a graph that loaded".
+    assert_ne!(
+        graph.entity_count(),
+        0,
+        "the resolved graph is empty; the section it was built from held {section_entity_count} entities"
+    );
+    assert_eq!(
+        graph.entity_count(),
+        section_entity_count,
+        "graph entity count disagrees with the resolved section it was built from"
+    );
+    assert_eq!(
+        graph.relation_count(),
+        section_relation_count,
+        "graph relation count disagrees with the resolved section it was built from"
     );
 
     std::fs::create_dir_all(&out).expect("the output directory must be creatable");
