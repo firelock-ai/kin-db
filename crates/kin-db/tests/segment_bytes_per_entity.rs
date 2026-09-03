@@ -60,44 +60,44 @@ const DOC_BYTES: usize = 223;
 /// holds relative to the entity and relation counts.
 #[derive(Clone, Copy)]
 enum Records {
-    PerEntity,
-    PerEntityPlusOne,
-    PerRelation,
-    PerEntityEdge,
+    Entities,
+    EntitiesPlusOne,
+    Relations,
+    EntityEdges,
 }
 
 const FIXED: &[(u32, u32, Records)] = &[
-    (column::ENTITY_ID, 16, Records::PerEntity),
-    (column::ENTITY_KIND, 1, Records::PerEntity),
-    (column::ENTITY_LANGUAGE, 1, Records::PerEntity),
-    (column::ENTITY_FLAGS, 1, Records::PerEntity),
-    (column::ENTITY_AST_HASH, 32, Records::PerEntity),
-    (column::ENTITY_PATH_ORD, 4, Records::PerEntity),
-    (column::ENTITY_SPAN, 24, Records::PerEntity),
-    (column::ENTITY_SPAN_PATH_ORD, 4, Records::PerEntity),
-    (column::ENTITY_NAME_OFF, 4, Records::PerEntityPlusOne),
-    (column::ENTITY_SIG_OFF, 4, Records::PerEntityPlusOne),
-    (column::ENTITY_DOC_OFF, 4, Records::PerEntityPlusOne),
-    (column::OUT_OFF, 4, Records::PerEntityPlusOne),
-    (column::IN_OFF, 4, Records::PerEntityPlusOne),
-    (column::OUT_DST, 4, Records::PerEntityEdge),
-    (column::IN_SRC, 4, Records::PerEntityEdge),
-    (column::IN_REL_ORD, 4, Records::PerEntityEdge),
-    (column::REL_ID, 16, Records::PerRelation),
-    (column::REL_KIND, 1, Records::PerRelation),
-    (column::REL_CONFIDENCE, 4, Records::PerRelation),
-    (column::REL_ORIGIN, 1, Records::PerRelation),
-    (column::REL_SRC, 4, Records::PerRelation),
-    (column::REL_FLAGS, 1, Records::PerRelation),
-    (column::ENTITY_COLD_FLAGS, 1, Records::PerEntity),
-    (column::ENTITY_SIGNATURE_HASH, 32, Records::PerEntity),
-    (column::ENTITY_BEHAVIOR_HASH, 32, Records::PerEntity),
-    (column::ENTITY_EQUIVALENCE_HASH, 32, Records::PerEntity),
-    (column::ENTITY_STABILITY, 4, Records::PerEntity),
-    (column::ENTITY_LINEAGE_PARENT, 16, Records::PerEntity),
-    (column::ENTITY_CREATED_IN, 32, Records::PerEntity),
-    (column::ENTITY_SUPERSEDED_BY, 16, Records::PerEntity),
-    (column::REL_CREATED_IN, 32, Records::PerRelation),
+    (column::ENTITY_ID, 16, Records::Entities),
+    (column::ENTITY_KIND, 1, Records::Entities),
+    (column::ENTITY_LANGUAGE, 1, Records::Entities),
+    (column::ENTITY_FLAGS, 1, Records::Entities),
+    (column::ENTITY_AST_HASH, 32, Records::Entities),
+    (column::ENTITY_PATH_ORD, 4, Records::Entities),
+    (column::ENTITY_SPAN, 24, Records::Entities),
+    (column::ENTITY_SPAN_PATH_ORD, 4, Records::Entities),
+    (column::ENTITY_NAME_OFF, 4, Records::EntitiesPlusOne),
+    (column::ENTITY_SIG_OFF, 4, Records::EntitiesPlusOne),
+    (column::ENTITY_DOC_OFF, 4, Records::EntitiesPlusOne),
+    (column::OUT_OFF, 4, Records::EntitiesPlusOne),
+    (column::IN_OFF, 4, Records::EntitiesPlusOne),
+    (column::OUT_DST, 4, Records::EntityEdges),
+    (column::IN_SRC, 4, Records::EntityEdges),
+    (column::IN_REL_ORD, 4, Records::EntityEdges),
+    (column::REL_ID, 16, Records::Relations),
+    (column::REL_KIND, 1, Records::Relations),
+    (column::REL_CONFIDENCE, 4, Records::Relations),
+    (column::REL_ORIGIN, 1, Records::Relations),
+    (column::REL_SRC, 4, Records::Relations),
+    (column::REL_FLAGS, 1, Records::Relations),
+    (column::ENTITY_COLD_FLAGS, 1, Records::Entities),
+    (column::ENTITY_SIGNATURE_HASH, 32, Records::Entities),
+    (column::ENTITY_BEHAVIOR_HASH, 32, Records::Entities),
+    (column::ENTITY_EQUIVALENCE_HASH, 32, Records::Entities),
+    (column::ENTITY_STABILITY, 4, Records::Entities),
+    (column::ENTITY_LINEAGE_PARENT, 16, Records::Entities),
+    (column::ENTITY_CREATED_IN, 32, Records::Entities),
+    (column::ENTITY_SUPERSEDED_BY, 16, Records::Entities),
+    (column::REL_CREATED_IN, 32, Records::Relations),
 ];
 
 /// Hot bytes per entity this layout is designed to cost on the corpus above.
@@ -145,7 +145,7 @@ fn corpus() -> InMemoryGraph {
                 signature: pad(&format!("static int fn_{index}"), SIGNATURE_BYTES),
                 visibility: Visibility::Internal,
                 role: EntityRole::Source,
-                doc_summary: if index % DOC_EVERY == 0 {
+                doc_summary: if index.is_multiple_of(DOC_EVERY) {
                     Some(pad(&format!("doc for fn_{index}"), DOC_BYTES))
                 } else {
                     None
@@ -160,7 +160,7 @@ fn corpus() -> InMemoryGraph {
 
     let mut serial = 0u128;
     for (index, source) in ids.iter().enumerate() {
-        if index as u32 % EDGE_EVERY != 0 {
+        if !(index as u32).is_multiple_of(EDGE_EVERY) {
             continue;
         }
         for step in 1..=EDGES_PER_ENTITY {
@@ -214,10 +214,10 @@ fn every_fixed_width_column_is_exactly_its_registered_width_times_its_count() {
             .find(|candidate| candidate.id == *id)
             .unwrap_or_else(|| panic!("segment is missing column {id}"));
         let expected_count = match records {
-            Records::PerEntity => entities,
-            Records::PerEntityPlusOne => entities + 1,
-            Records::PerRelation => relations,
-            Records::PerEntityEdge => entity_edges,
+            Records::Entities => entities,
+            Records::EntitiesPlusOne => entities + 1,
+            Records::Relations => relations,
+            Records::EntityEdges => entity_edges,
         };
         assert_eq!(
             column.width, *width,
