@@ -99,15 +99,12 @@ fn write_a_segment_from_a_real_store_and_price_every_column() {
     let entities = stats.shape.entity_count.max(1) as f64;
     println!("\nsegment written in {write_ms} ms");
     println!(
-        "shape          entities {} relations {} entity-edges {} paths {} name-keys {} \
-         revisions {} changes {}",
+        "shape          entities {} relations {} entity-edges {} paths {} name-keys {}",
         stats.shape.entity_count,
         stats.shape.relation_count,
         stats.shape.entity_edge_count,
         stats.shape.path_count,
-        stats.shape.name_key_count,
-        stats.revision_count,
-        stats.change_count
+        stats.shape.name_key_count
     );
     println!(
         "\n{:>4}  {:>6}  {:>12}  {:>14}  {:>12}",
