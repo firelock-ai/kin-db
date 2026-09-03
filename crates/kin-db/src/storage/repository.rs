@@ -2623,8 +2623,8 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-            validate_history_replay(&snapshot, &all_changes)?;
+            let validation_targets: Vec<_> = snapshot.changes.keys().copied().collect();
+            validate_history_replay(&snapshot, &validation_targets)?;
         }
         let replay_at = started.elapsed();
 
@@ -3262,8 +3262,8 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             )));
         }
         snapshot.validate_storage_admission()?;
-        let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-        validate_history_replay(&snapshot, &all_changes)?;
+        let validation_targets: Vec<_> = snapshot.changes.keys().copied().collect();
+        validate_history_replay(&snapshot, &validation_targets)?;
         let body_backend = FrozenLocalBodyBackend {
             backend: self.backend.as_ref(),
             freeze: &locked,
@@ -3612,7 +3612,8 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.history_replay").entered();
-    validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
+    let transaction_targets: Vec<_> = transaction.changes.iter().map(|change| change.id).collect();
+    validate_history_replay_with(&replay, &snapshot, &transaction_targets)?;
     let history_replay_ms = timer.lap_ms();
     drop(lap);
     // The shared proof is charged to whichever lap first forced it rather than
@@ -5870,17 +5871,26 @@ fn verified_history_validation(
     matches.then_some(recovered.generation)
 }
 
+/// Replay a persisted history, validating every change named in `targets`.
+///
+/// The targets are change ids rather than changes. This function reads exactly
+/// one field of a change, its id, and reads every body it actually needs back
+/// out of `snapshot.changes` by reference, so handing it owned changes cloned
+/// the whole history to compute a key set the snapshot already holds. On a
+/// converted store the change map is most of the body, which is 1.32 GiB
+/// decoded on a full VS Code tree, and both reopen callers passed the entire
+/// map.
 fn validate_history_replay(
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    targets: &[SemanticChangeId],
 ) -> Result<(), KinDbError> {
-    validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, new_changes)
+    validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, targets)
 }
 
 fn validate_history_replay_with(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    targets: &[SemanticChangeId],
 ) -> Result<(), KinDbError> {
     // One Kahn pass over the whole change map proves the DAG is acyclic and
     // that every declared parent is persisted. Resolving each change's reachable
@@ -5903,7 +5913,7 @@ fn validate_history_replay_with(
     // reachable histories cover every persisted change, including unreachable
     // history that is not currently named by a ref. This is graph replay only:
     // an invalid history never falls back to Git or the filesystem.
-    let mut validation_targets: Vec<_> = if new_changes.is_empty() {
+    let mut validation_targets: Vec<_> = if targets.is_empty() {
         snapshot
             .changes
             .keys()
@@ -5916,7 +5926,7 @@ fn validate_history_replay_with(
             .copied()
             .collect()
     } else {
-        new_changes.iter().map(|change| change.id).collect()
+        targets.to_vec()
     };
     validation_targets.sort_unstable();
     validation_targets.dedup();
@@ -11907,8 +11917,9 @@ mod tests {
         // against the merge's first parent, so it restates the transition the
         // side branch already published. Both readings are the same history.
         let (snapshot, changes) = merge_history_fixture(original, revised);
+        let change_ids: Vec<_> = changes.iter().map(|change| change.id).collect();
 
-        validate_history_replay(&snapshot, &changes)
+        validate_history_replay(&snapshot, &change_ids)
             .expect("a merge restating its second parent's edit is not a stale payload");
         validate_history_replay(&snapshot, &[])
             .expect("reopen must replay the same merge history it admitted");
@@ -11924,9 +11935,10 @@ mod tests {
         replacement.fingerprint.signature_hash = Hash256::from_bytes([0x64; 32]);
 
         let (snapshot, changes) = merge_history_fixture(unpublished, replacement);
+        let change_ids: Vec<_> = changes.iter().map(|change| change.id).collect();
 
-        for (label, new_changes) in [("admission", changes.as_slice()), ("reopen", &[][..])] {
-            let error = validate_history_replay(&snapshot, new_changes)
+        for (label, targets) in [("admission", change_ids.as_slice()), ("reopen", &[][..])] {
+            let error = validate_history_replay(&snapshot, targets)
                 .expect_err("an old payload no parent ever published must be refused");
             assert!(
                 error.to_string().contains("stale old payload for entity"),
