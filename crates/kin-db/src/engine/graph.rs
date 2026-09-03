@@ -17726,6 +17726,19 @@ mod tests {
                 "kind",
                 Box::new(|e: &mut Entity| e.kind = EntityKind::Class),
             ),
+        ];
+
+        // The other half of the same claim, and it inverted. The file path, the
+        // file import context and the file surface context no longer reach the
+        // embed text: they are the VOLATILE fields, and they moved to
+        // `format_graph_entity_volatile_context` so that a moved file and a
+        // changed neighbour hit the embedding cache instead of re-embedding.
+        //
+        // These three are asserted on the embed text directly rather than on
+        // the queue, because the queue has inputs besides the text (a blob
+        // restamp, a file-level change) and asserting a zero there would be
+        // asserting something this test cannot isolate.
+        let volatile_cases: Vec<(&str, Box<dyn Fn(&mut Entity)>)> = vec![
             (
                 "file_origin",
                 Box::new(|e: &mut Entity| e.file_origin = Some(FilePathId::new("src/moved.rs"))),
@@ -17749,6 +17762,22 @@ mod tests {
                 }),
             ),
         ];
+        for (label, mutate) in volatile_cases {
+            let before = entity_in_edited_file("target_symbol", file, "blob-1", 10);
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert_eq!(
+                crate::embed::format_graph_entity_text(&before),
+                crate::embed::format_graph_entity_text(&after),
+                "{label} must no longer reach the embed text"
+            );
+            assert_ne!(
+                crate::embed::format_graph_entity_volatile_context(&before, &[]),
+                crate::embed::format_graph_entity_volatile_context(&after, &[]),
+                "{label} must reach the volatile context, or it was lost rather \
+                 than relocated"
+            );
+        }
 
         for (label, mutate) in cases {
             let graph = InMemoryGraph::new();

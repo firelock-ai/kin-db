@@ -4972,44 +4972,57 @@ mod tests {
             .unwrap()
             .to_string();
 
+        // The filler characters must not appear anywhere else in the fixture,
+        // or counting them over the whole text counts other fields too. This
+        // control is what caught it: `s` occurs in "disk", `d` in "load" and
+        // "disk", `n` in "fn" and "open".
+        let base_text = format_graph_entity_text(&base);
+        for filler in ['Z', 'Q', 'X', 'W'] {
+            assert_eq!(
+                base_text.chars().filter(|c| *c == filler).count(),
+                0,
+                "filler {filler} must not occur in the unmodified fixture"
+            );
+        }
+
         let mut long_name = base.clone();
-        long_name.name = "n".repeat(EMBED_NAME_MAX_CHARS * 3);
+        long_name.name = "Z".repeat(EMBED_NAME_MAX_CHARS * 3);
         let mut long_signature = base.clone();
-        long_signature.signature = "s".repeat(EMBED_SIGNATURE_MAX_CHARS * 3);
+        long_signature.signature = "Q".repeat(EMBED_SIGNATURE_MAX_CHARS * 3);
         let mut long_doc = base.clone();
-        long_doc.doc_summary = Some("d".repeat(EMBED_DOC_SUMMARY_MAX_CHARS * 3));
+        long_doc.doc_summary = Some("X".repeat(EMBED_DOC_SUMMARY_MAX_CHARS * 3));
         let mut long_body = base.clone();
         long_body.metadata.extra.insert(
             EMBEDDING_BODY_PREVIEW_KEY.into(),
-            serde_json::Value::String("b".repeat(EMBED_BODY_PREVIEW_MAX_CHARS * 3)),
+            serde_json::Value::String("W".repeat(EMBED_BODY_PREVIEW_MAX_CHARS * 3)),
         );
 
         for (label, entity, filler, ceiling, survivors) in [
             (
                 "name",
                 long_name,
-                'n',
+                'Z',
                 EMBED_NAME_MAX_CHARS,
                 vec![signature.clone(), doc.clone(), body.clone()],
             ),
             (
                 "signature",
                 long_signature,
-                's',
+                'Q',
                 EMBED_SIGNATURE_MAX_CHARS,
                 vec![name.clone(), doc.clone(), body.clone()],
             ),
             (
                 "doc summary",
                 long_doc,
-                'd',
+                'X',
                 EMBED_DOC_SUMMARY_MAX_CHARS,
                 vec![name.clone(), signature.clone(), body.clone()],
             ),
             (
                 "body preview",
                 long_body,
-                'b',
+                'W',
                 EMBED_BODY_PREVIEW_MAX_CHARS,
                 vec![name.clone(), signature.clone(), doc.clone()],
             ),
