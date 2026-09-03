@@ -239,10 +239,39 @@ fn every_entity_reads_back_byte_identical_through_the_mapped_views() {
         // Byte-identical on the serialized form, not only structurally equal,
         // so a field that survives `PartialEq` by being defaulted on both sides
         // cannot pass.
+        //
+        // `metadata` is held to CONTENT rather than to bytes, and the reason is
+        // a property of the type rather than of this format: `EntityMetadata`
+        // wraps a `std::collections::HashMap`, whose iteration order is not
+        // part of its value, so two equal maps can serialize to two byte
+        // orders. Asserting bytes over it asserts something no writer can
+        // promise. CI found this on an entity carrying two metadata keys, and
+        // narrowing the claim is the fix rather than deleting it: the other
+        // fourteen fields are still held to bytes, and metadata is held to a
+        // key-ordered comparison that distinguishes value types, so a `26` that
+        // came back as `26.0` still fails.
+        let ordered = |entity: &Entity| -> BTreeMap<String, serde_json::Value> {
+            entity
+                .metadata
+                .extra
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        };
         assert_eq!(
-            rmp_serde::to_vec(&actual).unwrap(),
-            rmp_serde::to_vec(expected).unwrap(),
-            "entity at ordinal {ordinal} did not serialize identically"
+            ordered(&actual),
+            ordered(expected),
+            "entity at ordinal {ordinal} did not carry back the same metadata"
+        );
+
+        let mut actual_without = actual.clone();
+        let mut expected_without = expected.clone();
+        actual_without.metadata = EntityMetadata::default();
+        expected_without.metadata = EntityMetadata::default();
+        assert_eq!(
+            rmp_serde::to_vec(&actual_without).unwrap(),
+            rmp_serde::to_vec(&expected_without).unwrap(),
+            "entity at ordinal {ordinal} did not serialize identically outside its metadata"
         );
         seen += 1;
     }
