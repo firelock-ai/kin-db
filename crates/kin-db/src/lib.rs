@@ -34,6 +34,11 @@ pub use storage::format::{
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
+pub use storage::{
+    write_segment, ColumnStat, OpenProfile, Ordinals, SegmentReader, SegmentShape,
+    SegmentWriteStats,
+    CURRENT_SEGMENT_VERSION, MAX_SUPPORTED_SEGMENT_VERSION, MIN_SUPPORTED_SEGMENT_VERSION,
+};
 pub use storage::SnapshotManager;
 pub use storage::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,

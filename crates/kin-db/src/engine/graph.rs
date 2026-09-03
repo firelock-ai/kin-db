@@ -4071,6 +4071,34 @@ impl InMemoryGraph {
         edges
     }
 
+    /// Visit every entity under one read lock, without cloning any of them.
+    ///
+    /// `list_all_entities` returns `Vec<Entity>` cloned from the live map, which
+    /// is a full second copy of the graph and is how the reconciler LKG and the
+    /// cross-file linker each came to hold one. A visitor is what a reader that
+    /// only needs to LOOK at every entity should take, and it is what the
+    /// segment writer takes.
+    pub fn for_each_entity<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Entity),
+    {
+        let ent = self.entities.read();
+        for entity in ent.entities.values() {
+            visit(entity);
+        }
+    }
+
+    /// Visit every relation under one read lock, without cloning any of them.
+    pub fn for_each_relation<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Relation),
+    {
+        let ent = self.entities.read();
+        for relation in ent.relations.values() {
+            visit(relation);
+        }
+    }
+
     /// Resolve one persisted external symbol coordinate by its stable ID.
     pub fn get_external_reference(&self, id: &ExternalReferenceId) -> Option<ExternalReference> {
         self.entities.read().external_references.get(id).cloned()

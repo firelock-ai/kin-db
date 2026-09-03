@@ -9,6 +9,22 @@
 //!
 //! The full GraphSnapshot is still used for write operations.
 //! This index is a read-only acceleration layer.
+//!
+//! # Two things this shape costs, and where the replacement is
+//!
+//! [`crate::storage::segment`] is the mapped columnar form of the same facts.
+//! It exists because this one is fully owned: [`ReadIndex::load`] returns
+//! `Self` from `bincode::deserialize`, so every entity name, path and id
+//! becomes heap the moment a process reads the index, and `id_to_idx` keys are
+//! 36-byte UUID strings rather than the 16 raw bytes.
+//!
+//! Two properties of this format are hazards the segment does not repeat.
+//! [`ReadIndex::load`] refuses on `version != INDEX_VERSION`, an equality of
+//! the kind that made every store on disk unopenable in the first draft of
+//! kin-db#271 while the whole suite stayed green. And `kind` and `language`
+//! are persisted as `variant as u8`, which pins the meaning of every byte
+//! already written to the declaration order of `EntityKind` and `LanguageId`,
+//! so inserting a variant reinterprets old indexes rather than failing.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

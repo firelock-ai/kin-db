@@ -26,6 +26,7 @@ pub(crate) use mmap::open_regular_nofollow;
 pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
 mod snapshot;
+pub mod segment;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod tiered;
@@ -60,6 +61,11 @@ pub use gcs_compatibility::{
     GcsFullAuthorityEnvelopeCompatibility, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
 };
 pub use index::ReadIndex;
+pub use segment::{
+    write_segment, ColumnStat, OpenProfile, Ordinals, SegmentReader, SegmentShape,
+    SegmentWriteStats,
+    CURRENT_SEGMENT_VERSION, MAX_SUPPORTED_SEGMENT_VERSION, MIN_SUPPORTED_SEGMENT_VERSION,
+};
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,
     compute_repo_truth_hash, compute_retrieval_authority_hash, compute_subgraph_hash,
