@@ -635,7 +635,7 @@ const METAL_MAX_ATTENTION_AREA: usize = 8_388_608;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v4";
 #[cfg(feature = "embeddings")]
-const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
+const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-09-03-durable-fields";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 pub(crate) const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 pub(crate) const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
@@ -3710,11 +3710,6 @@ pub fn format_entity_text(name: &str, signature: &str, body: &str) -> String {
     parts.join(" ")
 }
 
-/// Build the text representation for a persisted graph entity.
-pub fn format_graph_entity_text(entity: &Entity) -> String {
-    format_graph_entity_text_with_context(entity, &[])
-}
-
 /// Append `text` to `out`, bounded to `max_chars` on a UTF-8 char boundary.
 /// Right-truncation keeps the front of the field, which for docstrings is the
 /// summary line and first paragraph (the discriminating signal); the trailing
@@ -3739,63 +3734,58 @@ fn bounded_embed_field(text: &str, max_chars: usize) -> String {
     out
 }
 
-/// Build the text representation for a persisted graph entity with additional
-/// graph-derived neighborhood context lines.
+/// Build the text representation for a persisted graph entity.
 ///
-/// The fields are emitted in a fixed order and joined with `\n`. Output is built
-/// directly into one pre-sized `String` — no intermediate `Vec<String>` and no
-/// per-field clones — so the common entity formats in a single allocation. The
-/// byte layout is identical to the prior `parts.join("\n")` form; embed
-/// determinism depends on that, so it is locked by
+/// Emits only the entity's DURABLE fields, in a fixed order, joined with `\n`:
+/// the kind label, the name, the signature, the bounded doc summary, and the
+/// body preview. Those describe what the entity IS, and they change only when
+/// someone edits it.
+///
+/// The VOLATILE fields are deliberately absent: the file path, the file's
+/// import and surface context, and the graph relation context lines. Those
+/// describe where the entity SITS. They change when a file moves, when an
+/// unrelated sibling in the same file changes, or when any neighbour gains or
+/// loses an edge, and none of those is an edit to this entity.
+///
+/// That split is the whole point, because the embedding cache keys on this
+/// text (`EmbeddingCache::key_for_text`). While the path was field two and the
+/// relation lines were the tail, a moved file re-embedded every entity in it
+/// and a changed neighbour re-embedded its neighbours, so a store's embedding
+/// cost tracked churn anywhere in the repository rather than churn in the
+/// entity. Now it tracks the entity. Two consequences follow, and both are
+/// intended:
+///
+/// * The vector no longer carries path or neighbour signal. Retrieval reads
+///   both of those from the graph and the lexical index, which hold them
+///   exactly rather than as an embedding of a string.
+/// * The live-entity text and its head revision's text become byte-identical
+///   for the same content, because the relation lines were the only thing that
+///   ever separated them. So the in-batch dedupe and the on-disk cache collapse
+///   the pair structurally, where before it took a carry rule to avoid
+///   embedding every entity twice.
+///
+/// Changing what this emits changes every vector, so it moves with
+/// `EMBEDDING_CACHE_PIPELINE_EPOCH` in the same commit rather than mixing two
+/// vector populations in one index.
+///
+/// Output is built directly into one pre-sized `String`, so the common entity
+/// formats in a single allocation, and the byte layout is locked by
 /// `format_graph_entity_text_byte_identical_to_joined_parts`.
-pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
+pub fn format_graph_entity_text(entity: &Entity) -> String {
     let kind_label = entity_kind_label(entity.kind);
-
-    let file_origin = entity.file_origin.as_ref().map(|origin| origin.0.as_str());
-    if let Some(path) = file_origin {
-        // Machine-absolute paths must never enter embed text — they bake
-        // machine-specific prefixes into vectors, breaking cross-host
-        // reproducibility. The parser layer is responsible for storing
-        // repo-relative paths; this guard catches regressions at the embed
-        // boundary where the damage would be silent.
-        debug_assert!(
-            !path.starts_with('/'),
-            "absolute path in embed text: '{path}' — store repo-relative paths only"
-        );
-        if path.starts_with('/') {
-            tracing::warn!(
-                path = %path,
-                "machine-absolute path detected in embedding input (entity file_origin); \
-                 vectors may not be reproducible across machines — store repo-relative paths"
-            );
-        }
-    }
 
     let doc_summary = entity
         .doc_summary
         .as_deref()
         .map(str::trim)
         .filter(|summary| !summary.is_empty());
-    let metadata_field = |key: &str| {
-        entity
-            .metadata
-            .extra
-            .get(key)
-            .and_then(|value| value.as_str())
-            .filter(|text| !text.is_empty())
-    };
-    let body_preview = metadata_field(EMBEDDING_BODY_PREVIEW_KEY);
-    let file_import_context = metadata_field(FILE_IMPORT_CONTEXT_KEY);
-    let file_surface_context = metadata_field(FILE_SURFACE_CONTEXT_KEY);
+    let body_preview = entity_metadata_field(entity, EMBEDDING_BODY_PREVIEW_KEY);
 
     // Pre-size for every field that will be emitted (each preceded by one
     // `\n` joiner), so the buffer is allocated once. The doc-summary estimate
-    // uses its untruncated byte length — a harmless slight over-reserve when the
+    // uses its untruncated byte length, a harmless slight over-reserve when the
     // field is capped.
     let mut capacity = kind_label.len();
-    if let Some(path) = file_origin {
-        capacity += 1 + path.len();
-    }
     if !entity.name.is_empty() {
         capacity += 1 + entity.name.len();
     }
@@ -3805,22 +3795,12 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     if let Some(summary) = doc_summary {
         capacity += 1 + summary.len();
     }
-    for field in [body_preview, file_import_context, file_surface_context]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(field) = body_preview {
         capacity += 1 + field.len();
-    }
-    for line in context_lines {
-        capacity += 1 + line.len();
     }
 
     let mut out = String::with_capacity(capacity);
     out.push_str(kind_label);
-    if let Some(path) = file_origin {
-        out.push('\n');
-        out.push_str(path);
-    }
     if !entity.name.is_empty() {
         out.push('\n');
         out.push_str(&entity.name);
@@ -3833,18 +3813,96 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
         out.push('\n');
         push_bounded_embed_field(&mut out, summary, EMBED_DOC_SUMMARY_MAX_CHARS);
     }
-    for field in [body_preview, file_import_context, file_surface_context]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(field) = body_preview {
         out.push('\n');
         out.push_str(field);
     }
-    for line in context_lines {
-        out.push('\n');
-        out.push_str(line);
-    }
     out
+}
+
+/// The embed text for a persisted graph entity, ignoring the caller's graph
+/// context lines.
+///
+/// Identical to [`format_graph_entity_text`], and kept as a separate entry
+/// point because the callers that hold context lines are in another crate
+/// boundary's file. The parameter is retained rather than removed so those
+/// callers compile unchanged; the lines themselves belong to
+/// [`format_graph_entity_volatile_context`] now, which is what hashes them.
+pub fn format_graph_entity_text_with_context(entity: &Entity, _context_lines: &[String]) -> String {
+    format_graph_entity_text(entity)
+}
+
+/// Read a non-empty string field out of an entity's metadata.
+fn entity_metadata_field<'a>(entity: &'a Entity, key: &str) -> Option<&'a str> {
+    entity
+        .metadata
+        .extra
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+}
+
+/// The volatile half: where an entity sits, rather than what it is.
+///
+/// Emits the file path, the file's import and surface context, and the graph
+/// relation context lines, in that order, joined with `\n`. Nothing embeds
+/// this. It exists so the volatile half is a computable value with one
+/// definition, rather than something each caller reassembles, and so
+/// [`embed_volatile_context_digest`] can name what a cached vector was produced
+/// beside.
+///
+/// The machine-absolute path guard lives here, because this is where a path now
+/// enters an embed-adjacent value. An absolute path would bake a machine prefix
+/// into the digest and break cross-host reproducibility; the parser layer is
+/// responsible for storing repo-relative paths, and this catches a regression
+/// at the boundary where the damage would otherwise be silent.
+pub fn format_graph_entity_volatile_context(entity: &Entity, context_lines: &[String]) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(3 + context_lines.len());
+
+    if let Some(origin) = entity.file_origin.as_ref() {
+        let path = origin.0.as_str();
+        debug_assert!(
+            !path.starts_with('/'),
+            "absolute path in embed context: '{path}' - store repo-relative paths only"
+        );
+        if path.starts_with('/') {
+            tracing::warn!(
+                path = %path,
+                "machine-absolute path detected in embedding context (entity file_origin); \
+                 volatile digests may not be reproducible across machines - store \
+                 repo-relative paths"
+            );
+        }
+        parts.push(path);
+    }
+    for key in [FILE_IMPORT_CONTEXT_KEY, FILE_SURFACE_CONTEXT_KEY] {
+        if let Some(field) = entity_metadata_field(entity, key) {
+            parts.push(field);
+        }
+    }
+    for line in context_lines {
+        parts.push(line.as_str());
+    }
+    parts.join("\n")
+}
+
+/// SHA-256 over [`format_graph_entity_volatile_context`], hex encoded: the
+/// separate cheap key beside the durable embedding key.
+///
+/// Nothing persists this yet. Recording it beside a cached vector would say
+/// which path and which neighbourhood the vector was produced under, so a later
+/// pass could re-embed on a volatile change if that ever proves worth the GPU
+/// time. Doing so needs the embedder API to carry a second key alongside each
+/// text, which reaches a caller outside this file, so it is proposed rather
+/// than done here.
+pub fn embed_volatile_context_digest(entity: &Entity, context_lines: &[String]) -> String {
+    // Locally imported: the module's `sha2` import sits behind the `embeddings`
+    // feature, and the volatile digest is a property of the graph rather than of
+    // the inference stack, so it has to hold with that feature off.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format_graph_entity_volatile_context(entity, context_lines).as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Build the text representation for a structured artifact.
@@ -4373,6 +4431,25 @@ mod tests {
     #[cfg(feature = "embeddings")]
     const DEFAULT_EMBED_DIMS: usize = 768;
 
+    /// SHA-256 of an entity's embed text, hex encoded: exactly what
+    /// `EmbeddingCache::key_for_text` computes over the same string. Duplicated
+    /// here rather than reached for, so these guards hold with the
+    /// `embeddings` feature off, which is the configuration that compiles the
+    /// formatter without the cache.
+    fn embed_text_digest(entity: &Entity) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(format_graph_entity_text(entity).as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn embed_text_digest_with_context(entity: &Entity, context_lines: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(format_graph_entity_text_with_context(entity, context_lines).as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     #[test]
     fn format_entity_text_joins_parts() {
         assert_eq!(
@@ -4425,14 +4502,247 @@ mod tests {
         );
 
         let formatted = format_graph_entity_text(&entity);
-        assert!(formatted.contains("function"));
-        assert!(formatted.contains("src/config.rs"));
-        assert!(formatted.contains("parse_config"));
-        assert!(formatted.contains("fn parse_config(path: &str) -> Config"));
-        assert!(formatted.contains("Parse a config file"));
-        assert!(formatted.contains("fn parse_config(path: &str) -> Config { ... }"));
-        assert!(formatted.contains("@vue/runtime-core"));
-        assert!(formatted.contains("runtime dom"));
+        // The durable half, all of it.
+        assert!(formatted.contains("function"), "kind label");
+        assert!(formatted.contains("parse_config"), "name");
+        assert!(
+            formatted.contains("fn parse_config(path: &str) -> Config"),
+            "signature"
+        );
+        assert!(formatted.contains("Parse a config file"), "doc summary");
+        assert!(
+            formatted.contains("fn parse_config(path: &str) -> Config { ... }"),
+            "body preview"
+        );
+
+        // The volatile half, none of it. These are the fields whose presence
+        // made a moved file and a changed neighbour re-embed.
+        assert!(
+            !formatted.contains("src/config.rs"),
+            "the file path must not reach the embed text"
+        );
+        assert!(
+            !formatted.contains("@vue/runtime-core"),
+            "file import context must not reach the embed text"
+        );
+        assert!(
+            !formatted.contains("runtime dom"),
+            "file surface context must not reach the embed text"
+        );
+
+        // And all three land in the volatile context instead, so they are
+        // dropped from one value rather than lost from both.
+        let volatile = format_graph_entity_volatile_context(&entity, &[]);
+        assert!(volatile.contains("src/config.rs"), "path");
+        assert!(volatile.contains("@vue/runtime-core"), "import context");
+        assert!(volatile.contains("runtime dom"), "surface context");
+    }
+
+    /// A durable-field entity fixture, so the guards below vary exactly one
+    /// thing at a time.
+    fn durable_fixture(path: &str) -> Entity {
+        let mut entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "load_registry".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(path)),
+            span: None,
+            signature: "fn load_registry() -> Registry".into(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: Some("Load the registry from disk".into()),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        entity.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("fn load_registry() -> Registry { Registry::open() }".into()),
+        );
+        entity.metadata.extra.insert(
+            FILE_IMPORT_CONTEXT_KEY.into(),
+            serde_json::Value::String(format!("module {path} names Registry")),
+        );
+        entity
+    }
+
+    /// The guard the cache-key change is accepted on: a file that moves must
+    /// produce the same embed text, so it produces the same cache key, so it
+    /// costs zero new embeddings.
+    ///
+    /// Two things move together here, the path itself and the file import
+    /// context derived from it, because that is what a real move does.
+    #[test]
+    fn a_moved_file_keeps_the_embed_text_and_the_cache_key() {
+        let before = durable_fixture("src/registry.rs");
+        let after = durable_fixture("crates/kin-core/src/registry.rs");
+
+        assert_eq!(
+            format_graph_entity_text(&before),
+            format_graph_entity_text(&after),
+            "a move must not change the embed text"
+        );
+        assert_eq!(
+            embed_text_digest(&before),
+            embed_text_digest(&after),
+            "a move must not change the cache key"
+        );
+
+        // Positive control: the paths really do differ, so the equality above
+        // is not comparing a value to itself.
+        assert_ne!(
+            format_graph_entity_volatile_context(&before, &[]),
+            format_graph_entity_volatile_context(&after, &[]),
+            "the fixture must actually move the file"
+        );
+    }
+
+    /// A neighbour that changes must likewise cost nothing, because a neighbour
+    /// gaining or losing an edge is not an edit to this entity.
+    #[test]
+    fn a_changed_neighbour_keeps_the_embed_text_and_the_cache_key() {
+        let entity = durable_fixture("src/registry.rs");
+        let before: Vec<String> = vec!["calls parse_manifest".into()];
+        let after: Vec<String> = vec![
+            "calls parse_manifest".into(),
+            "called_by reload_registry".into(),
+        ];
+
+        assert_eq!(
+            format_graph_entity_text_with_context(&entity, &before),
+            format_graph_entity_text_with_context(&entity, &after),
+            "a neighbourhood change must not change the embed text"
+        );
+        assert_eq!(
+            embed_text_digest_with_context(&entity, &before),
+            embed_text_digest_with_context(&entity, &after),
+            "a neighbourhood change must not change the cache key"
+        );
+        assert_ne!(
+            format_graph_entity_volatile_context(&entity, &before),
+            format_graph_entity_volatile_context(&entity, &after),
+            "the fixture must actually change the neighbourhood"
+        );
+    }
+
+    /// The control that makes the two guards above able to fail. A formatter
+    /// that returned a constant, or a key that ignored its input, would pass
+    /// both of them; an edit to the entity's own content must still move both.
+    ///
+    /// Every durable field is varied on its own, so a formatter that dropped
+    /// any one of them fails here rather than passing on the strength of the
+    /// others.
+    #[test]
+    fn an_edit_to_any_durable_field_changes_the_embed_text_and_the_cache_key() {
+        let base = durable_fixture("src/registry.rs");
+        let base_text = format_graph_entity_text(&base);
+
+        let mut renamed = base.clone();
+        renamed.name = "open_registry".into();
+
+        let mut resigned = base.clone();
+        resigned.signature = "fn load_registry(path: &Path) -> Registry".into();
+
+        let mut redocumented = base.clone();
+        redocumented.doc_summary = Some("Load the registry from a mapping".into());
+
+        let mut rebodied = base.clone();
+        rebodied.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("fn load_registry() -> Registry { Registry::map() }".into()),
+        );
+
+        let mut rekinded = base.clone();
+        rekinded.kind = EntityKind::Struct;
+
+        for (label, edited) in [
+            ("name", renamed),
+            ("signature", resigned),
+            ("doc summary", redocumented),
+            ("body preview", rebodied),
+            ("kind", rekinded),
+        ] {
+            let edited_text = format_graph_entity_text(&edited);
+            assert_ne!(
+                base_text, edited_text,
+                "editing the {label} must change the embed text"
+            );
+            assert_ne!(
+                embed_text_digest(&base),
+                embed_text_digest(&edited),
+                "editing the {label} must change the cache key"
+            );
+        }
+    }
+
+    /// The live entity's text and its head revision's text are byte-identical
+    /// for the same content.
+    ///
+    /// The relation context lines were the only thing that ever separated them,
+    /// which is why every entity was embedded twice, once as `Entity` and once
+    /// as `EntityRevision`. With the lines out of the text the pair collapses
+    /// in the in-batch dedupe and in the on-disk cache, structurally, rather
+    /// than through a carry rule that has to notice the case.
+    #[test]
+    fn the_entity_and_its_head_revision_format_identically() {
+        let entity = durable_fixture("src/registry.rs");
+        let context: Vec<String> = vec!["calls parse_manifest".into()];
+
+        // The two call shapes the drain uses: the live entity carries context,
+        // the revision does not.
+        let live = format_graph_entity_text_with_context(&entity, &context);
+        let revision = format_graph_entity_text(&entity);
+        assert_eq!(
+            live, revision,
+            "the pair must format identically so the dedupe is structural"
+        );
+        assert_eq!(
+            embed_text_digest(&entity),
+            embed_text_digest_with_context(&entity, &context)
+        );
+    }
+
+    /// The volatile digest is the separate cheap key, so it must move with the
+    /// volatile fields and hold still under a durable edit. Both directions,
+    /// because a digest over everything would pass the first half alone.
+    #[test]
+    fn the_volatile_digest_tracks_only_the_volatile_fields() {
+        let here = durable_fixture("src/registry.rs");
+        let moved = durable_fixture("crates/kin-core/src/registry.rs");
+        let context: Vec<String> = vec!["calls parse_manifest".into()];
+        let more_context: Vec<String> = vec![
+            "calls parse_manifest".into(),
+            "called_by reload_registry".into(),
+        ];
+
+        assert_ne!(
+            embed_volatile_context_digest(&here, &context),
+            embed_volatile_context_digest(&moved, &context),
+            "the digest must move when the file moves"
+        );
+        assert_ne!(
+            embed_volatile_context_digest(&here, &context),
+            embed_volatile_context_digest(&here, &more_context),
+            "the digest must move when the neighbourhood changes"
+        );
+
+        let mut edited = here.clone();
+        edited.signature = "fn load_registry(path: &Path) -> Registry".into();
+        assert_eq!(
+            embed_volatile_context_digest(&here, &context),
+            embed_volatile_context_digest(&edited, &context),
+            "the digest must hold still under an edit to the entity itself"
+        );
     }
 
     #[test]
@@ -4502,7 +4812,7 @@ mod tests {
     }
 
     #[test]
-    fn format_graph_entity_text_with_context_appends_graph_neighborhood() {
+    fn format_graph_entity_text_leaves_the_graph_neighborhood_out() {
         let entity = Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
@@ -4528,17 +4838,34 @@ mod tests {
             superseded_by: None,
         };
 
-        let formatted = format_graph_entity_text_with_context(
-            &entity,
-            &[
-                "calls parse_manifest".into(),
-                "import_source serde_json".into(),
-            ],
+        let context: Vec<String> = vec![
+            "calls parse_manifest".into(),
+            "import_source serde_json".into(),
+        ];
+        let formatted = format_graph_entity_text_with_context(&entity, &context);
+
+        assert!(
+            formatted.contains("load_registry"),
+            "the durable half stays"
+        );
+        assert!(
+            !formatted.contains("calls parse_manifest"),
+            "a relation line must not reach the embed text"
+        );
+        assert!(
+            !formatted.contains("import_source serde_json"),
+            "a relation line must not reach the embed text"
         );
 
-        assert!(formatted.contains("load_registry"));
-        assert!(formatted.contains("calls parse_manifest"));
-        assert!(formatted.contains("import_source serde_json"));
+        // Passing context or not passing it is the same text, which is what
+        // makes a changed neighbour a cache hit.
+        assert_eq!(formatted, format_graph_entity_text(&entity));
+
+        // The lines are in the volatile context, so they are relocated rather
+        // than discarded.
+        let volatile = format_graph_entity_volatile_context(&entity, &context);
+        assert!(volatile.contains("calls parse_manifest"));
+        assert!(volatile.contains("import_source serde_json"));
     }
 
     #[test]
@@ -4558,9 +4885,6 @@ mod tests {
             }
             let mut parts: Vec<String> = Vec::new();
             parts.push(entity_kind_label(entity.kind).to_string());
-            if let Some(file_origin) = &entity.file_origin {
-                parts.push(file_origin.0.clone());
-            }
             if !entity.name.is_empty() {
                 parts.push(entity.name.clone());
             }
@@ -4573,18 +4897,19 @@ mod tests {
                     parts.push(bounded(doc_summary, EMBED_DOC_SUMMARY_MAX_CHARS));
                 }
             }
-            for key in [
-                EMBEDDING_BODY_PREVIEW_KEY,
-                FILE_IMPORT_CONTEXT_KEY,
-                FILE_SURFACE_CONTEXT_KEY,
-            ] {
-                if let Some(text) = entity.metadata.extra.get(key).and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        parts.push(text.to_string());
-                    }
+            if let Some(text) = entity
+                .metadata
+                .extra
+                .get(EMBEDDING_BODY_PREVIEW_KEY)
+                .and_then(|v| v.as_str())
+            {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
                 }
             }
-            parts.extend(context_lines.iter().cloned());
+            // The volatile fields are absent by construction, and
+            // `context_lines` is ignored, which is exactly the claim.
+            let _ = context_lines;
             parts.join("\n")
         }
 
@@ -5656,6 +5981,52 @@ mod tests {
     }
 
     #[cfg(feature = "embeddings")]
+    /// The end-to-end form of the moved-file claim, through a real cache on
+    /// disk rather than through the key function alone: embed an entity, move
+    /// its file, and look it up again. A hit is zero new embeddings.
+    ///
+    /// The negative control is the same cache asked for an EDITED entity, which
+    /// must miss. Without it a cache that returned its only entry for every
+    /// key would pass.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_moved_file_hits_the_embedding_cache_and_embeds_nothing_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = EmbeddingCache::new_in(dir.path().to_path_buf(), "durable-key".into(), 4)
+            .expect("cache should initialize");
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+
+        let before = durable_fixture("src/registry.rs");
+        let vector = [0.5f32, 0.25, 0.125, 0.0625];
+
+        // The first pass embeds it and caches the result.
+        let first_key = cache.key_for_text(&format_graph_entity_text(&before));
+        assert!(
+            cache.get_by_key(&first_key).is_none(),
+            "a cold cache must miss"
+        );
+        cache.put_by_key(&first_key, &vector, &producers);
+
+        // The file moves. The second pass must not reach the GPU.
+        let after = durable_fixture("crates/kin-core/src/registry.rs");
+        let moved_key = cache.key_for_text(&format_graph_entity_text(&after));
+        assert_eq!(moved_key, first_key, "a move must not change the key");
+        let served = cache
+            .get_by_key(&moved_key)
+            .expect("a moved file must hit the cache");
+        assert_eq!(served.vector, vector.to_vec());
+
+        // Negative control: an edit must miss, or the hit above means nothing.
+        let mut edited = before.clone();
+        edited.signature = "fn load_registry(path: &Path) -> Registry".into();
+        let edited_key = cache.key_for_text(&format_graph_entity_text(&edited));
+        assert_ne!(edited_key, first_key, "an edit must change the key");
+        assert!(
+            cache.get_by_key(&edited_key).is_none(),
+            "an edited entity must miss the cache"
+        );
+    }
+
     #[test]
     fn embedding_cache_round_trips_vectors() {
         let dir = tempfile::tempdir().unwrap();
@@ -6286,9 +6657,14 @@ mod tests {
     /// triggers the debug_assert! guard, documenting that this is a bug.
     /// In debug builds (all `cargo test` runs) this panics; a regression that
     /// introduces absolute paths will be caught immediately.
+    ///
+    /// The guard moved with the path. The path no longer reaches the embed
+    /// text, so the place an absolute prefix can still bake a machine into a
+    /// reproducible value is the volatile digest, and that is where the
+    /// assertion now lives.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "absolute path in embed text")]
+    #[should_panic(expected = "absolute path in embed context")]
     fn absolute_file_origin_guard_fires() {
         let entity = Entity {
             id: EntityId::new(),
@@ -6315,8 +6691,8 @@ mod tests {
             created_in: None,
             superseded_by: None,
         };
-        // The debug_assert! inside format_graph_entity_text_with_context fires here.
-        let _ = format_graph_entity_text(&entity);
+        // The debug_assert! inside format_graph_entity_volatile_context fires here.
+        let _ = format_graph_entity_volatile_context(&entity, &[]);
     }
 
     #[test]
