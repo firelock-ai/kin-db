@@ -14757,6 +14757,258 @@ mod tests {
         );
     }
 
+    /// One review and one note on it, fixed in every byte, so two sides can be
+    /// seeded with the same record and a digest comparison means something.
+    ///
+    /// Fixed UUIDs rather than `ReviewId::new()`: that constructor is v4 random,
+    /// and two sides seeded with random ids would fold different collaboration
+    /// roots for a reason that has nothing to do with replication, which is the
+    /// exact confusion this test exists to remove.
+    fn transferred_review_and_note() -> (kin_model::Review, kin_model::ReviewNote) {
+        let review_id = kin_model::ReviewId(Uuid::from_u128(0xc0_11_ab_00));
+        let at = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let author = kin_model::IdentityRef::human("collaboration-source");
+        let review = kin_model::Review {
+            review_id,
+            title: "transferred review".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "topic".to_string(),
+            state: kin_model::ReviewDecisionState::Pending,
+            completion: kin_model::ReviewCompletionState::InReview,
+            created_by: author.clone(),
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            scopes: Vec::new(),
+        };
+        let note = kin_model::ReviewNote {
+            note_id: kin_model::ReviewNoteId(Uuid::from_u128(0xc0_11_ab_01)),
+            review_id,
+            body: "the model calls this replicated truth".to_string(),
+            scope: None,
+            authored_by: author,
+            created_at: at,
+        };
+        (review, note)
+    }
+
+    /// A manager over a store whose graph already holds whatever `shape` wrote.
+    ///
+    /// This exists because there is no other way in. The collaboration domains
+    /// have no transaction door: `RepositoryTransaction` carries seventeen
+    /// fields and not one of them is a collaboration domain, and
+    /// `prepare_successor` admits exactly eight things (external objects,
+    /// changes, aliases, Git authority, ref mutations, the local overlay, the
+    /// workspace and the merge transaction), none of which is collaboration. So
+    /// the record is written through `ReviewStore`, which is the API kin-db
+    /// actually offers for it, the graph is exported, a generation-zero
+    /// authority is folded over those exact contents, and the manager opens on
+    /// the persisted bytes. Every step is the crate's own path; nothing is
+    /// hand-built to make the fold come out a particular way.
+    fn manager_over_graph(
+        backend: Arc<MemoryBackend>,
+        shape: impl FnOnce(&InMemoryGraph),
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let graph = InMemoryGraph::new();
+        shape(&graph);
+        let mut snapshot = graph.to_snapshot();
+        snapshot.repository_authority = Some(
+            PersistedRepositoryAuthority::empty(repository_id(), &snapshot)
+                .expect("a generation-zero authority folds over these contents"),
+        );
+        let bytes = snapshot.to_bytes().expect("the seeded snapshot serializes");
+        backend
+            .save_snapshot(repository_id().as_str(), &bytes, 0)
+            .expect("the seeded snapshot persists");
+        RepositoryAuthorityManager::open(repository_id(), backend).expect("the seeded store opens")
+    }
+
+    /// Seed one store with the review alone, through the real API.
+    ///
+    /// The pair with [`manager_holding_the_note`] differ in the note and in
+    /// nothing else, which is what lets the first control below say the NOTE
+    /// moved the collaboration root rather than the review beside it.
+    fn manager_holding_the_review(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, _) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+        })
+    }
+
+    /// Seed one store with the review and its note, through the real API.
+    ///
+    /// `add_review_note` has no other caller anywhere in this crate. This is
+    /// the door a collaboration record comes in by, and it opens onto nothing
+    /// the commit path can see.
+    fn manager_holding_the_note(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, note) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+            graph.add_review_note(&note).expect("the note is added");
+        })
+    }
+
+    /// KNOWN RED. A review note is replicated truth that nothing replicates.
+    ///
+    /// `RootBundle::collaboration` is documented as "Replicated collaboration
+    /// authority" and `RootBundle::has_same_replicated_truth` compares it
+    /// alongside `history`, `ref_state` and `replication`. So the model's own
+    /// claim is that two replicas which have exchanged their transferred
+    /// authority agree on it. They cannot. `RepositoryTransaction` has no
+    /// collaboration domain, `prepare_successor` admits none, and
+    /// `add_review_note` has no call site anywhere in this crate, so a review
+    /// note enters a store through a door the commit path does not know exists
+    /// and leaves by no door at all.
+    ///
+    /// **Why the existing guard did not catch this.**
+    /// `equivalent_receivers_reopen_with_the_same_replicated_truth` above
+    /// asserts `source_roots.collaboration == receiver_roots.collaboration`
+    /// inside a test where neither side ever writes a collaboration record. It
+    /// is an empty fold compared against an empty fold: it passes for the same
+    /// reason `0 == 0` passes, and it would keep passing if the collaboration
+    /// root were deleted from the bundle entirely.
+    ///
+    /// **The controls, because a comparison that cannot report DIFFER is not
+    /// evidence.** Three of them run before the claim, so a failure below is
+    /// the finding and not the harness:
+    ///
+    /// - the note must MOVE the collaboration root. Without this the equality
+    ///   at the end could fail, or hold, for reasons unrelated to the note.
+    /// - two sides that BOTH hold the note must agree on every replicated root.
+    ///   This proves agreement is reachable through this harness at all, so the
+    ///   final assertion is a claim about replication and not an unsatisfiable
+    ///   one about the seed.
+    /// - the richest transaction this module can build must move `history` and
+    ///   `ref_state` and leave `collaboration` byte-identical. This is the
+    ///   runnable half of "no transaction carries it": the structural half is
+    ///   the field list, which a reader can check but a test cannot.
+    ///
+    /// **Ignored, not weakened.** The assertion states what the model claims
+    /// and fails, and that failing state is the finding. It is not inverted
+    /// into a test that passes by asserting the hole is present, because such a
+    /// test would go red on the day somebody closes the hole and would have to
+    /// be deleted by the fix. `#[ignore]` is this repo's mechanism for a test
+    /// the default suite does not run, and the honest cost is that CI does not
+    /// see this one: run it by name to read the red. Closing it means giving
+    /// the collaboration domain a transfer representation across kin-model,
+    /// kin-db and kin, which is a three-repo decision and deliberately not made
+    /// here.
+    ///
+    /// ```text
+    /// cargo test -p kin-db --lib \
+    ///   a_review_note_on_one_side_is_replicated_truth_the_other_never_receives \
+    ///   -- --ignored --exact --nocapture
+    /// ```
+    #[test]
+    #[ignore = "known red: RootBundle calls `collaboration` replicated truth and no transfer moves it"]
+    fn a_review_note_on_one_side_is_replicated_truth_the_other_never_receives() {
+        // Control one: the collaboration root is sensitive to the note itself.
+        // The two stores differ in the note and in nothing else, so this cannot
+        // pass on the review that carries it.
+        let carrying = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let without = manager_holding_the_review(Arc::new(MemoryBackend::default()));
+        assert_ne!(
+            carrying.read_authority().roots().collaboration,
+            without.read_authority().roots().collaboration,
+            "a review note must move the collaboration root, or nothing below means anything"
+        );
+        drop(carrying);
+        drop(without);
+
+        // Control two: agreement is reachable. Both sides hold the same note and
+        // both apply the same transferred authority.
+        let agreeing_source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let agreeing_receiver = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        agreeing_source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_source,
+                0xfb01,
+                "collaboration-source",
+            ))
+            .unwrap();
+        agreeing_receiver
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_receiver,
+                0xfb02,
+                "collaboration-destination",
+            ))
+            .unwrap();
+        let agreeing_source_roots = agreeing_source.read_authority().roots().clone();
+        let agreeing_receiver_roots = agreeing_receiver.read_authority().roots().clone();
+        assert_eq!(
+            agreeing_source_roots.collaboration, agreeing_receiver_roots.collaboration,
+            "two sides holding the same note must fold the same collaboration root"
+        );
+        assert!(
+            agreeing_source_roots.has_same_replicated_truth(&agreeing_receiver_roots),
+            "two sides holding the same note must agree on replicated truth"
+        );
+
+        // Control three: the richest transaction this module can build moves the
+        // replicated history and ref roots and leaves collaboration exactly where
+        // it found it. This is the runnable half of "no transaction carries it".
+        let commuter = initial_manager(Arc::new(MemoryBackend::default()));
+        let before = commuter.read_authority().roots().clone();
+        commuter
+            .commit_repository_transaction(arbitrary_repository_transaction(&commuter))
+            .unwrap();
+        let after = commuter.read_authority().roots().clone();
+        assert_ne!(before.history, after.history, "the fixture commits changes");
+        assert_ne!(before.ref_state, after.ref_state, "the fixture moves a ref");
+        assert_eq!(
+            before.collaboration, after.collaboration,
+            "no field of a repository transaction reaches the collaboration domain"
+        );
+
+        // The claim. The source holds the note. The receiver applies exactly the
+        // transferred authority the source applied, which is the whole vocabulary
+        // a transfer has, and ends up without it.
+        let source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let receiver = manager_over_graph(Arc::new(MemoryBackend::default()), |_| {});
+        source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &source,
+                0xfb03,
+                "collaboration-source",
+            ))
+            .unwrap();
+        receiver
+            .commit_repository_transaction(receiver_ref_transaction(
+                &receiver,
+                0xfb04,
+                "collaboration-destination",
+            ))
+            .unwrap();
+        let source_roots = source.read_authority().roots().clone();
+        let receiver_roots = receiver.read_authority().roots().clone();
+
+        // Every other replicated root already agrees, so collaboration is the one
+        // disagreement left and the failure below has exactly one cause.
+        assert_eq!(source_roots.history, receiver_roots.history);
+        assert_eq!(source_roots.ref_state, receiver_roots.ref_state);
+        assert_eq!(source_roots.replication, receiver_roots.replication);
+        assert_eq!(
+            source_roots.collaboration, receiver_roots.collaboration,
+            "`RootBundle` documents `collaboration` as replicated authority and \
+             `has_same_replicated_truth` compares it, so a receiver that applied the \
+             source's transferred authority must hold the source's review note. \
+             Nothing in `RepositoryTransaction` carries one, so it never arrives."
+        );
+        assert!(
+            source_roots.has_same_replicated_truth(&receiver_roots),
+            "a root the model calls replicated must actually replicate"
+        );
+    }
+
     #[test]
     fn local_only_operations_do_not_perturb_replicated_roots() {
         let backend_a = Arc::new(MemoryBackend::default());
