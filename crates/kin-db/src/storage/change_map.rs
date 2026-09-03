@@ -262,6 +262,16 @@ impl ChangeMap {
         self.decoded.get().is_some()
     }
 
+    /// The entries if they are already in memory, and `None` if they are
+    /// still on disk.
+    ///
+    /// [`Deref`] is the ordinary way to reach the entries and it decodes them;
+    /// this is for the one caller that has to compare map identity without
+    /// paying the decode the comparison exists to avoid.
+    pub(crate) fn decoded_if_present(&self) -> Option<&ChangeMapInner> {
+        self.decoded.get()
+    }
+
     /// Number of changes, read from the map header when the map is encoded.
     pub fn len(&self) -> usize {
         match (self.decoded.get(), &self.encoded) {

@@ -2590,6 +2590,24 @@ impl InMemoryGraph {
         Self::from_snapshot_without_text_index(snapshot)
     }
 
+    /// Whether this graph is holding its history in memory.
+    ///
+    /// The instrument behind "a graph built over a base whose history is on
+    /// disk leaves it there". The currency digest folds the whole map in, and
+    /// doing that through `Deref` used to leave it resident for the life of the
+    /// graph, which on a converted store is most of what a daemon holds.
+    #[cfg(test)]
+    pub(crate) fn history_is_decoded(&self) -> bool {
+        self.changes.read().changes.is_decoded()
+    }
+
+    /// How many changes this graph's history holds, read from the map header
+    /// when the history is still on disk.
+    #[cfg(test)]
+    pub(crate) fn history_len(&self) -> usize {
+        self.changes.read().changes.len()
+    }
+
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
     pub fn from_snapshot_with_text_index(
@@ -3422,7 +3440,9 @@ impl InMemoryGraph {
         persist_additional: impl FnOnce([u8; 32]) -> Result<T, KinDbError>,
     ) -> Result<bool, KinDbError> {
         let ent = self.entities.read();
-        let chg = self.changes.read();
+        // Held for coherence with the domains below, not read: the retrieval
+        // authority no longer covers the history.
+        let _chg = self.changes.read();
         let _wrk = self.work.read();
         let _rev = self.reviews.read();
         let _ver = self.verification.read();
@@ -3435,7 +3455,6 @@ impl InMemoryGraph {
             current_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,
@@ -3904,7 +3923,6 @@ impl InMemoryGraph {
             graph_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,
@@ -3988,14 +4006,12 @@ impl InMemoryGraph {
     #[cfg(any(feature = "vector", test))]
     pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
         let ent = self.entities.read();
-        let chg = self.changes.read();
         self.flush_merkle(&ent);
         let graph_root_hash = self.merkle.read().root_hash();
         compute_live_retrieval_authority_hash(
             graph_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,
