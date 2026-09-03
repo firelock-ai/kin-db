@@ -758,10 +758,11 @@ impl PersistedRepositoryAuthority {
             .iter()
             .map(|operation| operation.operation_id)
             .collect();
+        // FALSIFICATION ARM: the trim is removed and every assertion is left
+        // in place.
+        let _ = &logged;
         for receipt in &mut self.receipts {
-            if receipt.operation.is_some() && logged.contains(&receipt.operation_id) {
-                receipt.operation = None;
-            }
+            let _ = receipt;
         }
     }
 
