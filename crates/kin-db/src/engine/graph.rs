@@ -17740,8 +17740,14 @@ mod tests {
         // asserting something this test cannot isolate.
         let volatile_cases: Vec<(&str, Box<dyn Fn(&mut Entity)>)> = vec![
             (
-                "file_origin",
-                Box::new(|e: &mut Entity| e.file_origin = Some(FilePathId::new("src/moved.rs"))),
+                // A DIRECTORY move, keeping the filename, which is the case the
+                // basename policy makes free. A rename is a different case and
+                // still invalidates, covered in the embed module by
+                // `a_renamed_file_changes_the_embed_text_and_the_cache_key`.
+                "file_origin directory",
+                Box::new(|e: &mut Entity| {
+                    e.file_origin = Some(FilePathId::new("src/moved/graph.rs"))
+                }),
             ),
             (
                 "file_import_context",

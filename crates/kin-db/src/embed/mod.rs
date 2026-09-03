@@ -699,6 +699,39 @@ const EMBED_MAX_SEQ_LEN: usize = 2048;
 // The full text of every field stays in graph truth for display and blame. Only
 // the embed projection is bounded.
 
+/// Which part of an entity's file path, if any, the embed text carries.
+///
+/// THE DIAL. All three settings are one constant away, and the trade each makes
+/// is between how much a moved file costs and how much file identity the vector
+/// carries:
+///
+/// * `None`. Nothing about the path reaches the vector. Every move, rename and
+///   reorganisation is a cache hit, and the vector loses the language and
+///   file-identity signal a filename carries. Retrieval reads the path from the
+///   graph and the lexical index, which hold it exactly.
+/// * `Basename`, the default. The filename reaches the vector and the directory
+///   does not. A directory reorganisation is a cache hit and only a rename of
+///   the file itself re-embeds, which is correct: the name changed. The vector
+///   keeps `graph.rs` and drops `crates/kin-db/src/engine/`.
+/// * `Full`. The behaviour before this change. Every move re-embeds every
+///   entity in the file, so a store's embedding cost tracks churn anywhere in
+///   the repository rather than churn in the entity.
+///
+/// Changing this changes every vector, so it moves with
+/// `EMBEDDING_CACHE_PIPELINE_EPOCH` in the same commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathInEmbedText {
+    None,
+    Basename,
+    Full,
+}
+
+const EMBED_PATH_POLICY: PathInEmbedText = PathInEmbedText::Basename;
+
+/// Maximum characters of the path fragment the policy admits. Generous for a
+/// real filename and small enough that the budget below keeps its headroom.
+const EMBED_PATH_MAX_CHARS: usize = 64;
+
 /// Maximum characters of an entity's `name`.
 const EMBED_NAME_MAX_CHARS: usize = 128;
 
@@ -729,7 +762,8 @@ const EMBED_KIND_LABEL_MAX_CHARS: usize = 14;
 /// Below `EMBED_MAX_SEQ_LEN`, and a token is at least one character, so this
 /// bounds the tokenized length too.
 const EMBED_TEXT_MAX_CHARS: usize = EMBED_KIND_LABEL_MAX_CHARS
-    + 4
+    + 5
+    + EMBED_PATH_MAX_CHARS
     + EMBED_NAME_MAX_CHARS
     + EMBED_SIGNATURE_MAX_CHARS
     + EMBED_DOC_SUMMARY_MAX_CHARS
@@ -3824,11 +3858,17 @@ fn bounded_embed_field(text: &str, max_chars: usize) -> String {
 /// spend another field's share and the tokenizer's right-truncation can never
 /// fire. See the per-field budget section above `EMBED_NAME_MAX_CHARS`.
 ///
-/// The VOLATILE fields are deliberately absent: the file path, the file's
-/// import and surface context, and the graph relation context lines. Those
-/// describe where the entity SITS. They change when a file moves, when an
-/// unrelated sibling in the same file changes, or when any neighbour gains or
-/// loses an edge, and none of those is an edit to this entity.
+/// The path fragment is whatever `EMBED_PATH_POLICY` admits, which by default
+/// is the FILENAME and not the directory. So a directory reorganisation is a
+/// cache hit and only a rename of the file itself re-embeds, which is correct:
+/// the name changed.
+///
+/// The VOLATILE fields are deliberately absent: the directory the file sits in,
+/// the file's import and surface context, and the graph relation context lines.
+/// Those describe where the entity SITS. They change when a file is moved to
+/// another directory, when an unrelated sibling in the same file changes, or
+/// when any neighbour gains or loses an edge, and none of those is an edit to
+/// this entity.
 ///
 /// That split is the whole point, because the embedding cache keys on this
 /// text (`EmbeddingCache::key_for_text`). While the path was field two and the
@@ -3868,7 +3908,12 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     // `\n` joiner), so the buffer is allocated once. The doc-summary estimate
     // uses its untruncated byte length, a harmless slight over-reserve when the
     // field is capped.
+    let path_fragment = durable_path_fragment(entity);
+
     let mut capacity = kind_label.len();
+    if let Some(fragment) = path_fragment {
+        capacity += 1 + fragment.len().min(EMBED_PATH_MAX_CHARS * 4);
+    }
     if !entity.name.is_empty() {
         capacity += 1 + entity.name.len().min(EMBED_NAME_MAX_CHARS * 4);
     }
@@ -3884,6 +3929,10 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
 
     let mut out = String::with_capacity(capacity);
     out.push_str(kind_label);
+    if let Some(fragment) = path_fragment {
+        out.push('\n');
+        push_bounded_embed_field(&mut out, fragment, EMBED_PATH_MAX_CHARS);
+    }
     if !entity.name.is_empty() {
         out.push('\n');
         push_bounded_embed_field(&mut out, &entity.name, EMBED_NAME_MAX_CHARS);
@@ -3920,6 +3969,74 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, _context_lines: &[
     format_graph_entity_text(entity)
 }
 
+/// An entity's repo-relative file path, with the machine-absolute guard.
+///
+/// The guard lives here rather than in either formatter, because both of them
+/// read a path now and an absolute prefix has to be caught wherever it enters.
+/// The parser layer is responsible for storing repo-relative paths; this catches
+/// a regression at the boundary where the damage would otherwise be silent, and
+/// it is silent in a particular way worth naming: an absolute path bakes a
+/// machine prefix into a value that is supposed to be reproducible across hosts.
+fn repo_relative_file_path(entity: &Entity) -> Option<&str> {
+    let path = entity
+        .file_origin
+        .as_ref()
+        .map(|origin| origin.0.as_str())?;
+    debug_assert!(
+        !path.starts_with('/'),
+        "absolute path in embed context: '{path}' - store repo-relative paths only"
+    );
+    if path.starts_with('/') {
+        tracing::warn!(
+            path = %path,
+            "machine-absolute path detected in embedding input (entity file_origin); \
+             vectors and volatile digests may not be reproducible across machines - \
+             store repo-relative paths"
+        );
+    }
+    Some(path)
+}
+
+/// The filename, with no directory: everything after the last separator.
+fn path_basename(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    }
+}
+
+/// The directory, with its trailing separator: everything up to and including
+/// the last one, and the empty string for a path with no directory.
+fn path_directory(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((directory, _)) => &path[..directory.len() + 1],
+        None => "",
+    }
+}
+
+/// The path fragment the durable embed text carries, under the current policy.
+fn durable_path_fragment(entity: &Entity) -> Option<&str> {
+    let path = repo_relative_file_path(entity)?;
+    match EMBED_PATH_POLICY {
+        PathInEmbedText::None => None,
+        PathInEmbedText::Basename => Some(path_basename(path)),
+        PathInEmbedText::Full => Some(path),
+    }
+    .filter(|fragment| !fragment.is_empty())
+}
+
+/// The path fragment the volatile context carries: whatever the durable text
+/// does not.
+fn volatile_path_fragment(entity: &Entity) -> Option<&str> {
+    let path = repo_relative_file_path(entity)?;
+    match EMBED_PATH_POLICY {
+        PathInEmbedText::None => Some(path),
+        PathInEmbedText::Basename => Some(path_directory(path)),
+        PathInEmbedText::Full => None,
+    }
+    .filter(|fragment| !fragment.is_empty())
+}
+
 /// Read a non-empty string field out of an entity's metadata.
 fn entity_metadata_field<'a>(entity: &'a Entity, key: &str) -> Option<&'a str> {
     entity
@@ -3932,36 +4049,23 @@ fn entity_metadata_field<'a>(entity: &'a Entity, key: &str) -> Option<&'a str> {
 
 /// The volatile half: where an entity sits, rather than what it is.
 ///
-/// Emits the file path, the file's import and surface context, and the graph
-/// relation context lines, in that order, joined with `\n`. Nothing embeds
-/// this. It exists so the volatile half is a computable value with one
+/// Emits whatever of the file path the durable text did NOT take, then the
+/// file's import and surface context, then the graph relation context lines,
+/// joined with `\n`. Nothing embeds this. Under the default policy the first
+/// entry is the directory, with its trailing separator, and the filename is in
+/// the durable text instead. It exists so the volatile half is a computable value with one
 /// definition, rather than something each caller reassembles, and so
 /// [`embed_volatile_context_digest`] can name what a cached vector was produced
 /// beside.
 ///
-/// The machine-absolute path guard lives here, because this is where a path now
-/// enters an embed-adjacent value. An absolute path would bake a machine prefix
-/// into the digest and break cross-host reproducibility; the parser layer is
-/// responsible for storing repo-relative paths, and this catches a regression
-/// at the boundary where the damage would otherwise be silent.
+/// The machine-absolute path guard is in `repo_relative_file_path`, which both
+/// formatters read through, because both of them carry part of a path now and an
+/// absolute prefix has to be caught wherever it enters.
 pub fn format_graph_entity_volatile_context(entity: &Entity, context_lines: &[String]) -> String {
     let mut parts: Vec<&str> = Vec::with_capacity(3 + context_lines.len());
 
-    if let Some(origin) = entity.file_origin.as_ref() {
-        let path = origin.0.as_str();
-        debug_assert!(
-            !path.starts_with('/'),
-            "absolute path in embed context: '{path}' - store repo-relative paths only"
-        );
-        if path.starts_with('/') {
-            tracing::warn!(
-                path = %path,
-                "machine-absolute path detected in embedding context (entity file_origin); \
-                 volatile digests may not be reproducible across machines - store \
-                 repo-relative paths"
-            );
-        }
-        parts.push(path);
+    if let Some(fragment) = volatile_path_fragment(entity) {
+        parts.push(fragment);
     }
     for key in [FILE_IMPORT_CONTEXT_KEY, FILE_SURFACE_CONTEXT_KEY] {
         if let Some(field) = entity_metadata_field(entity, key) {
@@ -4603,11 +4707,17 @@ mod tests {
             "body preview"
         );
 
-        // The volatile half, none of it. These are the fields whose presence
-        // made a moved file and a changed neighbour re-embed.
+        // The filename is durable under the default policy, so the vector keeps
+        // file identity and language while a directory reorganisation costs
+        // nothing.
+        assert!(formatted.contains("config.rs"), "the filename is durable");
         assert!(
             !formatted.contains("src/config.rs"),
-            "the file path must not reach the embed text"
+            "the directory must not reach the embed text"
+        );
+        assert!(
+            !formatted.contains("src/"),
+            "no part of the directory may reach the embed text"
         );
         assert!(
             !formatted.contains("@vue/runtime-core"),
@@ -4621,7 +4731,7 @@ mod tests {
         // And all three land in the volatile context instead, so they are
         // dropped from one value rather than lost from both.
         let volatile = format_graph_entity_volatile_context(&entity, &[]);
-        assert!(volatile.contains("src/config.rs"), "path");
+        assert!(volatile.contains("src/"), "the directory is volatile");
         assert!(volatile.contains("@vue/runtime-core"), "import context");
         assert!(volatile.contains("runtime dom"), "surface context");
     }
@@ -4664,12 +4774,16 @@ mod tests {
         entity
     }
 
-    /// The guard the cache-key change is accepted on: a file that moves must
-    /// produce the same embed text, so it produces the same cache key, so it
-    /// costs zero new embeddings.
+    /// The guard the cache-key change is accepted on: a file moved to another
+    /// DIRECTORY must produce the same embed text, so it produces the same
+    /// cache key, so it costs zero new embeddings.
     ///
     /// Two things move together here, the path itself and the file import
-    /// context derived from it, because that is what a real move does.
+    /// context derived from it, because that is what a real move does. The
+    /// filename does not, which is what makes this a directory move rather than
+    /// a rename; the rename case is
+    /// `a_renamed_file_changes_the_embed_text_and_the_cache_key` and must
+    /// behave the opposite way.
     #[test]
     fn a_moved_file_keeps_the_embed_text_and_the_cache_key() {
         let before = durable_fixture("src/registry.rs");
@@ -4692,6 +4806,105 @@ mod tests {
             format_graph_entity_volatile_context(&before, &[]),
             format_graph_entity_volatile_context(&after, &[]),
             "the fixture must actually move the file"
+        );
+    }
+
+    /// The other half of the middle setting, and the control that makes the
+    /// moved-file guard mean something: a file that is RENAMED must change the
+    /// embed text and the cache key.
+    ///
+    /// Under `PathInEmbedText::None` this test fails, which is the point: it is
+    /// what distinguishes the default from the setting that drops the path
+    /// entirely, and without it a formatter that ignored the path would pass
+    /// the moved-file guard and this one both.
+    #[test]
+    fn a_renamed_file_changes_the_embed_text_and_the_cache_key() {
+        assert_eq!(
+            EMBED_PATH_POLICY,
+            PathInEmbedText::Basename,
+            "this guard describes the basename policy; under None or Full the \
+             claim is different and the test must change with the constant"
+        );
+
+        let before = durable_fixture("src/registry.rs");
+        let renamed = durable_fixture("src/registry_loader.rs");
+
+        assert_ne!(
+            format_graph_entity_text(&before),
+            format_graph_entity_text(&renamed),
+            "a rename must change the embed text"
+        );
+        assert_ne!(
+            embed_text_digest(&before),
+            embed_text_digest(&renamed),
+            "a rename must change the cache key"
+        );
+
+        // And a move into a deep directory tree, keeping the same filename,
+        // must not. Both directions in one test, so a formatter cannot satisfy
+        // one by breaking the other.
+        let moved = durable_fixture("crates/kin-core/src/engine/registry.rs");
+        assert_eq!(
+            format_graph_entity_text(&before),
+            format_graph_entity_text(&moved),
+            "a directory move must not change the embed text"
+        );
+    }
+
+    /// The three settings of the dial, each asserted against what it claims,
+    /// so the two that are not the default are one constant away and not one
+    /// guess away.
+    #[test]
+    fn each_path_policy_does_what_it_says() {
+        let here = durable_fixture("src/registry.rs");
+        let moved = durable_fixture("crates/kin-core/src/registry.rs");
+        let renamed = durable_fixture("src/registry_loader.rs");
+
+        assert_eq!(path_basename("src/engine/graph.rs"), "graph.rs");
+        assert_eq!(path_directory("src/engine/graph.rs"), "src/engine/");
+        assert_eq!(path_basename("graph.rs"), "graph.rs");
+        assert_eq!(path_directory("graph.rs"), "");
+
+        match EMBED_PATH_POLICY {
+            PathInEmbedText::None => {
+                assert!(durable_path_fragment(&here).is_none());
+                assert_eq!(volatile_path_fragment(&here), Some("src/registry.rs"));
+            }
+            PathInEmbedText::Basename => {
+                assert_eq!(durable_path_fragment(&here), Some("registry.rs"));
+                assert_eq!(volatile_path_fragment(&here), Some("src/"));
+                assert_eq!(
+                    durable_path_fragment(&here),
+                    durable_path_fragment(&moved),
+                    "a move keeps the durable fragment"
+                );
+                assert_ne!(
+                    volatile_path_fragment(&here),
+                    volatile_path_fragment(&moved),
+                    "a move changes the volatile fragment"
+                );
+                assert_ne!(
+                    durable_path_fragment(&here),
+                    durable_path_fragment(&renamed),
+                    "a rename changes the durable fragment"
+                );
+            }
+            PathInEmbedText::Full => {
+                assert_eq!(durable_path_fragment(&here), Some("src/registry.rs"));
+                assert!(volatile_path_fragment(&here).is_none());
+            }
+        }
+
+        // A path with no directory has nothing volatile to carry, and its
+        // filename is the whole path, so neither helper may invent a fragment.
+        let bare = durable_fixture("README.md");
+        assert_eq!(volatile_path_fragment(&bare), None);
+        assert_eq!(
+            durable_path_fragment(&bare),
+            match EMBED_PATH_POLICY {
+                PathInEmbedText::None => None,
+                _ => Some("README.md"),
+            }
         );
     }
 
@@ -4847,7 +5060,8 @@ mod tests {
         assert_eq!(
             EMBED_TEXT_MAX_CHARS,
             EMBED_KIND_LABEL_MAX_CHARS
-                + 4
+                + 5
+                + EMBED_PATH_MAX_CHARS
                 + EMBED_NAME_MAX_CHARS
                 + EMBED_SIGNATURE_MAX_CHARS
                 + EMBED_DOC_SUMMARY_MAX_CHARS
@@ -4889,7 +5103,10 @@ mod tests {
 
         // An entity maximal in every field at once, in multibyte characters so
         // a byte-length bound could not stand in for a character bound.
-        let mut worst = durable_fixture("src/registry.rs");
+        let mut worst = durable_fixture(&format!(
+            "deep/nested/{}.rs",
+            "é".repeat(EMBED_PATH_MAX_CHARS * 4)
+        ));
         worst.kind = EntityKind::EventContract;
         worst.name = "é".repeat(EMBED_NAME_MAX_CHARS * 4);
         worst.signature = "é".repeat(EMBED_SIGNATURE_MAX_CHARS * 4);
@@ -4961,6 +5178,7 @@ mod tests {
     #[test]
     fn every_field_is_bounded_by_its_own_ceiling_and_no_others() {
         let base = durable_fixture("src/registry.rs");
+        let basename = "registry.rs".to_string();
         let name = base.name.clone();
         let signature = base.signature.clone();
         let doc = base.doc_summary.clone().unwrap();
@@ -4977,7 +5195,7 @@ mod tests {
         // control is what caught it: `s` occurs in "disk", `d` in "load" and
         // "disk", `n` in "fn" and "open".
         let base_text = format_graph_entity_text(&base);
-        for filler in ['Z', 'Q', 'X', 'W'] {
+        for filler in ['Y', 'Z', 'Q', 'X', 'W'] {
             assert_eq!(
                 base_text.chars().filter(|c| *c == filler).count(),
                 0,
@@ -4985,6 +5203,8 @@ mod tests {
             );
         }
 
+        let long_path =
+            durable_fixture(&format!("src/{}.rs", "Y".repeat(EMBED_PATH_MAX_CHARS * 3)));
         let mut long_name = base.clone();
         long_name.name = "Z".repeat(EMBED_NAME_MAX_CHARS * 3);
         let mut long_signature = base.clone();
@@ -4999,32 +5219,54 @@ mod tests {
 
         for (label, entity, filler, ceiling, survivors) in [
             (
+                "path",
+                long_path,
+                'Y',
+                EMBED_PATH_MAX_CHARS,
+                vec![name.clone(), signature.clone(), doc.clone(), body.clone()],
+            ),
+            (
                 "name",
                 long_name,
                 'Z',
                 EMBED_NAME_MAX_CHARS,
-                vec![signature.clone(), doc.clone(), body.clone()],
+                vec![
+                    basename.clone(),
+                    signature.clone(),
+                    doc.clone(),
+                    body.clone(),
+                ],
             ),
             (
                 "signature",
                 long_signature,
                 'Q',
                 EMBED_SIGNATURE_MAX_CHARS,
-                vec![name.clone(), doc.clone(), body.clone()],
+                vec![basename.clone(), name.clone(), doc.clone(), body.clone()],
             ),
             (
                 "doc summary",
                 long_doc,
                 'X',
                 EMBED_DOC_SUMMARY_MAX_CHARS,
-                vec![name.clone(), signature.clone(), body.clone()],
+                vec![
+                    basename.clone(),
+                    name.clone(),
+                    signature.clone(),
+                    body.clone(),
+                ],
             ),
             (
                 "body preview",
                 long_body,
                 'W',
                 EMBED_BODY_PREVIEW_MAX_CHARS,
-                vec![name.clone(), signature.clone(), doc.clone()],
+                vec![
+                    basename.clone(),
+                    name.clone(),
+                    signature.clone(),
+                    doc.clone(),
+                ],
             ),
         ] {
             let formatted = format_graph_entity_text(&entity);
@@ -5182,6 +5424,9 @@ mod tests {
             }
             let mut parts: Vec<String> = Vec::new();
             parts.push(entity_kind_label(entity.kind).to_string());
+            if let Some(fragment) = durable_path_fragment(entity) {
+                parts.push(bounded(fragment, EMBED_PATH_MAX_CHARS));
+            }
             if !entity.name.is_empty() {
                 parts.push(bounded(&entity.name, EMBED_NAME_MAX_CHARS));
             }
