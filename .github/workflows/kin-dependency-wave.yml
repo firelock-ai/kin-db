@@ -15,7 +15,19 @@ jobs:
     uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.33
     with:
       manifests: crates/kin-db/Cargo.toml
-      test-command: cargo test -p kin-db --lib
+      # HF_HUB_OFFLINE + the three-test skip list match ci.yml, ci-linux.yml,
+      # windows-nightly.yml and registry-publish.yml: those three tests build a
+      # real embedder and need HF network plus nomic weights, which a runner
+      # here cannot reliably fetch. Before this line, this was the one place
+      # in the repo running kin-db's lib suite without the guard, and a
+      # download-lock hiccup on the shared HF Hub cache failed the wave's own
+      # verification step with an IndexError unrelated to any pin it moved.
+      # scripts/check-network-test-skip-parity.sh keeps this in sync.
+      test-command: >-
+        HF_HUB_OFFLINE=1 cargo test -p kin-db --lib --
+        --skip process_embedding_queue_without_embeddings_is_noop
+        --skip default_dimensions_match_default_model
+        --skip test_vector_index_dimension_mismatch_auto_recovery
       auto-merge: true
     secrets:
       KIN_CI_BOT_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
