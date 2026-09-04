@@ -739,7 +739,7 @@ struct TestLocalRuntime {
     primary: TestLocalModel,
     cpu: Option<TestLocalModel>,
     cpu_model_error: Option<String>,
-    backend_choice: EmbedBackendChoice,
+    route: EmbedDispatchRoute,
     stats: std::sync::Arc<TestLocalRuntimeStats>,
 }
 
@@ -985,14 +985,14 @@ impl CodeEmbedder {
         primary: TestLocalModel,
         cpu: Option<TestLocalModel>,
         cpu_model_error: Option<String>,
-        backend_choice: EmbedBackendChoice,
+        route: EmbedDispatchRoute,
     ) -> (Self, std::sync::Arc<TestLocalRuntimeStats>) {
         let stats = std::sync::Arc::new(TestLocalRuntimeStats::default());
         let runtime = TestLocalRuntime {
             primary,
             cpu,
             cpu_model_error,
-            backend_choice,
+            route,
             stats: std::sync::Arc::clone(&stats),
         };
         let embedder = Self {
@@ -1025,7 +1025,7 @@ impl CodeEmbedder {
                 forward: TestLocalForward::Success(vec![1.0; dimensions]),
             }),
             None,
-            EmbedBackendChoice::Metal {
+            EmbedDispatchRoute::PrimaryBatched {
                 reason: "test_non_oom_primary_error",
             },
         )
@@ -1052,7 +1052,7 @@ impl CodeEmbedder {
                 forward: TestLocalForward::Success(cpu_vector),
             }),
             None,
-            EmbedBackendChoice::Metal {
+            EmbedDispatchRoute::PrimaryBatched {
                 reason: "test_oom_primary_error",
             },
         )
@@ -1075,7 +1075,7 @@ impl CodeEmbedder {
             },
             None,
             Some("synthetic CPU twin unavailable".to_string()),
-            EmbedBackendChoice::Metal {
+            EmbedDispatchRoute::PrimaryBatched {
                 reason: "test_local_success",
             },
         )
@@ -1099,7 +1099,7 @@ impl CodeEmbedder {
             },
             None,
             Some("synthetic CPU twin construction failure".to_string()),
-            EmbedBackendChoice::Cpu {
+            EmbedDispatchRoute::CpuTwin {
                 reason: "test_cpu_twin_failure",
             },
         )
@@ -1454,7 +1454,7 @@ impl CodeEmbedder {
                 let indices: Vec<usize> = (0..texts.len()).collect();
                 let placed = process_chunk_with_runtime(
                     runtime,
-                    runtime.backend_choice,
+                    runtime.route,
                     &token_ids,
                     &attention_masks,
                     &indices,
@@ -1698,7 +1698,7 @@ impl BertEmbedder {
         batch: EncodedSlice<'_>,
         dimensions: usize,
         budget: BatchBudget,
-        backend_override: Option<EmbedBackendChoice>,
+        route_override: Option<EmbedDispatchRoute>,
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         // Pack the length-sorted run into sub-batch ranges up front.
         let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
@@ -1720,7 +1720,7 @@ impl BertEmbedder {
         // rayon pool (sized to the resource plan's rayon_threads by the host
         // binary), so this does not oversubscribe and is not hardcoded.
         let parallel_cpu = ranges.len() > 1
-            && matches!(backend_override, Some(EmbedBackendChoice::Cpu { .. }))
+            && matches!(route_override, Some(EmbedDispatchRoute::CpuTwin { .. }))
             && resource_profile_is_throughput()
             && self.cpu_model().is_ok();
 
@@ -1734,14 +1734,14 @@ impl BertEmbedder {
                 rayon_threads = rayon::current_num_threads(),
                 "embed_cpu_parallel"
             );
-            let backend_choice = EmbedBackendChoice::Cpu {
+            let route = EmbedDispatchRoute::CpuTwin {
                 reason: "hybrid_cpu_parallel",
             };
             let chunks = ranges
                 .par_iter()
                 .map(|&(s, e, longest)| {
                     self.process_chunk(
-                        backend_choice,
+                        route,
                         &batch.ids[s..e],
                         &batch.masks[s..e],
                         &batch.idx[s..e],
@@ -1760,9 +1760,9 @@ impl BertEmbedder {
 
         let mut placed: Vec<(usize, Vec<f32>, EmbeddingProducer)> = Vec::with_capacity(batch.len());
         for &(s, e, longest) in &ranges {
-            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
+            let route = route_override.unwrap_or_else(|| resolve_dispatch_route(longest));
             placed.extend(self.process_chunk(
-                backend_choice,
+                route,
                 &batch.ids[s..e],
                 &batch.masks[s..e],
                 &batch.idx[s..e],
@@ -1781,7 +1781,7 @@ impl BertEmbedder {
     /// what makes concurrent dispatch of CPU sub-batches safe.
     fn process_chunk(
         &self,
-        backend_choice: EmbedBackendChoice,
+        route: EmbedDispatchRoute,
         token_ids: &[Vec<u32>],
         attention_masks: &[Vec<u32>],
         indices: &[usize],
@@ -1790,7 +1790,7 @@ impl BertEmbedder {
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         process_chunk_with_runtime(
             &BertChunkRuntime(self),
-            backend_choice,
+            route,
             token_ids,
             attention_masks,
             indices,
@@ -1838,7 +1838,7 @@ impl BertEmbedder {
                 cpu_twin_used = twin_available,
                 "embed_hybrid_dispatch"
             );
-            let cpu_override = twin_available.then_some(EmbedBackendChoice::Cpu {
+            let cpu_override = twin_available.then_some(EmbedDispatchRoute::CpuTwin {
                 reason: "hybrid_cpu_only",
             });
             return self.process_encoded_subset(cpu_side, dimensions, budget, cpu_override);
@@ -1882,7 +1882,7 @@ impl BertEmbedder {
                 metal_side,
                 dimensions,
                 budget,
-                Some(EmbedBackendChoice::Metal {
+                Some(EmbedDispatchRoute::PrimaryBatched {
                     reason: "hybrid_serial_primary",
                 }),
             )?;
@@ -1890,7 +1890,7 @@ impl BertEmbedder {
                 cpu_side,
                 dimensions,
                 budget,
-                Some(EmbedBackendChoice::Metal {
+                Some(EmbedDispatchRoute::PrimaryBatched {
                     reason: "hybrid_serial_primary",
                 }),
             )?);
@@ -1920,7 +1920,7 @@ impl BertEmbedder {
                     metal_side,
                     dimensions,
                     budget,
-                    Some(EmbedBackendChoice::Metal {
+                    Some(EmbedDispatchRoute::PrimaryBatched {
                         reason: "hybrid_metal",
                     }),
                 );
@@ -1932,7 +1932,7 @@ impl BertEmbedder {
                     cpu_side,
                     dimensions,
                     budget,
-                    Some(EmbedBackendChoice::Cpu {
+                    Some(EmbedDispatchRoute::CpuTwin {
                         reason: "hybrid_cpu",
                     }),
                 );
@@ -2926,9 +2926,14 @@ const EMBED_AUTO_PREFERS_CPU: bool = false;
 
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbedBackendChoice {
-    Metal { reason: &'static str },
-    Cpu { reason: &'static str },
+enum EmbedDispatchRoute {
+    /// Run the whole sub-batch through `forward_batched` on the primary model.
+    /// The primary is whatever backend the loaded model reports, so this route
+    /// is Metal only on a Metal build; on a CPU-only host it batches on the CPU.
+    PrimaryBatched { reason: &'static str },
+    /// Run the sub-batch on the CPU twin, falling back to the primary model when
+    /// the twin cannot be constructed (see `run_cpu_route_forward`).
+    CpuTwin { reason: &'static str },
 }
 
 #[cfg(feature = "embeddings")]
@@ -3067,7 +3072,7 @@ impl LocalChunkRuntime for TestLocalRuntime {
 #[cfg(feature = "embeddings")]
 fn process_chunk_with_runtime<R: LocalChunkRuntime>(
     runtime: &R,
-    backend_choice: EmbedBackendChoice,
+    route: EmbedDispatchRoute,
     token_ids: &[Vec<u32>],
     attention_masks: &[Vec<u32>],
     indices: &[usize],
@@ -3076,8 +3081,8 @@ fn process_chunk_with_runtime<R: LocalChunkRuntime>(
 ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
     let count = token_ids.len();
     let trace_start = batch_trace::enabled().then(std::time::Instant::now);
-    let (vectors, forward_model, actual_producer) = match backend_choice {
-        EmbedBackendChoice::Metal { reason } => {
+    let (vectors, forward_model, actual_producer) = match route {
+        EmbedDispatchRoute::PrimaryBatched { reason } => {
             let (vectors, forward_model) = if let Some((attention_area, attention_area_cap)) =
                 metal_hard_guard_rejection(count, longest)
             {
@@ -3168,7 +3173,7 @@ fn process_chunk_with_runtime<R: LocalChunkRuntime>(
             let producer = actual_producer_from_returning_backend(runtime.backend(forward_model));
             (vectors, forward_model, producer)
         }
-        EmbedBackendChoice::Cpu { reason } => {
+        EmbedDispatchRoute::CpuTwin { reason } => {
             tracing::info!(
                 target: "kindb.embed.dispatch",
                 batch_size = count,
@@ -3623,38 +3628,38 @@ fn scatter_attributed(
 /// - `auto` (default): use batched Metal. CPU is an explicit escape hatch via
 ///   `KIN_EMBED_BACKEND=cpu`, not a hidden fallback for long code entities.
 #[cfg(feature = "embeddings")]
-fn resolve_embed_backend(max_seq: usize) -> EmbedBackendChoice {
+fn resolve_dispatch_route(max_seq: usize) -> EmbedDispatchRoute {
     let mode = std::env::var("KIN_EMBED_BACKEND")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "auto".to_string());
 
     match mode.as_str() {
-        "metal" | "gpu" => EmbedBackendChoice::Metal {
+        "metal" | "gpu" => EmbedDispatchRoute::PrimaryBatched {
             reason: "env_forced",
         },
-        "cpu" => EmbedBackendChoice::Cpu {
+        "cpu" => EmbedDispatchRoute::CpuTwin {
             reason: "env_forced",
         },
-        "auto" | "" => auto_choice(max_seq),
+        "auto" | "" => auto_route(max_seq),
         other => {
             tracing::warn!(
                 backend = %other,
                 "unknown KIN_EMBED_BACKEND value, falling back to auto"
             );
-            auto_choice(max_seq)
+            auto_route(max_seq)
         }
     }
 }
 
 #[cfg(feature = "embeddings")]
-fn auto_choice(_max_seq: usize) -> EmbedBackendChoice {
+fn auto_route(_max_seq: usize) -> EmbedDispatchRoute {
     if EMBED_AUTO_PREFERS_CPU {
-        EmbedBackendChoice::Cpu {
+        EmbedDispatchRoute::CpuTwin {
             reason: "auto_metal_unreliable",
         }
     } else {
-        EmbedBackendChoice::Metal {
+        EmbedDispatchRoute::PrimaryBatched {
             reason: "auto_metal_default",
         }
     }
@@ -5103,47 +5108,47 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn resolve_embed_backend_honors_env_and_metal_default() {
+    fn resolve_dispatch_route_honors_env_and_batched_default() {
         let _env = ResourceEnvGuard::acquire();
 
         std::env::set_var("KIN_EMBED_BACKEND", "auto");
         // `EMBED_AUTO_PREFERS_CPU` is `false`: auto stays on Metal. CPU is an
         // explicit debug escape hatch via KIN_EMBED_BACKEND=cpu.
         assert!(matches!(
-            resolve_embed_backend(8),
-            EmbedBackendChoice::Metal { .. }
+            resolve_dispatch_route(8),
+            EmbedDispatchRoute::PrimaryBatched { .. }
         ));
         assert!(matches!(
-            resolve_embed_backend(128),
-            EmbedBackendChoice::Metal { .. }
+            resolve_dispatch_route(128),
+            EmbedDispatchRoute::PrimaryBatched { .. }
         ));
         assert!(matches!(
-            resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
-            EmbedBackendChoice::Metal { .. }
+            resolve_dispatch_route(EMBED_CPU_SEQ_THRESHOLD + 1),
+            EmbedDispatchRoute::PrimaryBatched { .. }
         ));
 
         std::env::set_var("KIN_EMBED_BACKEND", "cpu");
         assert!(matches!(
-            resolve_embed_backend(64),
-            EmbedBackendChoice::Cpu { .. }
+            resolve_dispatch_route(64),
+            EmbedDispatchRoute::CpuTwin { .. }
         ));
         assert!(matches!(
-            resolve_embed_backend(1024),
-            EmbedBackendChoice::Cpu { .. }
+            resolve_dispatch_route(1024),
+            EmbedDispatchRoute::CpuTwin { .. }
         ));
 
         std::env::set_var("KIN_EMBED_BACKEND", "metal");
         assert!(matches!(
-            resolve_embed_backend(1024),
-            EmbedBackendChoice::Metal { .. }
+            resolve_dispatch_route(1024),
+            EmbedDispatchRoute::PrimaryBatched { .. }
         ));
 
         // An unrecognized value falls through to the auto path, which now keeps
         // long code entities on Metal.
         std::env::set_var("KIN_EMBED_BACKEND", "nonsense-value");
         assert!(matches!(
-            resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
-            EmbedBackendChoice::Metal { .. }
+            resolve_dispatch_route(EMBED_CPU_SEQ_THRESHOLD + 1),
+            EmbedDispatchRoute::PrimaryBatched { .. }
         ));
     }
 
@@ -5959,7 +5964,7 @@ mod tests {
                 forward: TestLocalForward::Success(vec![1.0, 0.0]),
             }),
             cpu_model_error: None,
-            backend_choice: EmbedBackendChoice::Metal {
+            route: EmbedDispatchRoute::PrimaryBatched {
                 reason: "scripted_hybrid_primary",
             },
             stats: std::sync::Arc::clone(&stats),
@@ -5968,7 +5973,7 @@ mod tests {
         let masks = vec![vec![1u32]];
         let mut scattered = process_chunk_with_runtime(
             &runtime,
-            EmbedBackendChoice::Metal {
+            EmbedDispatchRoute::PrimaryBatched {
                 reason: "hybrid_metal",
             },
             &token_ids,
@@ -5981,7 +5986,7 @@ mod tests {
         scattered.extend(
             process_chunk_with_runtime(
                 &runtime,
-                EmbedBackendChoice::Cpu {
+                EmbedDispatchRoute::CpuTwin {
                     reason: "hybrid_cpu",
                 },
                 &token_ids,
