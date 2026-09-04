@@ -4071,6 +4071,53 @@ impl InMemoryGraph {
         edges
     }
 
+    /// Visit every entity under one read lock, without cloning any of them.
+    ///
+    /// `list_all_entities` returns `Vec<Entity>` cloned from the live map, which
+    /// is a full second copy of the graph and is how the reconciler LKG and the
+    /// cross-file linker each came to hold one. A visitor is what a reader that
+    /// only needs to LOOK at every entity should take, and it is what the
+    /// segment writer takes.
+    pub fn for_each_entity<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Entity),
+    {
+        let ent = self.entities.read();
+        for entity in ent.entities.values() {
+            visit(entity);
+        }
+    }
+
+    /// Visit every relation under one read lock, without cloning any of them.
+    pub fn for_each_relation<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Relation),
+    {
+        let ent = self.entities.read();
+        for relation in ent.relations.values() {
+            visit(relation);
+        }
+    }
+
+    /// Visit every entity revision under one read lock, without cloning any of
+    /// them, and hand the head entity beside each one.
+    ///
+    /// The head comes along because the only thing a persisted revision needs to
+    /// record beyond its identity is whether its own `entity` differs from the
+    /// head, and answering that without the head means cloning one of them.
+    pub fn for_each_entity_revision<F>(&self, mut visit: F)
+    where
+        F: FnMut(&EntityId, &EntityRevision, Option<&Entity>),
+    {
+        let ent = self.entities.read();
+        for (entity_id, revisions) in ent.entity_revisions.iter() {
+            let head = ent.entities.get(entity_id);
+            for revision in revisions {
+                visit(entity_id, revision, head);
+            }
+        }
+    }
+
     /// Resolve one persisted external symbol coordinate by its stable ID.
     pub fn get_external_reference(&self, id: &ExternalReferenceId) -> Option<ExternalReference> {
         self.entities.read().external_references.get(id).cloned()
