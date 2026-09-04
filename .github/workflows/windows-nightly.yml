@@ -158,3 +158,14 @@ jobs:
       - name: Check the nightly Windows job still runs these steps
         if: runner.os == 'Linux'
         run: ./scripts/check-windows-nightly-parity.sh
+
+      # This step's own HF_HUB_OFFLINE + --skip guard above is the canonical
+      # copy. ci-linux.yml, windows-nightly.yml, registry-publish.yml and
+      # kin-dependency-wave.yml each run kin-db's lib suite too and each needs
+      # the identical guard, or that surface inherits a live-network flake the
+      # day a download hits a lock or throttling hiccup. A scheduled Kin
+      # Dependency Wave run failed exactly this way on 2026-09-04 because
+      # kin-dependency-wave.yml never carried the guard.
+      - name: Check every workflow running kin-db's lib suite skips the network tests
+        if: runner.os == 'Linux'
+        run: ./scripts/check-network-test-skip-parity.sh
