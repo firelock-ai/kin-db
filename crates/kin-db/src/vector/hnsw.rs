@@ -1891,6 +1891,9 @@ mod tests {
             canonical_order_dirty: false,
             mutation_seq: 0,
             sq_norms: Vec::new(),
+            // This helper builds a bare, unmapped graph to exercise legacy v1/v2 encoding, so
+            // there is no backing mapped container to point at.
+            payload: None,
         };
         rmp_serde::to_vec(&kin_vector::HnswSnapshot {
             format_version,
