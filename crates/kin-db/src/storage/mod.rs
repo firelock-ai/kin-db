@@ -25,6 +25,7 @@ pub(crate) use mmap::open_regular_nofollow;
 #[cfg(feature = "embeddings")]
 pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
+pub mod segment;
 mod snapshot;
 #[cfg(feature = "sql")]
 pub mod sql;
@@ -72,6 +73,11 @@ pub use repository::{
     PersistedRepositoryAuthority, PreparedWorkspaceGraphStats, RepositoryAuthorityManager,
     RepositoryAuthorityMetadata, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
     PREPARED_WORKSPACE_GRAPH_VERSION,
+};
+pub use segment::{
+    write_segment, ColumnStat, OpenProfile, Ordinals, SegmentReader, SegmentShape,
+    SegmentWriteStats, CURRENT_SEGMENT_VERSION, MAX_SUPPORTED_SEGMENT_VERSION,
+    MIN_SUPPORTED_SEGMENT_VERSION,
 };
 #[cfg(feature = "vector")]
 pub use snapshot::{
