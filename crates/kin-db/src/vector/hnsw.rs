@@ -2268,7 +2268,11 @@ mod tests {
     }
 
     #[test]
-    fn released_kin_vector_accepts_the_current_trailed_v2_bytes() {
+    // Renamed off "..._v2_bytes": `index.save()` writes whatever container version the pinned
+    // kin-vector currently defaults to, v3 under this pin, and the old name would silently start
+    // lying about which format it exercises rather than describing the property under test, which
+    // is that the released parser tolerates a kin-db trailer appended after it, at any version.
+    fn released_kin_vector_accepts_the_current_trailed_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("released-parser-trailed.kvec");
         let index = VectorIndex::new(4).unwrap();
