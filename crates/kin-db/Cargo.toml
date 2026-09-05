@@ -66,7 +66,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig", "
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
 directories = "6"
 cap-std = "=4.0.2"
-cap-fs-ext = "=4.0.2"
+cap-fs-ext = "=4.0.3"
 half = "2"
 rkyv = { version = "0.8", features = ["std", "bytecheck"], optional = true }
 rayon = "1"
