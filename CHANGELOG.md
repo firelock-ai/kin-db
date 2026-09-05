@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject stale prepared workspace query bindings before loading their payloads, while retaining full validation for eligible artifacts.
 - Share immutable change history across cloned snapshots and decode it once across concurrent readers. Mutable access preserves independent snapshot contents.
 - Validate complete repository history using borrowed changes instead of copying every change payload during reopen and local authority freeze.
 
