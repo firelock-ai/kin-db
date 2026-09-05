@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Share immutable change history across cloned snapshots and decode it once across concurrent readers. Mutable access preserves independent snapshot contents.
+- Validate complete repository history using borrowed changes instead of copying every change payload during reopen and local authority freeze.
+
 ## [0.7.20] - 2026-08-11
 
 ### Changed
