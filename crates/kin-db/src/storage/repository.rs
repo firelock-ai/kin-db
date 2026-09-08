@@ -15768,6 +15768,7 @@ mod tests {
             .unwrap();
         assert_eq!(acknowledged_frame_count(&directory), 1);
         let expected = manager.read_authority();
+        let marker = retain_installed_authority_marker(&directory);
         let before = freeze_storage_bytes(directory.path());
         let frozen = LocalRepositoryAuthorityFreeze::open_existing_read_only(
             repository_id(),
@@ -15783,6 +15784,46 @@ mod tests {
         assert!(!backend
             .repository_writer_would_block(repository_id().as_str())
             .unwrap());
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("normal open must confirm the installed authority");
+        assert!(
+            !marker.exists(),
+            "normal open must clean the retained marker"
+        );
+    }
+
+    fn retain_installed_authority_marker(directory: &TempDir) -> std::path::PathBuf {
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        std::fs::remove_file(crate::storage::mmap::recovery_tmp_path(&authority)).unwrap();
+        crate::storage::mmap::recovery_marker_path(&authority)
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_staged_authority_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, _manager) = framed_local_repository(&directory);
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a staged candidate must not be confirmed as installed");
+        assert!(error.to_string().contains("still staged"), "{error}");
         assert_eq!(before, freeze_storage_bytes(directory.path()));
     }
 
@@ -15848,6 +15889,7 @@ mod tests {
     fn local_read_only_freeze_rejects_corrupt_cas_without_changing_storage() {
         let directory = TempDir::new().unwrap();
         let (backend, _manager) = framed_local_repository(&directory);
+        retain_installed_authority_marker(&directory);
         let hash = hex::encode(digest(b"pub fn kin() {}\n").as_bytes());
         let path = directory
             .path()

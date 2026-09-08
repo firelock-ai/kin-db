@@ -6193,7 +6193,7 @@ impl LocalFileBackend {
             })?;
         let frames = if authority.snapshot_generation != authority.head_generation {
             let record = self
-                .read_authority_record_unlocked(&lock.namespace)?
+                .read_authority_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
                 .ok_or_else(|| {
                     KinDbError::StorageError(format!(
                         "repo {repo_id} has no existing local snapshot authority to freeze"
@@ -6994,12 +6994,25 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
+        self.read_authority_record_raw_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn read_authority_record_raw_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
         let relative = Self::authority_relative_path();
         let path = namespace.display(relative);
         if !namespace.exists(relative)? {
             return Ok(None);
         }
-        mmap::confirm_installed_write_at(&namespace.directory, relative, &namespace.display_path)?;
+        mmap::confirm_installed_write_at(
+            &namespace.directory,
+            relative,
+            &namespace.display_path,
+            cleanup,
+        )?;
         let bytes = namespace.read_regular_bounded(relative, "local authority", 1024 * 1024)?;
         Self::decode_authority_record(&namespace.repo_id, &path, &bytes).map(Some)
     }
@@ -7054,7 +7067,15 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
-        let record = self.read_authority_record_raw_unlocked(namespace)?;
+        self.read_authority_record_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn read_authority_record_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
+        let record = self.read_authority_record_raw_with_cleanup_unlocked(namespace, cleanup)?;
         let Some(record) = record else {
             return Ok(None);
         };
@@ -7171,7 +7192,8 @@ impl LocalFileBackend {
         cleanup: bool,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
         let repo_id = &namespace.repo_id;
-        let Some(record) = self.read_authority_record_unlocked(namespace)? else {
+        let Some(record) = self.read_authority_record_with_cleanup_unlocked(namespace, cleanup)?
+        else {
             let quarantines = match namespace.surface(Self::deltas_surface_name(), false)? {
                 Some(deltas) => {
                     let quarantines =
