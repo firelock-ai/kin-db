@@ -6168,9 +6168,24 @@ impl LocalFileBackend {
         &self,
         repo_id: &str,
     ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
+        self.freeze_existing_authority_with_cleanup(repo_id, true)
+    }
+
+    pub(crate) fn freeze_existing_authority_read_only(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
+        self.freeze_existing_authority_with_cleanup(repo_id, false)
+    }
+
+    fn freeze_existing_authority_with_cleanup(
+        &self,
+        repo_id: &str,
+        cleanup: bool,
+    ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self
-            .load_authority_unlocked(&lock.namespace)?
+            .load_authority_with_cleanup_unlocked(&lock.namespace, cleanup)?
             .ok_or_else(|| {
                 KinDbError::StorageError(format!(
                     "repo {repo_id} has no existing local snapshot authority to freeze"
@@ -6676,6 +6691,15 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
+        self.validate_retired_quarantines_unlocked(namespace, record, true)
+    }
+
+    fn validate_retired_quarantines_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        record: &LocalAuthorityRecord,
+        cleanup: bool,
+    ) -> Result<(), KinDbError> {
         let repo_id = &namespace.repo_id;
         let Some(deltas) = namespace.surface(Self::deltas_surface_name(), false)? else {
             return Ok(());
@@ -6699,8 +6723,14 @@ impl LocalFileBackend {
                 )));
             }
         }
-        for artifact in &quarantined {
-            delete_quarantined_delta_exact_at(&deltas.directory, artifact, &deltas.display_path)?;
+        if cleanup {
+            for artifact in &quarantined {
+                delete_quarantined_delta_exact_at(
+                    &deltas.directory,
+                    artifact,
+                    &deltas.display_path,
+                )?;
+            }
         }
         namespace.confirm_surface_visible(&deltas)?;
         Ok(())
@@ -7132,6 +7162,14 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        self.load_authority_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn load_authority_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
         let repo_id = &namespace.repo_id;
         let Some(record) = self.read_authority_record_unlocked(namespace)? else {
             let quarantines = match namespace.surface(Self::deltas_surface_name(), false)? {
@@ -7170,11 +7208,13 @@ impl LocalFileBackend {
             })?;
         // Cleanup is downstream of both authority-directory durability and
         // exact authoritative payload verification.
-        self.finalize_retired_quarantines_unlocked(namespace, &record)?;
-        if let Err(error) =
-            self.clear_superseded_snapshots_unlocked(namespace, record.snapshot_generation)
-        {
-            tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+        self.validate_retired_quarantines_unlocked(namespace, &record, cleanup)?;
+        if cleanup {
+            if let Err(error) =
+                self.clear_superseded_snapshots_unlocked(namespace, record.snapshot_generation)
+            {
+                tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+            }
         }
         namespace.confirm_surface_visible(&snapshots)?;
         self.confirm_repository_visible(namespace)?;
@@ -13424,6 +13464,17 @@ mod tests {
             })
             .collect();
         assert_eq!(quarantined.len(), 1);
+
+        let old_snapshot = backend.versioned_snapshot_path(repo_id, gen1);
+        let old_bytes = base.to_bytes().unwrap();
+        std::fs::write(&old_snapshot, &old_bytes).unwrap();
+        let quarantine_bytes = std::fs::read(&quarantined[0]).unwrap();
+        let frozen = backend
+            .freeze_existing_authority_read_only(repo_id)
+            .unwrap();
+        assert_eq!(std::fs::read(&old_snapshot).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&quarantined[0]).unwrap(), quarantine_bytes);
+        drop(frozen);
 
         let reopened = LocalFileBackend::new(dir.path());
         let recovered = load_recovered_snapshot(&reopened, repo_id)
