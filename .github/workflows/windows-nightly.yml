@@ -63,8 +63,8 @@ jobs:
       # in its own log: "Cache hit occurred on the primary key Linux-cargo-,
       # not saving cache." The cache had stopped tracking the dependency set
       # entirely while still reading as a hit.
-      - name: Cache cargo registry and build
-        uses: actions/cache@v6
+      - name: Restore cargo registry and build cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -169,3 +169,18 @@ jobs:
       - name: Check every workflow running kin-db's lib suite skips the network tests
         if: runner.os == 'Linux'
         run: ./scripts/check-network-test-skip-parity.sh
+
+      # Actions caches are scoped to the ref that saved them, so only main's
+      # cache is readable from every other ref. Every PR and merge-queue leg
+      # saving into its own private scope is what pushed this repo's cache
+      # past the 10 GB repo-wide cap and evicted main's own cache. Save only
+      # from main; every other ref just restores what main already saved.
+      - name: Save cargo registry and build cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml', 'rust-toolchain.toml') }}
