@@ -219,6 +219,7 @@ fn publish(
         local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(frozen_overlay)),
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     drop(lease);
     manager
