@@ -201,6 +201,8 @@ pub struct PreparedWorkspaceGraphStats {
 /// This exists so the published authority state can reach durable prepared
 /// bytes without carrying the backend's type parameter through every reader.
 trait PreparedWorkspaceGraphStore: Send + Sync {
+    fn load_binding(&self, workspace_id: &str) -> Result<Option<Vec<u8>>, KinDbError>;
+
     fn load(
         &self,
         workspace_id: &str,
@@ -221,6 +223,11 @@ struct BackendPreparedWorkspaceGraphStore<B: StorageBackend + ?Sized + 'static> 
 impl<B: StorageBackend + ?Sized + 'static> PreparedWorkspaceGraphStore
     for BackendPreparedWorkspaceGraphStore<B>
 {
+    fn load_binding(&self, workspace_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.backend
+            .load_prepared_workspace_graph_binding(self.repository_id.as_str(), workspace_id)
+    }
+
     fn load(
         &self,
         workspace_id: &str,
@@ -350,6 +357,28 @@ impl PreparedWorkspaceGraphCache {
             );
             return None;
         }
+        match self.store.load_binding(&workspace_id.to_string()) {
+            Ok(Some(bytes)) => {
+                let binding: PreparedWorkspaceGraphBinding = match serde_json::from_slice(&bytes) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.refuse(workspace_id, "binding", &error.to_string());
+                        return None;
+                    }
+                };
+                // The claimed payload digest is not verified by this preflight.
+                // Only the complete pair loaded below can authorize a serve.
+                let expected = self.expected_binding(workspace_id, binding.payload_sha256.clone());
+                if !self.binding_matches(workspace_id, &expected, &binding) {
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.refuse(workspace_id, "artifact", &error.to_string());
+                return None;
+            }
+        }
         let artifact = match self.store.load(&workspace_id.to_string()) {
             Ok(Some(artifact)) => artifact,
             // No artifact yet is an ordinary first open, not a refusal.
@@ -369,6 +398,54 @@ impl PreparedWorkspaceGraphCache {
         };
         let expected =
             self.expected_binding(workspace_id, hex::encode(Sha256::digest(&artifact.payload)));
+        if !self.binding_matches(workspace_id, &expected, &binding) {
+            return None;
+        }
+        // The frame carries its own checksum over its own body, so this
+        // refuses bytes the binding record vouches for but the encoder never
+        // produced, and it revalidates storage admission over the payload.
+        let snapshot = match GraphSnapshot::from_bytes(&artifact.payload) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.refuse(workspace_id, "payload_frame", &error.to_string());
+                return None;
+            }
+        };
+        if snapshot.repository_authority.is_some() {
+            self.refuse(
+                workspace_id,
+                "repository_authority",
+                "prepared query state must not carry a second authority envelope",
+            );
+            return None;
+        }
+        // The invariant materialization asserts about its own output. A
+        // prepared serve has to clear the same bar or it is not the same
+        // answer.
+        if snapshot.resolved_tree != workspace.tree {
+            self.refuse(
+                workspace_id,
+                "resolved_tree",
+                "prepared state does not resolve the workspace's exact persisted tree",
+            );
+            return None;
+        }
+        self.serves.fetch_add(1, AtomicOrdering::SeqCst);
+        tracing::debug!(
+            repository = %self.repository_id,
+            workspace = %workspace_id,
+            generation,
+            "served workspace query state from validated durable bytes"
+        );
+        Some(snapshot)
+    }
+
+    fn binding_matches(
+        &self,
+        workspace_id: &WorkspaceId,
+        expected: &PreparedWorkspaceGraphBinding,
+        binding: &PreparedWorkspaceGraphBinding,
+    ) -> bool {
         // Named one at a time so a refusal is a diagnosis rather than a shrug.
         for (field, held, found) in [
             (
@@ -418,46 +495,10 @@ impl PreparedWorkspaceGraphCache {
                     field,
                     &format!("holding {held}, artifact names {found}"),
                 );
-                return None;
+                return false;
             }
         }
-        // The frame carries its own checksum over its own body, so this
-        // refuses bytes the binding record vouches for but the encoder never
-        // produced, and it revalidates storage admission over the payload.
-        let snapshot = match GraphSnapshot::from_bytes(&artifact.payload) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.refuse(workspace_id, "payload_frame", &error.to_string());
-                return None;
-            }
-        };
-        if snapshot.repository_authority.is_some() {
-            self.refuse(
-                workspace_id,
-                "repository_authority",
-                "prepared query state must not carry a second authority envelope",
-            );
-            return None;
-        }
-        // The invariant materialization asserts about its own output. A
-        // prepared serve has to clear the same bar or it is not the same
-        // answer.
-        if snapshot.resolved_tree != workspace.tree {
-            self.refuse(
-                workspace_id,
-                "resolved_tree",
-                "prepared state does not resolve the workspace's exact persisted tree",
-            );
-            return None;
-        }
-        self.serves.fetch_add(1, AtomicOrdering::SeqCst);
-        tracing::debug!(
-            repository = %self.repository_id,
-            workspace = %workspace_id,
-            generation,
-            "served workspace query state from validated durable bytes"
-        );
-        Some(snapshot)
+        true
     }
 
     /// Record what materialization just produced, best effort.
@@ -1045,10 +1086,16 @@ pub struct RepositoryAuthorityState {
 impl RepositoryAuthorityState {
     /// Build the read state after the enclosing snapshot has passed complete
     /// repository-authority and history validation.
-    fn from_validated_snapshot(snapshot: GraphSnapshot) -> Self {
+    fn from_validated_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
         let mut authenticated_gitlinks = BTreeSet::new();
-        extend_authenticated_gitlinks(&mut authenticated_gitlinks, snapshot.changes.values());
-        Self::from_validated_snapshot_with_gitlinks(snapshot, authenticated_gitlinks)
+        snapshot.changes.visit_changes(|change| {
+            extend_authenticated_gitlinks(&mut authenticated_gitlinks, std::iter::once(change));
+            Ok(())
+        })?;
+        Ok(Self::from_validated_snapshot_with_gitlinks(
+            snapshot,
+            authenticated_gitlinks,
+        ))
     }
 
     /// [`from_validated_snapshot`](Self::from_validated_snapshot) for an open
@@ -2134,6 +2181,62 @@ pub struct LocalRepositoryAuthorityFreeze {
 }
 
 impl LocalRepositoryAuthorityFreeze {
+    /// Open and fully validate existing authority without changing storage.
+    ///
+    /// The existing exclusive namespace lock is retained through validation
+    /// and until this guard is dropped. Missing authority fails; retired
+    /// quarantines and superseded snapshots are validated or preserved, never
+    /// cleaned up. No generation-zero repository is constructed.
+    pub fn open_existing_read_only(
+        repository_id: RepositoryId,
+        backend: &LocalFileBackend,
+    ) -> Result<Self, KinDbError> {
+        let locked = backend.freeze_existing_authority_read_only(repository_id.as_str())?;
+        Self::from_locked_authority(&repository_id, backend, locked)
+    }
+
+    fn from_locked_authority(
+        repository_id: &RepositoryId,
+        backend: &LocalFileBackend,
+        locked: LocalAuthorityFreezeLock,
+    ) -> Result<Self, KinDbError> {
+        // A freeze validates the complete acknowledged head regardless of
+        // cached history proofs, while the retained lock excludes writers.
+        let snapshot = crate::storage::backend::recover_snapshot_from_state(
+            repository_id.as_str(),
+            locked.authority(),
+            locked.frames(),
+            None,
+            crate::storage::backend::HistoryDecode::Streamed(&mut |change| {
+                crate::storage::change_validation::validate_semantic_change(change)
+            }),
+        )?
+        .recovered
+        .snapshot;
+        let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
+            storage(format!(
+                "repository {repository_id} frozen snapshot has no v13 authority envelope"
+            ))
+        })?;
+        if &metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "frozen snapshot authority belongs to {}, not {repository_id}",
+                metadata.repository_id
+            )));
+        }
+        snapshot.validate_storage_admission()?;
+        validate_history_replay(&snapshot, &[])?;
+        let body_backend = FrozenLocalBodyBackend {
+            backend,
+            freeze: &locked,
+        };
+        validate_all_authority_bodies(&body_backend, repository_id, &snapshot)?;
+        Ok(Self {
+            state: RepositoryAuthorityState::from_validated_snapshot(snapshot)?,
+            _lock: locked,
+        })
+    }
+
     /// Exact persisted authority reloaded after the exclusive lock was held.
     pub fn authority(&self) -> &RepositoryAuthorityState {
         &self.state
@@ -2673,8 +2776,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-            validate_history_replay(&snapshot, &all_changes)?;
+            validate_history_replay(&snapshot, &[])?;
         }
         let replay_at = started.elapsed();
 
@@ -2728,7 +2830,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 std::mem::take(&mut sweep.authenticated_gitlinks),
             )
         } else {
-            RepositoryAuthorityState::from_validated_snapshot(snapshot)
+            RepositoryAuthorityState::from_validated_snapshot(snapshot)?
         };
         // Prepared state binds to the digest of the durable authority this open
         // actually loaded, so a repository with no persisted authority yet has
@@ -3108,7 +3210,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 ));
             }
             if let Some(field) =
-                crate::storage::authority_frame::first_difference(current.snapshot(), &snapshot)
+                crate::storage::authority_frame::first_difference(current.snapshot(), &snapshot)?
             {
                 return Err(storage(format!(
                     "materialized graph representation rewrite changed {field}"
@@ -3123,6 +3225,48 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                     authority_generation,
                 }),
             })
+        })
+    }
+
+    /// Commit a complete Git bootstrap from a fallible, replayable history map.
+    pub fn commit_git_bootstrap_with_changes(
+        &self,
+        transaction: RepositoryTransaction,
+        changes: ChangeMap,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        if transaction.expected_generation != 0 || !transaction.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed Git bootstrap requires generation zero and no owned changes".into(),
+            )
+            .into());
+        }
+        let transaction_hash = transaction.transaction_hash_with_changes(changes.len(), || {
+            let ids = changes
+                .change_ids()
+                .map_err(|error| ModelError::InvalidOperation(error.to_string()))?;
+            Ok(ids.into_iter().map(|id| {
+                let change = changes
+                    .read_change(&id)
+                    .map_err(|error| ModelError::InvalidOperation(error.to_string()))?
+                    .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?;
+                if !matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. }) {
+                    return Err(ModelError::InvalidOperation(
+                        "streamed Git bootstrap accepts only Git-origin changes".into(),
+                    ));
+                }
+                Ok(change)
+            }))
+        })?;
+        self.publication.commit(|current| {
+            prepare_repository_commit_decision_with_history(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+                NativeAdmissionSource::LocalWorkspace,
+                Some(&changes),
+            )
         })
     }
 
@@ -3286,52 +3430,19 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
-        // The frozen head is the base plus every acknowledged frame the lock
-        // captured, put back together by the same recovery core an open uses,
-        // and validated in full here regardless of any durable proof: a freeze
-        // is the gate a namespace transition trusts.
-        let snapshot = crate::storage::backend::recover_snapshot_from_state(
-            self.repository_id.as_str(),
-            locked.authority(),
-            locked.frames(),
-            None,
-            crate::storage::backend::HistoryDecode::Eager,
-        )?
-        .recovered
-        .snapshot;
-        let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
-            storage(format!(
-                "repository {} frozen snapshot has no v13 authority envelope",
-                self.repository_id
-            ))
-        })?;
-        if metadata.repository_id != self.repository_id {
-            return Err(storage(format!(
-                "frozen snapshot authority belongs to {}, not {}",
-                metadata.repository_id, self.repository_id
-            )));
-        }
-        snapshot.validate_storage_admission()?;
-        let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-        validate_history_replay(&snapshot, &all_changes)?;
-        let body_backend = FrozenLocalBodyBackend {
-            backend: self.backend.as_ref(),
-            freeze: &locked,
-        };
-        validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
-
-        let state = RepositoryAuthorityState::from_validated_snapshot(snapshot);
-        if state.roots() != expected.roots() {
+        let freeze = LocalRepositoryAuthorityFreeze::from_locked_authority(
+            &self.repository_id,
+            self.backend.as_ref(),
+            locked,
+        )?;
+        if freeze.roots() != expected.roots() {
             return Err(ModelError::Conflict(format!(
                 "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
                 self.repository_id
             ))
             .into());
         }
-        Ok(LocalRepositoryAuthorityFreeze {
-            state,
-            _lock: locked,
-        })
+        Ok(freeze)
     }
 }
 
@@ -3460,6 +3571,27 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
     source: NativeAdmissionSource,
 ) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
 {
+    prepare_repository_commit_decision_with_history(
+        current,
+        transaction,
+        transaction_hash,
+        repository_id,
+        backend,
+        source,
+        None,
+    )
+}
+
+fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
     let metadata = current.metadata();
     if &transaction.repository_id != repository_id {
         return Err(ModelError::InvalidOperation(format!(
@@ -3508,8 +3640,17 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
         .into());
     }
 
-    let (next, receipt) =
-        prepare_successor(current, transaction, transaction_hash, backend, source)?;
+    let (next, receipt) = match external_history {
+        Some(changes) => prepare_successor_with_history(
+            current,
+            transaction,
+            transaction_hash,
+            backend,
+            source,
+            Some(changes),
+        )?,
+        None => prepare_successor(current, transaction, transaction_hash, backend, source)?,
+    };
     Ok(AuthorityCommitDecision::Publish {
         next,
         output: receipt,
@@ -3572,6 +3713,24 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     backend: &B,
     source: NativeAdmissionSource,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
+    prepare_successor_with_history(
+        current,
+        transaction,
+        transaction_hash,
+        backend,
+        source,
+        None,
+    )
+}
+
+fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     // Every lap below runs inside its own span as well as reporting its
     // milliseconds, and the two must not drift apart: a profiler reads spans and
     // an operator reads the summary event, and a lap that exists in one split
@@ -3601,9 +3760,27 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         &mut metadata,
         &transaction.external_objects,
     )?;
-    admit_changes(&mut snapshot, &transaction.changes)?;
+    if let Some(changes) = external_history {
+        if current.generation() != 0 || !snapshot.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed Git bootstrap requires an empty generation-zero history".into(),
+            )
+            .into());
+        }
+        snapshot.changes = changes.clone();
+        snapshot.change_children = derive_change_children(&snapshot.changes)?;
+        snapshot.entity_revisions.clear();
+    } else {
+        admit_changes(&mut snapshot, &transaction.changes)?;
+    }
     admit_aliases(&snapshot, &mut metadata, &transaction.aliases)?;
-    apply_git_authority(backend, &snapshot, &mut metadata, transaction)?;
+    apply_git_authority(
+        backend,
+        &snapshot,
+        &mut metadata,
+        transaction,
+        external_history,
+    )?;
     metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
     let admit_ms = timer.lap_ms();
     drop(lap);
@@ -3617,6 +3794,16 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction.local_overlay_delta.as_ref(),
     )?;
     let refs_overlay_ms = timer.lap_ms();
+    drop(lap);
+
+    // Before the replay graph below borrows the snapshot, because collaboration
+    // records are snapshot content and this is the last point the snapshot is
+    // still mutable. The replay graph does not need them: a review note is a
+    // sibling collection of `entities` and `relations`, not an entity, so
+    // nothing admission verifies can see it.
+    let lap = tracing::info_span!("kindb.prepare.collaboration").entered();
+    apply_collaboration(&mut snapshot, transaction)?;
+    let collaboration_ms = timer.lap_ms();
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.workspace").entered();
@@ -3652,12 +3839,27 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.change_bodies").entered();
-    validate_new_change_bodies(
-        backend,
-        &transaction.repository_id,
-        &transaction.changes,
-        &metadata.admission_policies,
-    )?;
+    if let Some(changes) = external_history {
+        changes.visit_changes(|change| {
+            validate_change_tree_bodies(
+                backend,
+                &transaction.repository_id,
+                std::iter::once(change),
+            )
+        })?;
+        for resolved in &metadata.admission_policies {
+            if let Some(policy) = &resolved.policy {
+                validate_shared_policy_bodies(backend, &transaction.repository_id, policy)?;
+            }
+        }
+    } else {
+        validate_new_change_bodies(
+            backend,
+            &transaction.repository_id,
+            &transaction.changes,
+            &metadata.admission_policies,
+        )?;
+    }
     let change_bodies_ms = timer.lap_ms();
     drop(lap);
 
@@ -3773,8 +3975,11 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.successor_index").entered();
-    let state =
-        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes);
+    let state = if external_history.is_some() {
+        RepositoryAuthorityState::from_validated_snapshot(snapshot)?
+    } else {
+        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes)
+    };
     let successor_index_ms = timer.lap_ms();
     drop(lap);
     let elapsed = prepare_started.elapsed();
@@ -3785,6 +3990,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             clone_ms,
             admit_ms,
             refs_overlay_ms,
+            collaboration_ms,
             workspace_ms,
             merge_ms,
             admission_verify_ms,
@@ -3802,6 +4008,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             clone_ms,
             admit_ms,
             refs_overlay_ms,
+            collaboration_ms,
             workspace_ms,
             merge_ms,
             admission_verify_ms,
@@ -3821,6 +4028,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             ("clone_ms", clone_ms),
             ("admit_ms", admit_ms),
             ("refs_overlay_ms", refs_overlay_ms),
+            ("collaboration_ms", collaboration_ms),
             ("workspace_ms", workspace_ms),
             ("merge_ms", merge_ms),
             ("admission_verify_ms", admission_verify_ms),
@@ -3904,19 +4112,13 @@ fn admit_changes(
     incoming: &[kin_model::SemanticChange],
 ) -> Result<(), KinDbError> {
     for change in incoming {
-        if let Some(existing) = snapshot.changes.get(&change.id) {
-            if existing != change {
-                return Err(KinDbError::DuplicateChange(change.id.to_string()));
-            }
-        } else {
-            snapshot.changes.insert(change.id, change.clone());
-        }
+        snapshot.changes.append_change(change.clone())?;
     }
 
     // Rebuild the inverse index from canonical history. Ordered and repeated
     // parent identity stays in each change; this derived lookup needs each
     // parent→child edge only once.
-    snapshot.change_children = derive_change_children(&snapshot.changes);
+    snapshot.change_children = derive_change_children(&snapshot.changes)?;
 
     // A repository with multiple refs has no single current entity/relation
     // revision view. Exact target replay derives revisions from the immutable
@@ -3931,26 +4133,29 @@ fn admit_changes(
 /// Successor preparation and authority-frame recovery both derive it from the
 /// same function, so a reconstructed head carries the index its writer carried.
 pub(crate) fn derive_change_children(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
-) -> HashMap<SemanticChangeId, Vec<SemanticChangeId>> {
+    changes: &crate::storage::ChangeMap,
+) -> Result<HashMap<SemanticChangeId, Vec<SemanticChangeId>>, KinDbError> {
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in changes.values() {
-        for parent in &change.parents {
-            children.entry(*parent).or_default().insert(change.id);
+    for id in changes.change_ids()? {
+        for parent in changes
+            .change_parents(&id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?
+        {
+            children.entry(parent).or_default().insert(id);
         }
     }
-    children
+    Ok(children
         .into_iter()
         .map(|(parent, children)| (parent, children.into_iter().collect()))
-        .collect()
+        .collect())
 }
 
 fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
     let mut expected_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>> = HashMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in snapshot.changes.values() {
-        for parent in &change.parents {
-            children.entry(*parent).or_default().insert(change.id);
+    for id in snapshot.changes.change_ids()? {
+        for parent in snapshot.changes.change_parents(&id)?.unwrap_or_default() {
+            children.entry(parent).or_default().insert(id);
         }
     }
     expected_children.extend(
@@ -3999,9 +4204,9 @@ fn admit_aliases(
     for alias in incoming {
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
-        alias.validate_change(change)?;
+        alias.validate_change(&change)?;
         alias.validate_binding(aliases.get(&alias.oid).map(|existing| existing.change_id))?;
         aliases.entry(alias.oid).or_insert_with(|| alias.clone());
     }
@@ -4014,6 +4219,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
+    external_history: Option<&ChangeMap>,
 ) -> Result<(), KinDbError> {
     if let Some(delta) = &transaction.git_authority_delta {
         if metadata.git_external_authority.as_ref() != delta.old.as_ref() {
@@ -4029,6 +4235,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
     validate_transaction_git_projection_membership(
         transaction,
         metadata.git_external_authority.as_ref(),
+        external_history,
     )?;
     validate_git_authority_shape_and_projection(
         snapshot,
@@ -4048,6 +4255,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
 fn validate_transaction_git_projection_membership(
     transaction: &RepositoryTransaction,
     authority: Option<&GitExternalAuthority>,
+    external_history: Option<&ChangeMap>,
 ) -> Result<(), KinDbError> {
     let projected_oids = authority
         .into_iter()
@@ -4068,7 +4276,7 @@ fn validate_transaction_git_projection_membership(
             .into());
         }
     }
-    for change in &transaction.changes {
+    let validate = |change: &kin_model::SemanticChange| -> Result<(), KinDbError> {
         if let kin_model::ChangeOrigin::GitCommit { oid } = change.origin {
             if !projected_oids.contains(&oid) {
                 return Err(ModelError::InvalidOperation(format!(
@@ -4078,6 +4286,13 @@ fn validate_transaction_git_projection_membership(
                 .into());
             }
         }
+        Ok(())
+    };
+    for change in &transaction.changes {
+        validate(change)?;
+    }
+    if let Some(changes) = external_history {
+        changes.visit_changes(validate)?;
     }
     Ok(())
 }
@@ -4206,7 +4421,7 @@ fn validate_git_authority_shape_and_projection(
         })?;
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
         match change.origin {
             kin_model::ChangeOrigin::GitCommit { oid } if oid == projection.commit_oid => {}
@@ -4317,7 +4532,7 @@ where
     for change_id in targets.keys() {
         let change = snapshot
             .changes
-            .get(change_id)
+            .read_change(change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         if let Some(first_parent) = change.parents.first() {
             if !targets.contains_key(first_parent) {
@@ -4381,7 +4596,7 @@ where
                 }
                 let change = snapshot
                     .changes
-                    .get(&change_id)
+                    .read_change(&change_id)?
                     .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
                 let target = targets
                     .get(&change_id)
@@ -4416,7 +4631,7 @@ where
             GitProjectionTreeFrame::Exit(change_id) => {
                 let change = snapshot
                     .changes
-                    .get(&change_id)
+                    .read_change(&change_id)?
                     .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
                 let inverse = change
                     .tree_deltas
@@ -4493,13 +4708,13 @@ fn validate_persisted_git_alias_coverage(
         }
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
-        alias.validate_change(change)?;
+        alias.validate_change(&change)?;
     }
-    for change in snapshot.changes.values() {
+    snapshot.changes.visit_changes(|change| {
         let kin_model::ChangeOrigin::GitCommit { oid } = change.origin else {
-            continue;
+            return Ok(());
         };
         if !projected_oids.contains(&oid) {
             return Err(ModelError::InvalidOperation(format!(
@@ -4515,7 +4730,8 @@ fn validate_persisted_git_alias_coverage(
             ))
             .into());
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -4879,6 +5095,99 @@ fn apply_local_overlay(
 /// happened. Citations the previous record already carried were proven the same
 /// way when they were applied, so they are not rechecked here, which also keeps
 /// this sound across operation-log compaction.
+/// Admit the collaboration records a transaction carries into the successor
+/// snapshot.
+///
+/// `RootBundle::collaboration` is replicated truth and
+/// `has_same_replicated_truth` compares it, but until this existed nothing
+/// could move it through a transaction. `prepare_successor` admitted eight
+/// things and no collaboration domain, so two replicas could complete a
+/// transfer and hold different collaboration roots with nothing erroring. The
+/// collections below are the seventeen `collaboration_root` folds, in fold
+/// order.
+///
+/// # Idempotent by construction, which a transfer needs
+///
+/// A keyed entry replaces whatever is held under its key; an unkeyed one is
+/// admitted only when an identical record is not already present. Applying the
+/// same delta twice therefore lands the same snapshot, which is what lets a
+/// replayed pack report `IdempotentReplay` rather than duplicate a review note.
+/// The delta's own `validate` has already refused a repeated key, so the
+/// upserts here cannot be hiding an ambiguity from the sender.
+///
+/// # Every key travels rather than being re-derived
+///
+/// `contracts` is keyed by `ContractId` while `Contract::id` is an `EntityId`,
+/// and this module derives that key at its own write site. The delta carries
+/// the key the sender used, so the record lands where the sender put it and the
+/// two collaboration roots can actually agree. Re-deriving here would be the
+/// same silent divergence one layer down.
+fn apply_collaboration(
+    snapshot: &mut GraphSnapshot,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    let Some(delta) = &transaction.collaboration_delta else {
+        return Ok(());
+    };
+    delta.validate().map_err(|error| {
+        ModelError::InvalidOperation(format!("invalid collaboration delta: {error}"))
+    })?;
+
+    /// Admit one unkeyed record, skipping one the receiver already holds.
+    fn admit<T: PartialEq + Clone>(into: &mut Vec<T>, records: &[T]) {
+        for record in records {
+            if !into.contains(record) {
+                into.push(record.clone());
+            }
+        }
+    }
+
+    for entry in &delta.work_items {
+        snapshot.work_items.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.annotations {
+        snapshot.annotations.insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.work_links, &delta.work_links);
+    for entry in &delta.reviews {
+        snapshot.reviews.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.review_decisions {
+        snapshot
+            .review_decisions
+            .insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.review_notes, &delta.review_notes);
+    admit(&mut snapshot.review_discussions, &delta.review_discussions);
+    for entry in &delta.review_assignments {
+        snapshot
+            .review_assignments
+            .insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.test_cases {
+        snapshot.test_cases.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.assertions {
+        snapshot.assertions.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.verification_runs {
+        snapshot
+            .verification_runs
+            .insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.mock_hints, &delta.mock_hints);
+    for entry in &delta.contracts {
+        snapshot.contracts.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.actors {
+        snapshot.actors.insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.delegations, &delta.delegations);
+    admit(&mut snapshot.approvals, &delta.approvals);
+    admit(&mut snapshot.audit_events, &delta.audit_events);
+    Ok(())
+}
+
 fn apply_merge_transaction(
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
@@ -4971,28 +5280,17 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // this whole lap. The lap is the largest single term in a full-history
     // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    // Deliberately NOT capturing here, and the reason is measured rather than
-    // stylistic. This resolution is at exactly the change a section names, so
-    // capturing it is tempting and was tried; it holds the resolved state as a
-    // second copy for the rest of the mutation, and
-    // `a_workspace_mutation_does_not_hold_the_whole_history_four_times` read
-    // 7.17 copies of the history against a ceiling of 4.4 and an intact reading
-    // of 4.08. That guard is calibrated and its ceiling is not the thing to
-    // move: the section is 185 MiB on a converted store, of which
-    // `entity_revisions` is 173.8 MiB, and it cannot be narrowed because a base
-    // with empty revisions is a DIFFERENT answer (FIR-3048).
-    //
-    // So a publish does not write sections. An explicit materialize operation
-    // does, where paying one graph copy is the point of the command rather than
-    // a tax on every commit, and where a store that never runs it simply keeps
-    // folding.
+    // This private preparation compares only live graph domains. It neither
+    // answers revision queries nor captures a persisted graph section, so it
+    // resolves an explicit current-state projection. Full workspace snapshots
+    // and materialized sections keep their exact historical revision output.
     let next_base = {
         let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
         resolve_workspace_base_graph_snapshot(
             snapshot,
             metadata,
             mutation.new_base_target.as_ref(),
-            WorkspaceBaseHistory::Omitted,
+            WorkspaceBaseHistory::CurrentProjection,
         )?
     };
 
@@ -5006,7 +5304,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
                 snapshot,
                 metadata,
                 current_base_target,
-                WorkspaceBaseHistory::Omitted,
+                WorkspaceBaseHistory::CurrentProjection,
             )?
         }
     };
@@ -5220,7 +5518,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         let change_id = target_change_id(metadata, base_target)?;
         let change = snapshot
             .changes
-            .get(&change_id)
+            .read_change(&change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         let was_already_admitted = current.snapshot.changes.contains_key(&change_id);
         let is_verified_git = matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. });
@@ -5987,17 +6285,17 @@ fn verified_history_validation(
     matches.then_some(recovered.generation)
 }
 
-fn validate_history_replay(
+fn validate_history_replay<'a>(
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    new_changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
 ) -> Result<(), KinDbError> {
     validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, new_changes)
 }
 
-fn validate_history_replay_with(
+fn validate_history_replay_with<'a>(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    new_changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
 ) -> Result<(), KinDbError> {
     // One Kahn pass over the whole change map proves the DAG is acyclic and
     // that every declared parent is persisted. Resolving each change's reachable
@@ -6020,40 +6318,45 @@ fn validate_history_replay_with(
     // reachable histories cover every persisted change, including unreachable
     // history that is not currently named by a ref. This is graph replay only:
     // an invalid history never falls back to Git or the filesystem.
-    let mut validation_targets: Vec<_> = if new_changes.is_empty() {
-        snapshot
+    // Reopen and freeze borrow the complete map; transaction preparation
+    // borrows only incoming changes. Replay needs identities, not owned payloads.
+    let mut validation_targets: Vec<_> = new_changes.into_iter().map(|change| change.id).collect();
+    if validation_targets.is_empty() {
+        validation_targets = snapshot
             .changes
-            .keys()
+            .change_ids()?
+            .into_iter()
             .filter(|change_id| {
                 snapshot
                     .change_children
                     .get(change_id)
                     .is_none_or(Vec::is_empty)
             })
-            .copied()
-            .collect()
-    } else {
-        new_changes.iter().map(|change| change.id).collect()
-    };
+            .collect();
+    }
     validation_targets.sort_unstable();
     validation_targets.dedup();
     validate_first_parent_history(&snapshot.changes, &validation_targets)
 }
 
 fn topological_change_order(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
+    changes: &crate::storage::ChangeMap,
 ) -> Result<Vec<SemanticChangeId>, KinDbError> {
     let mut indegree = BTreeMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in changes.values() {
-        let unique_parents: BTreeSet<_> = change.parents.iter().copied().collect();
+    for id in changes.change_ids()? {
+        let unique_parents: BTreeSet<_> = changes
+            .change_parents(&id)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         for parent in &unique_parents {
-            if !changes.contains_key(parent) {
+            if !changes.contains_change(parent) {
                 return Err(ModelError::ChangeNotFound(parent.to_string()).into());
             }
-            children.entry(*parent).or_default().insert(change.id);
+            children.entry(*parent).or_default().insert(id);
         }
-        indegree.insert(change.id, unique_parents.len());
+        indegree.insert(id, unique_parents.len());
     }
     let mut ready: BTreeSet<_> = indegree
         .iter()
@@ -6081,12 +6384,14 @@ fn topological_change_order(
 }
 
 fn derive_admission_policies(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
+    changes: &crate::storage::ChangeMap,
 ) -> Result<Vec<ChangeAdmissionPolicy>, KinDbError> {
     let order = topological_change_order(changes)?;
     let mut states: HashMap<SemanticChangeId, Option<SharedAdmissionPolicy>> = HashMap::new();
     for change_id in order {
-        let change = &changes[&change_id];
+        let change = changes
+            .read_change(&change_id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         let inherited = change
             .parents
             .first()
@@ -6194,7 +6499,7 @@ fn is_ancestor(
         }
         let change = snapshot
             .changes
-            .get(&change_id)
+            .read_change(&change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         stack.extend(change.parents.iter().copied());
     }
@@ -6345,7 +6650,7 @@ fn materialize_workspace_graph_snapshot_from_base(
 /// materialization path can reach them, and a future caller that does must be
 /// refused rather than silently served an empty answer.
 struct AuthorityHistoryView<'a> {
-    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+    changes: &'a crate::storage::ChangeMap,
 }
 
 impl AuthorityHistoryView<'_> {
@@ -6360,7 +6665,7 @@ impl ChangeStore for AuthorityHistoryView<'_> {
     type Error = KinDbError;
 
     fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
-        Ok(self.changes.get(id).cloned())
+        self.changes.read_change(id)
     }
 
     fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
@@ -6546,7 +6851,11 @@ enum WorkspaceBaseHistory<'a> {
     /// Leave the change map out. A witness is unrepresentable here on purpose:
     /// carrying one onto an empty map would satisfy pointer identity while
     /// attesting nothing.
+    #[cfg(test)]
     Omitted,
+    /// Private mutation preparation consumes live facts only, never revisions
+    /// or a persisted section. Omit both history and revision output.
+    CurrentProjection,
 }
 
 /// The resolved graph at `change_id` from a persisted section, or why not.
@@ -6616,7 +6925,52 @@ fn resolve_workspace_base_graph_snapshot_capturing(
     let base_change = base_target
         .map(|target| target_change_id(metadata, target))
         .transpose()?;
+    let current_projection = if matches!(history, WorkspaceBaseHistory::CurrentProjection) {
+        if capture == WorkspaceBaseCapture::Retain {
+            return Err(storage(
+                "a current-state projection cannot become a full graph section".to_string(),
+            ));
+        }
+        base_change
+            .map(|change_id| {
+                let section = authority_snapshot
+                    .materialized_graph
+                    .as_ref()
+                    .ok_or(MaterializedGraphRefusal::Absent)
+                    .and_then(|section| section.validate_for(&change_id).map(|()| section));
+                if let Ok(section) = section {
+                    #[cfg(test)]
+                    BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.set(count.get() + 1));
+                    tracing::debug!(
+                        change = %change_id,
+                        "served the current workspace projection from a materialized graph section"
+                    );
+                    return Ok(crate::storage::ResolvedCurrentGraph {
+                        entities: section.state.entities.clone(),
+                        relations: section.state.relations.clone(),
+                        external_references: section.state.external_references.clone(),
+                        tree: section.state.tree.clone(),
+                    });
+                }
+                if let Err(refusal) = section {
+                    if !matches!(refusal, MaterializedGraphRefusal::Absent) {
+                        tracing::warn!(
+                            refusal = %refusal,
+                            change = %change_id,
+                            "refused the materialized graph section; folding the current projection from history instead"
+                        );
+                    }
+                }
+                #[cfg(test)]
+                BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.set(count.get() + 1));
+                crate::storage::resolve_current_graph(&authority_snapshot.changes, &change_id)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let resolved = match base_change {
+        Some(_) if matches!(history, WorkspaceBaseHistory::CurrentProjection) => None,
         Some(change_id) => {
             Some(
                 match resolved_graph_from_section(authority_snapshot, &change_id) {
@@ -6678,23 +7032,30 @@ fn resolve_workspace_base_graph_snapshot_capturing(
             captured = Some(CapturedBaseGraph::capture(change_id, state.clone()));
         }
     }
-    let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
-    {
-        Some(state) => (
-            state.entities,
-            state.relations,
-            state.entity_revisions,
-            state.tree,
-            state.external_references,
-        ),
-        None => (
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            ResolvedTree::default(),
-            HashMap::new(),
-        ),
-    };
+    let (entities, relations, entity_revisions, resolved_tree, external_references) =
+        match (current_projection, resolved) {
+            (Some(state), _) => (
+                state.entities,
+                state.relations,
+                HashMap::new(),
+                state.tree,
+                state.external_references,
+            ),
+            (None, Some(state)) => (
+                state.entities,
+                state.relations,
+                state.entity_revisions,
+                state.tree,
+                state.external_references,
+            ),
+            (None, None) => (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                ResolvedTree::default(),
+                HashMap::new(),
+            ),
+        };
     // Every field is named so that a new snapshot domain refuses to compile
     // here until someone decides whether a workspace base carries it. The
     // carried domains are cloned exactly as the whole-snapshot clone carried
@@ -6708,10 +7069,14 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         incoming: HashMap::new(),
         changes: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.changes.clone(),
+            WorkspaceBaseHistory::CurrentProjection => ChangeMap::new(),
+            #[cfg(test)]
             WorkspaceBaseHistory::Omitted => ChangeMap::new(),
         },
         change_children: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.change_children.clone(),
+            WorkspaceBaseHistory::CurrentProjection => HashMap::new(),
+            #[cfg(test)]
             WorkspaceBaseHistory::Omitted => HashMap::new(),
         },
         work_items: authority_snapshot.work_items.clone(),
@@ -6758,9 +7123,11 @@ fn resolve_workspace_base_graph_snapshot_capturing(
             let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
             base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
         }
-        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::Omitted => {
+        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::CurrentProjection => {
             base.validate_storage_admission()?
         }
+        #[cfg(test)]
+        WorkspaceBaseHistory::Omitted => base.validate_storage_admission()?,
     }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
@@ -6985,10 +7352,16 @@ fn validate_workspace_state(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
-    admitted: Option<&AdmittedChangeMap<'_>>,
+    _admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     validate_workspace_state_without_materialization(replay, snapshot, metadata, workspace)?;
-    materialize_workspace_graph_snapshot(snapshot, metadata, workspace, admitted)?;
+    let base = resolve_workspace_base_graph_snapshot(
+        snapshot,
+        metadata,
+        workspace.base_target.as_ref(),
+        WorkspaceBaseHistory::CurrentProjection,
+    )?;
+    materialize_workspace_graph_snapshot_from_base(base, workspace, None)?;
     Ok(())
 }
 
@@ -7684,13 +8057,13 @@ fn collect_all_authority_body_requirements_with(
     }
     match changes {
         ChangeBodyRequirements::Walk(changes) => {
-            for change in changes.values() {
+            changes.visit_changes(|change| {
                 collect_tree_delta_body_requirements(
                     &mut requirements,
                     &change.tree_deltas,
                     &format!("change {}", change.id),
-                )?;
-            }
+                )
+            })?;
         }
         ChangeBodyRequirements::Collected(collected) => {
             for (digest, requirement) in collected {
@@ -8452,7 +8825,10 @@ impl DomainRoot {
 /// purpose. On a whole-repository leaf the tree cost fifteen times the bytes it
 /// produced, and a bootstrap hands this function the entire Git object closure
 /// as a single leaf (FIR-2665).
-fn canonical_leaf_hash<T: Serialize>(domain: &str, value: &T) -> Result<[u8; 32], KinDbError> {
+pub(crate) fn canonical_leaf_hash<T: Serialize>(
+    domain: &str,
+    value: &T,
+) -> Result<[u8; 32], KinDbError> {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-repository-root-leaf-v1\0");
     hasher.update((domain.len() as u64).to_le_bytes());
@@ -8498,6 +8874,10 @@ mod tests {
         snapshot: Mutex<Option<(Vec<u8>, Generation)>>,
         blobs: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         prepared: Mutex<HashMap<String, PreparedWorkspaceGraphArtifact>>,
+        prepared_load_count: AtomicUsize,
+        prepared_payload_bytes_loaded: AtomicUsize,
+        prepared_preflight_unavailable: AtomicBool,
+        prepared_binding_load_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
         fail_next_snapshot: AtomicBool,
         source_load_count: AtomicUsize,
         verified_batch_behavior: AtomicUsize,
@@ -8841,12 +9221,38 @@ mod tests {
             Ok(())
         }
 
+        fn load_prepared_workspace_graph_binding(
+            &self,
+            _repo_id: &str,
+            workspace_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            if self.prepared_preflight_unavailable.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let binding = self
+                .prepared
+                .lock()
+                .get(workspace_id)
+                .map(|artifact| artifact.binding.clone());
+            if let Some(hook) = self.prepared_binding_load_hook.lock().take() {
+                hook();
+            }
+            Ok(binding)
+        }
+
         fn load_prepared_workspace_graph(
             &self,
             _repo_id: &str,
             workspace_id: &str,
         ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
-            Ok(self.prepared.lock().get(workspace_id).cloned())
+            self.prepared_load_count.fetch_add(1, Ordering::SeqCst);
+            let artifacts = self.prepared.lock();
+            let artifact = artifacts.get(workspace_id);
+            if let Some(artifact) = artifact {
+                self.prepared_payload_bytes_loaded
+                    .fetch_add(artifact.payload.len(), Ordering::SeqCst);
+            }
+            Ok(artifact.cloned())
         }
 
         fn record_prepared_workspace_graph(
@@ -9369,6 +9775,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -10730,6 +11137,95 @@ mod tests {
             policy: RefUpdatePolicy::FastForwardOnly,
         });
         (transaction, old_body)
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_matches_owned_commit_and_replays() {
+        let owned = initial_manager(Arc::new(MemoryBackend::default()));
+        let streamed = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&owned, 0xa001);
+        let mut incoming = git_authority_transaction_fixture(&streamed, 0xa001).transaction;
+        let mut changes = ChangeMap::new();
+        for change in std::mem::take(&mut incoming.changes) {
+            changes.append_change(change).unwrap();
+        }
+        let expected = owned
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        let actual = streamed
+            .commit_git_bootstrap_with_changes(incoming.clone(), changes.clone())
+            .unwrap();
+        assert_eq!(actual.transaction_hash, expected.transaction_hash);
+        assert_eq!(actual.roots_before, expected.roots_before);
+        // Independently committed operations receive different wall-clock
+        // timestamps. Normalize only that generated field for the root oracle.
+        let streamed_lease = streamed.read_authority();
+        let owned_lease = owned.read_authority();
+        let mut normalized = streamed_lease.metadata().clone();
+        normalized.operation_log[0].committed_at =
+            owned_lease.metadata().operation_log[0].committed_at.clone();
+        assert_eq!(
+            compute_roots(&streamed_lease.snapshot, &normalized, 1).unwrap(),
+            expected.roots_after
+        );
+        assert_eq!(actual.generation, 1);
+        assert_eq!(
+            streamed
+                .read_authority()
+                .snapshot
+                .changes
+                .change_ids()
+                .unwrap(),
+            owned
+                .read_authority()
+                .snapshot
+                .changes
+                .change_ids()
+                .unwrap()
+        );
+        assert_eq!(
+            streamed.read_authority().metadata().ref_state.refs,
+            owned.read_authority().metadata().ref_state.refs
+        );
+        let replay = streamed
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .unwrap();
+        assert_eq!(replay.outcome, RepositoryCommitOutcome::IdempotentReplay);
+        assert_eq!(replay.transaction_hash, expected.transaction_hash);
+        assert_eq!(streamed.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_rejects_native_changes() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut incoming = git_authority_transaction_fixture(&manager, 0xa001).transaction;
+        let mut change = incoming.changes.remove(0);
+        change.origin = ChangeOrigin::Native;
+        change.id = compute_semantic_change_id(&change).unwrap();
+        incoming.changes.clear();
+        let mut changes = ChangeMap::new();
+        changes.append_change(change).unwrap();
+        let error = manager
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .unwrap_err();
+        assert!(error.to_string().contains("only Git-origin"), "{error}");
+        assert_eq!(manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_rejects_missing_parent() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut incoming = git_authority_transaction_fixture(&manager, 0xa001).transaction;
+        let mut changes = ChangeMap::new();
+        for change in std::mem::take(&mut incoming.changes) {
+            if !change.parents.is_empty() {
+                changes.append_change(change).unwrap();
+            }
+        }
+        assert!(manager
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .is_err());
+        assert_eq!(manager.read_authority().generation(), 0);
     }
 
     #[test]
@@ -14757,6 +15253,418 @@ mod tests {
         );
     }
 
+    /// One review and one note on it, fixed in every byte, so two sides can be
+    /// seeded with the same record and a digest comparison means something.
+    ///
+    /// Fixed UUIDs rather than `ReviewId::new()`: that constructor is v4 random,
+    /// and two sides seeded with random ids would fold different collaboration
+    /// roots for a reason that has nothing to do with replication, which is the
+    /// exact confusion this test exists to remove.
+    fn transferred_review_and_note() -> (kin_model::Review, kin_model::ReviewNote) {
+        let review_id = kin_model::ReviewId(Uuid::from_u128(0xc0_11_ab_00));
+        let at = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let author = kin_model::IdentityRef::human("collaboration-source");
+        let review = kin_model::Review {
+            review_id,
+            title: "transferred review".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "topic".to_string(),
+            state: kin_model::ReviewDecisionState::Pending,
+            completion: kin_model::ReviewCompletionState::InReview,
+            created_by: author.clone(),
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            scopes: Vec::new(),
+        };
+        let note = kin_model::ReviewNote {
+            note_id: kin_model::ReviewNoteId(Uuid::from_u128(0xc0_11_ab_01)),
+            review_id,
+            body: "the model calls this replicated truth".to_string(),
+            scope: None,
+            authored_by: author,
+            created_at: at,
+        };
+        (review, note)
+    }
+
+    /// A manager over a store whose graph already holds whatever `shape` wrote.
+    ///
+    /// This exists because there is no other way in. The collaboration domains
+    /// have no transaction door: `RepositoryTransaction` carries seventeen
+    /// fields and not one of them is a collaboration domain, and
+    /// `prepare_successor` admits exactly eight things (external objects,
+    /// changes, aliases, Git authority, ref mutations, the local overlay, the
+    /// workspace and the merge transaction), none of which is collaboration. So
+    /// the record is written through `ReviewStore`, which is the API kin-db
+    /// actually offers for it, the graph is exported, a generation-zero
+    /// authority is folded over those exact contents, and the manager opens on
+    /// the persisted bytes. Every step is the crate's own path; nothing is
+    /// hand-built to make the fold come out a particular way.
+    fn manager_over_graph(
+        backend: Arc<MemoryBackend>,
+        shape: impl FnOnce(&InMemoryGraph),
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let graph = InMemoryGraph::new();
+        shape(&graph);
+        let mut snapshot = graph.to_snapshot();
+        snapshot.repository_authority = Some(
+            PersistedRepositoryAuthority::empty(repository_id(), &snapshot)
+                .expect("a generation-zero authority folds over these contents"),
+        );
+        let bytes = snapshot.to_bytes().expect("the seeded snapshot serializes");
+        backend
+            .save_snapshot(repository_id().as_str(), &bytes, 0)
+            .expect("the seeded snapshot persists");
+        RepositoryAuthorityManager::open(repository_id(), backend).expect("the seeded store opens")
+    }
+
+    /// Seed one store with the review alone, through the real API.
+    ///
+    /// The pair with [`manager_holding_the_note`] differ in the note and in
+    /// nothing else, which is what lets the first control below say the NOTE
+    /// moved the collaboration root rather than the review beside it.
+    fn manager_holding_the_review(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, _) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+        })
+    }
+
+    /// Seed one store with the review and its note, through the real API.
+    ///
+    /// `add_review_note` has no other caller anywhere in this crate. This is
+    /// the door a collaboration record comes in by, and it opens onto nothing
+    /// the commit path can see.
+    fn manager_holding_the_note(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, note) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+            graph.add_review_note(&note).expect("the note is added");
+        })
+    }
+
+    /// Every field a repository transaction carries is either admitted by
+    /// `prepare_successor` or named here as not a mutation, and the list is
+    /// checked against the function's own source.
+    ///
+    /// This is the guard whose absence let the collaboration domain sit
+    /// unreplicated for the whole life of the merge and sealed fields too.
+    /// `prepare_successor` admits an explicit hand-written list. A field the
+    /// transaction grows and that function never learns is SILENTLY INERT:
+    /// every existing test passes, the commit succeeds, the roots recompute,
+    /// and the only symptom is two replicas quietly disagreeing. kin-model
+    /// guards its own field list in eight mirrors behind five deny-by-default
+    /// registries. This crate had no equivalent.
+    ///
+    /// Two independent halves, because each catches what the other cannot.
+    ///
+    /// The ARITY half fails closed on a new field. `RepositoryTransaction`
+    /// serializes positionally, so its own encoding counts its fields, and a
+    /// field added to it without a row below stops this test rather than
+    /// slipping past. Falsify it by adding a field to `RepositoryTransaction`
+    /// in kin-model and not touching this list.
+    ///
+    /// The SOURCE half fails when an admit call leaves `prepare_successor`. The
+    /// arity is unchanged in that case, so nothing above can see it, and the
+    /// hash-shaped guards elsewhere cannot either: the successor is still valid,
+    /// it is just missing what that call would have admitted. Falsify it by
+    /// deleting the `apply_collaboration` call from `prepare_successor`.
+    ///
+    /// The source scan reads this file rather than a copy of it, and asserts it
+    /// found the function at all, because a scan that silently matched nothing
+    /// would report every row as satisfied.
+    #[test]
+    fn prepare_successor_admits_every_mutation_a_transaction_can_carry() {
+        /// Each mutation-bearing field, and the call inside `prepare_successor`
+        /// that admits it.
+        const ADMITTED: [(&str, &str); 10] = [
+            ("external_objects", "admit_external_objects("),
+            ("changes", "admit_changes("),
+            ("aliases", "admit_aliases("),
+            ("git_authority_delta", "apply_git_authority("),
+            ("ref_mutations", "apply_ref_mutations("),
+            ("default_ref_mutation", "apply_ref_mutations("),
+            ("workspace_mutation", "apply_workspace("),
+            ("local_overlay_delta", "apply_local_overlay("),
+            ("collaboration_delta", "apply_collaboration("),
+            ("merge_transaction_delta", "apply_merge_transaction("),
+        ];
+
+        /// Fields that are precondition or identity rather than admitted
+        /// payload, with the reason each one moves no authority by itself.
+        const NOT_A_MUTATION: [(&str, &str); 8] = [
+            (
+                "schema_version",
+                "a version gate, checked by RepositoryTransaction::validate",
+            ),
+            (
+                "operation_id",
+                "the operation's identity, bound into the receipt",
+            ),
+            ("repository_id", "names the repository this may commit to"),
+            ("expected_generation", "a compare-and-swap precondition"),
+            ("expected_roots", "a compare-and-swap precondition"),
+            ("actor", "provenance carried into the operation record"),
+            ("reason", "provenance carried into the operation record"),
+            (
+                "sealed_observation",
+                "binds the admitted content closure and is verified by \
+                 verify_transaction_admission; it qualifies a mutation rather than being one, \
+                 which kin-model states as a_sealed_observation_binds_a_real_mutation_but_is_not \
+                 _one_by_itself",
+            ),
+        ];
+
+        fn messagepack_array_len(bytes: &[u8]) -> usize {
+            match bytes.first() {
+                Some(marker) if (0x90..=0x9f).contains(marker) => usize::from(marker & 0x0f),
+                Some(0xdc) => usize::from(u16::from_be_bytes([bytes[1], bytes[2]])),
+                other => panic!("not a MessagePack array: {other:?}"),
+            }
+        }
+
+        // Every optional tail present, so the encoding counts every field the
+        // type has rather than only the ones this fixture happened to fill.
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut complete = arbitrary_repository_transaction(&manager);
+        complete.collaboration_delta = Some(transferred_collaboration_delta());
+        assert!(
+            complete.merge_transaction_delta.is_some()
+                || complete.sealed_observation.is_some()
+                || complete.collaboration_delta.is_some(),
+            "the fixture must occupy the last tail slot, or the arity below undercounts"
+        );
+        let arity = messagepack_array_len(&rmp_serde::to_vec(&complete).unwrap());
+
+        assert_eq!(
+            arity,
+            ADMITTED.len() + NOT_A_MUTATION.len(),
+            "RepositoryTransaction carries {arity} fields and this test accounts for {}. \
+             prepare_successor admits an explicit list and NOTHING fails when the two disagree, \
+             which is exactly how the collaboration domain stayed unreplicated. Add the field to \
+             ADMITTED with the call that admits it, or to NOT_A_MUTATION with the reason.",
+            ADMITTED.len() + NOT_A_MUTATION.len()
+        );
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/repository.rs"),
+        )
+        .expect("this file must be readable; the scan below is worthless without it");
+        let start = source
+            .find("fn prepare_successor_with_history<B: StorageBackend + ?Sized>(")
+            .expect(
+                "prepare_successor was not found in this file, so the scan matched nothing and \
+                 would have reported every row below as satisfied",
+            );
+        let body = &source[start..];
+        let end = body
+            .find("\nfn ")
+            .expect("prepare_successor must be followed by another top-level fn");
+        let body = &body[..end];
+        assert!(
+            body.contains("let mut snapshot = current.snapshot.clone();"),
+            "the extracted span does not look like prepare_successor's body, so the scan is \
+             reading the wrong text"
+        );
+
+        for (field, call) in ADMITTED {
+            assert!(
+                body.contains(call),
+                "`{field}` is admitted by `{call}` according to this list, but that call is not in \
+                 prepare_successor's body. Either it was removed, in which case `{field}` is now \
+                 silently inert, or it was renamed and this row must follow it."
+            );
+        }
+    }
+
+    /// A review note reaches a second replica, because the transaction that
+    /// moves the authority now carries it.
+    ///
+    /// This test landed RED and ignored, as
+    /// `a_review_note_on_one_side_is_replicated_truth_the_other_never_receives`
+    /// in kin-db #292, and the name is worth keeping findable: it recorded that
+    /// `RootBundle::collaboration` is documented "Replicated collaboration
+    /// authority" and compared by `has_same_replicated_truth`, while nothing
+    /// replicated it. `RepositoryTransaction` had no collaboration domain,
+    /// `prepare_successor` admitted none, and `add_review_note` had no call
+    /// site anywhere in this crate, so a review note entered a store through a
+    /// door the commit path did not know existed and left by no door at all.
+    ///
+    /// **Why the existing guard did not catch it.**
+    /// `equivalent_receivers_reopen_with_the_same_replicated_truth` above
+    /// asserts `source_roots.collaboration == receiver_roots.collaboration`
+    /// inside a test where neither side ever writes a collaboration record. It
+    /// was an empty fold compared against an empty fold: it passed for the same
+    /// reason `0 == 0` passes, and would have kept passing if the collaboration
+    /// root were deleted from the bundle entirely.
+    ///
+    /// **The controls, because a comparison that cannot report DIFFER is not
+    /// evidence.** Four now, three of them from the red version and the fourth
+    /// only askable once a delta existed:
+    ///
+    /// - the note must MOVE the collaboration root. Without this the equality
+    ///   at the end could hold for reasons unrelated to the note.
+    /// - two sides that BOTH hold the note must agree on every replicated root,
+    ///   so the final assertion is a claim about replication rather than an
+    ///   unsatisfiable one about the seed.
+    /// - a transaction carrying NO collaboration delta must leave the
+    ///   collaboration root exactly where it found it, which is what makes the
+    ///   delta the thing that moved it below rather than some side effect of
+    ///   committing at all.
+    /// - the same delta applied twice must land the same root. A transfer
+    ///   reports `IdempotentReplay` for a pack it has already applied, so a
+    ///   replayed pack has to be a no-op rather than a second copy of every
+    ///   record it carries.
+    ///
+    /// **What closed it.** kin-model gained `RepositoryTransaction::collaboration_delta`
+    /// carrying the seventeen collections `collaboration_root` folds, and
+    /// `apply_collaboration` above admits them into the successor snapshot. The
+    /// receiver below applies exactly the transferred authority the source
+    /// applied, which is the whole vocabulary a transfer has, and that
+    /// vocabulary now includes the note.
+    #[test]
+    fn a_review_note_reaches_a_receiver_because_the_transaction_carries_it() {
+        // Control one: the collaboration root is sensitive to the note itself.
+        // The two stores differ in the note and in nothing else, so this cannot
+        // pass on the review that carries it.
+        let carrying = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let without = manager_holding_the_review(Arc::new(MemoryBackend::default()));
+        assert_ne!(
+            carrying.read_authority().roots().collaboration,
+            without.read_authority().roots().collaboration,
+            "a review note must move the collaboration root, or nothing below means anything"
+        );
+        drop(carrying);
+        drop(without);
+
+        // Control two: agreement is reachable. Both sides hold the same note and
+        // both apply the same transferred authority.
+        let agreeing_source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let agreeing_receiver = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        agreeing_source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_source,
+                0xfb01,
+                "collaboration-source",
+            ))
+            .unwrap();
+        agreeing_receiver
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_receiver,
+                0xfb02,
+                "collaboration-destination",
+            ))
+            .unwrap();
+        let agreeing_source_roots = agreeing_source.read_authority().roots().clone();
+        let agreeing_receiver_roots = agreeing_receiver.read_authority().roots().clone();
+        assert_eq!(
+            agreeing_source_roots.collaboration, agreeing_receiver_roots.collaboration,
+            "two sides holding the same note must fold the same collaboration root"
+        );
+        assert!(
+            agreeing_source_roots.has_same_replicated_truth(&agreeing_receiver_roots),
+            "two sides holding the same note must agree on replicated truth"
+        );
+
+        // Control three: the richest transaction this module can build moves the
+        // replicated history and ref roots and leaves collaboration exactly where
+        // it found it. This is the runnable half of "no transaction carries it".
+        let commuter = initial_manager(Arc::new(MemoryBackend::default()));
+        let before = commuter.read_authority().roots().clone();
+        commuter
+            .commit_repository_transaction(arbitrary_repository_transaction(&commuter))
+            .unwrap();
+        let after = commuter.read_authority().roots().clone();
+        assert_ne!(before.history, after.history, "the fixture commits changes");
+        assert_ne!(before.ref_state, after.ref_state, "the fixture moves a ref");
+        assert_eq!(
+            before.collaboration, after.collaboration,
+            "a transaction carrying no collaboration delta must leave the collaboration root \
+             exactly where it found it, or the delta is not what moves it and the claim below \
+             proves nothing about the delta"
+        );
+
+        // The claim. The source holds the note. The receiver applies exactly the
+        // transferred authority the source applied, which is the whole vocabulary
+        // a transfer has, and ends up without it.
+        let source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let receiver = manager_over_graph(Arc::new(MemoryBackend::default()), |_| {});
+        source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &source,
+                0xfb03,
+                "collaboration-source",
+            ))
+            .unwrap();
+        let mut receiving =
+            receiver_ref_transaction(&receiver, 0xfb04, "collaboration-destination");
+        receiving.collaboration_delta = Some(transferred_collaboration_delta());
+        receiver.commit_repository_transaction(receiving).unwrap();
+
+        let source_roots = source.read_authority().roots().clone();
+        let receiver_roots = receiver.read_authority().roots().clone();
+
+        // Every other replicated root already agrees, so collaboration is the one
+        // root left that could disagree, and a failure below has exactly one cause.
+        assert_eq!(source_roots.history, receiver_roots.history);
+        assert_eq!(source_roots.ref_state, receiver_roots.ref_state);
+        assert_eq!(source_roots.replication, receiver_roots.replication);
+        assert_eq!(
+            source_roots.collaboration, receiver_roots.collaboration,
+            "`RootBundle` documents `collaboration` as replicated authority and \
+             `has_same_replicated_truth` compares it, so a receiver that applied the \
+             source's transferred authority must hold the source's review note"
+        );
+        assert!(
+            source_roots.has_same_replicated_truth(&receiver_roots),
+            "a root the model calls replicated must actually replicate"
+        );
+
+        // Control four, which only became askable once the delta existed: a
+        // replayed pack must be a no-op rather than a duplicate. A transfer
+        // reports `IdempotentReplay` for a pack it has already applied, so
+        // applying the same collaboration delta twice has to land the same
+        // collaboration root. An `admit` that pushed unconditionally would
+        // duplicate the note here and move the root a second time.
+        // Deliberately a transaction whose ONLY mutation is the collaboration
+        // delta. It replays the delta without re-creating a ref, and it proves
+        // a second thing on the way: collaboration alone counts as a mutation,
+        // so a pack carrying nothing but review notes is a transaction the
+        // model will accept rather than refuse as empty.
+        let mut replayed = transaction_shell(&receiver, 0xfb05);
+        replayed.actor = AuthorId::new("collaboration-destination");
+        replayed.reason = "replay the same collaboration delta".to_string();
+        replayed.collaboration_delta = Some(transferred_collaboration_delta());
+        receiver.commit_repository_transaction(replayed).unwrap();
+        assert_eq!(
+            receiver.read_authority().roots().collaboration,
+            receiver_roots.collaboration,
+            "applying the same collaboration delta twice moved the collaboration root, so a \
+             replayed transfer pack duplicates every record it carries"
+        );
+    }
+
+    /// The review and note from [`transferred_review_and_note`], in the form a
+    /// transaction carries them.
+    fn transferred_collaboration_delta() -> kin_model::CollaborationDelta {
+        let (review, note) = transferred_review_and_note();
+        kin_model::CollaborationDelta {
+            reviews: vec![kin_model::Keyed::new(review.review_id, review)],
+            review_notes: vec![note],
+            ..kin_model::CollaborationDelta::default()
+        }
+    }
+
     #[test]
     fn local_only_operations_do_not_perturb_replicated_roots() {
         let backend_a = Arc::new(MemoryBackend::default());
@@ -15146,6 +16054,206 @@ mod tests {
     }
 
     #[test]
+    fn local_read_only_freeze_preserves_storage_and_holds_journal_head() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3091, 0x62))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        let expected = manager.read_authority();
+        let marker = retain_installed_authority_marker(&directory);
+        let before = freeze_storage_bytes(directory.path());
+        let decoded_before = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        let frozen = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .unwrap();
+        assert!(!frozen.authority().snapshot.changes.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decoded_before
+        );
+        assert_same_authority(&expected, frozen.authority(), "read-only frozen journal");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        assert!(backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        drop(frozen);
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("normal open must confirm the installed authority");
+        assert!(
+            !marker.exists(),
+            "normal open must clean the retained marker"
+        );
+    }
+
+    #[test]
+    fn authority_frame_late_append_refusal_leaves_the_base_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let mut base = manager.read_authority().snapshot().clone();
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3092, 0x63))
+            .unwrap();
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let mut frame =
+            crate::storage::authority_frame::AuthorityFrame::from_bytes(&bytes).unwrap();
+        let id = base.changes.change_ids().unwrap()[0];
+        let mut valid = base.changes.read_change(&id).unwrap().unwrap();
+        valid.message.push_str(" valid appended record");
+        valid.id = compute_semantic_change_id(&valid).unwrap();
+        let mut invalid = valid.clone();
+        invalid.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        invalid.message.push_str(" invalidated identity");
+        frame.changes = vec![valid.clone(), invalid];
+        let before = rmp_serde::to_vec(&base).unwrap();
+        assert!(frame.apply(&mut base).is_err());
+        assert!(!base.changes.contains_change(&valid.id));
+        assert_eq!(rmp_serde::to_vec(&base).unwrap(), before);
+    }
+
+    fn retain_installed_authority_marker(directory: &TempDir) -> std::path::PathBuf {
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        std::fs::remove_file(crate::storage::mmap::recovery_tmp_path(&authority)).unwrap();
+        crate::storage::mmap::recovery_marker_path(&authority)
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_staged_authority_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, _manager) = framed_local_repository(&directory);
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a staged candidate must not be confirmed as installed");
+        assert!(error.to_string().contains("still staged"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    fn freeze_storage_bytes(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            entries: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    entries.push((path.strip_prefix(root).unwrap().to_path_buf(), Vec::new()));
+                    visit(root, &path, entries);
+                } else {
+                    entries.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn local_read_only_freeze_missing_authority_creates_nothing() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let before = freeze_storage_bytes(directory.path());
+        assert!(
+            LocalRepositoryAuthorityFreeze::open_existing_read_only(repository_id(), &backend,)
+                .is_err()
+        );
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    #[test]
+    fn local_read_only_freeze_missing_existing_lock_creates_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(repository_id().as_str())
+                .join(".lock"),
+        )
+        .unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let before = freeze_storage_bytes(directory.path());
+        let error =
+            LocalRepositoryAuthorityFreeze::open_existing_read_only(repository_id(), &backend)
+                .expect_err("existing-only freeze must not recreate a missing lock");
+        assert!(error.to_string().contains("lock"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_corrupt_cas_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, _manager) = framed_local_repository(&directory);
+        retain_installed_authority_marker(&directory);
+        let hash = hex::encode(digest(b"pub fn kin() {}\n").as_bytes());
+        let path = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("source-blobs/sha256")
+            .join(&hash[..2])
+            .join(&hash);
+        std::fs::write(path, b"pub fn bad() {}\n").unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a freeze must revalidate required CAS bodies");
+        assert!(error.to_string().contains("digest"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_corrupt_frame_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3092, 0x63))
+            .unwrap();
+        std::fs::write(frame_path(&directory, 2), b"corrupt frame").unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        assert!(LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .is_err());
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    #[test]
     fn local_authority_freeze_reloads_expected_roots_and_blocks_a_writer() {
         let directory = TempDir::new().unwrap();
         let backend = Arc::new(LocalFileBackend::new(directory.path()));
@@ -15172,35 +16280,29 @@ mod tests {
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&competing_backend))
                 .unwrap();
         let transaction = unborn_workspace_transaction(&competing, 0x5402, 0x5403, b"release");
+        assert!(!competing_backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
         let freeze = manager
             .freeze_current_authority(&expected_roots)
             .expect("current persisted authority must freeze");
         assert_eq!(freeze.roots(), &expected_roots);
         assert_eq!(freeze.authority().roots(), &expected_roots);
 
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = competing.commit_repository_transaction(transaction);
-            finished_tx.send(result).unwrap();
-        });
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
         assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
+            competing_backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap(),
             "a competing repository writer must remain blocked while the freeze guard lives"
         );
 
         drop(freeze);
-        finished_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("writer must resume after freeze release")
+        assert!(!competing_backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        competing
+            .commit_repository_transaction(transaction)
             .expect("writer must commit against the unchanged frozen parent");
-        writer.join().unwrap();
 
         let reopened = RepositoryAuthorityManager::open(
             repository_id(),
@@ -16352,6 +17454,43 @@ mod tests {
         assert_eq!(viewed.external_references, replayed.external_references);
     }
 
+    #[test]
+    fn current_workspace_projection_preserves_live_facts_but_cannot_be_persisted_as_a_full_section()
+    {
+        let store = build_synthetic_history_store(3, 8, 1, 3);
+        let lease = store.manager.read_authority();
+        let workspace = &lease.metadata().workspaces[0];
+        let full = resolve_workspace_base_graph_snapshot(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )
+        .unwrap();
+        let projected = resolve_workspace_base_graph_snapshot(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::CurrentProjection,
+        )
+        .unwrap();
+        assert!(!full.entity_revisions.is_empty());
+        assert!(projected.entity_revisions.is_empty());
+        assert!(projected.changes.is_empty());
+        assert_eq!(projected.entities, full.entities);
+        assert_eq!(projected.relations, full.relations);
+        assert_eq!(projected.external_references, full.external_references);
+        assert_eq!(projected.resolved_tree, full.resolved_tree);
+        assert!(resolve_workspace_base_graph_snapshot_capturing(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::CurrentProjection,
+            WorkspaceBaseCapture::Retain,
+        )
+        .is_err());
+    }
+
     use crate::storage::format::MATERIALIZED_GRAPH_SCHEMA_VERSION;
 
     /// Resolve one workspace base and report which arm answered.
@@ -17011,7 +18150,7 @@ mod tests {
 
     #[test]
     fn authority_history_view_fails_closed_outside_replay() {
-        let changes = HashMap::new();
+        let changes = ChangeMap::new();
         let view = AuthorityHistoryView { changes: &changes };
 
         let missing_head = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
@@ -17329,8 +18468,14 @@ mod tests {
                 .backend
                 .corrupt_prepared_binding_field(&store.workspace_id, field, corruption);
 
+            store.backend.prepared_load_count.store(0, Ordering::SeqCst);
             let manager = reopen_synthetic(&store);
             let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_eq!(
+                store.backend.prepared_load_count.load(Ordering::SeqCst),
+                usize::from(field == "payload_sha256"),
+                "{field} must be refused at the earliest boundary that can validate it"
+            );
             assert_eq!(
                 manager.prepared_workspace_graph_stats(),
                 PreparedWorkspaceGraphStats {
@@ -17367,8 +18512,14 @@ mod tests {
             .backend
             .install_prepared_artifact(&store.workspace_id, artifact);
 
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
         let manager = reopen_synthetic(&store);
         let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            store.backend.prepared_load_count.load(Ordering::SeqCst),
+            1,
+            "eligible metadata must reach full payload validation"
+        );
         assert_eq!(
             manager.prepared_workspace_graph_stats(),
             PreparedWorkspaceGraphStats {
@@ -17380,6 +18531,80 @@ mod tests {
             "payload bytes the binding does not name are refused before they are decoded"
         );
         assert_workspace_snapshots_identical(&materialized, &fresh);
+    }
+
+    #[test]
+    fn prepared_workspace_state_rechecks_the_pair_after_a_matching_preflight() {
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        let recorded = store.backend.prepared_artifact(&store.workspace_id);
+
+        for (field, corruption) in [
+            ("generation", serde_json::json!(4_242u64)),
+            (
+                "authority_snapshot_sha256",
+                serde_json::json!(hex::encode(Sha256::digest(b"later authority"))),
+            ),
+        ] {
+            store
+                .backend
+                .install_prepared_artifact(&store.workspace_id, recorded.clone());
+            let backend = Arc::clone(&store.backend);
+            let workspace_id = store.workspace_id;
+            *store.backend.prepared_binding_load_hook.lock() = Some(Box::new(move || {
+                backend.corrupt_prepared_binding_field(&workspace_id, field, corruption);
+            }));
+            store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+            let manager = reopen_synthetic(&store);
+            let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_eq!(
+                store.backend.prepared_load_count.load(Ordering::SeqCst),
+                1,
+                "the initially matching preflight must reach the full load"
+            );
+            assert_eq!(
+                manager.prepared_workspace_graph_stats(),
+                PreparedWorkspaceGraphStats {
+                    serves: 0,
+                    writes: 1,
+                    refusals: 1,
+                    last_refusal: Some(field.to_string()),
+                },
+                "the full pair's {field} must be checked after the binding changes"
+            );
+            assert_workspace_snapshots_identical(&materialized, &fresh);
+
+            let rewritten = reopen_synthetic(&store);
+            let served = materialize_through(&rewritten, &store.workspace_id);
+            assert_eq!(rewritten.prepared_workspace_graph_stats().serves, 1);
+            assert_workspace_snapshots_identical(&served, &fresh);
+        }
+    }
+
+    #[test]
+    fn prepared_workspace_state_uses_the_full_path_without_a_binding_preflight() {
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        let default_backend = PreparedBlindBackend(Arc::clone(&store.backend));
+        assert!(default_backend
+            .load_prepared_workspace_graph_binding(
+                repository_id().as_str(),
+                &store.workspace_id.to_string()
+            )
+            .unwrap()
+            .is_none());
+        store
+            .backend
+            .prepared_preflight_unavailable
+            .store(true, Ordering::SeqCst);
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+        let manager = reopen_synthetic(&store);
+        let served = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(manager.prepared_workspace_graph_stats().serves, 1);
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 1);
+        assert_workspace_snapshots_identical(&served, &fresh);
     }
 
     #[test]
@@ -17402,8 +18627,14 @@ mod tests {
             serde_json::json!(hex::encode(Sha256::digest(&artifact.payload))),
         );
 
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
         let manager = reopen_synthetic(&store);
         let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            store.backend.prepared_load_count.load(Ordering::SeqCst),
+            1,
+            "a preflight match cannot skip the frame's own integrity check"
+        );
         assert_eq!(
             manager.prepared_workspace_graph_stats(),
             PreparedWorkspaceGraphStats {
@@ -17419,7 +18650,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_a_stale_artifact_after_a_workspace_mutation() {
-        let (store, first) = build_overlaid_history_store(2, 8, 1, 3);
+        let (store, first) = build_overlaid_history_store(2, 64, 1, 12);
         let before = materialize_synthetic(&store);
         let opened = reopen_synthetic(&store);
         materialize_through(&opened, &store.workspace_id);
@@ -17449,8 +18680,34 @@ mod tests {
             "the second overlay relation must actually change what the workspace resolves"
         );
 
+        let stale_payload_bytes = store
+            .backend
+            .prepared_artifact(&store.workspace_id)
+            .payload
+            .len();
+        assert!(
+            stale_payload_bytes > 65_536,
+            "the fixture must carry a substantial payload"
+        );
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+        store
+            .backend
+            .prepared_payload_bytes_loaded
+            .store(0, Ordering::SeqCst);
         let after_mutation = reopen_synthetic(&store);
         let materialized = materialize_through(&after_mutation, &store.workspace_id);
+        let loaded = store
+            .backend
+            .prepared_payload_bytes_loaded
+            .load(Ordering::SeqCst);
+        eprintln!(
+            "stale prepared payload: available_bytes={stale_payload_bytes} loaded_bytes={loaded}"
+        );
+        assert_eq!(
+            loaded, 0,
+            "a stale binding must be refused before the full payload is loaded"
+        );
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 0);
         // The mutation moved the logical generation too, and that is the
         // cheaper mismatch, so it is the one reported. The authority digest is
         // what makes the refusal sound rather than incidental, so assert it
@@ -17482,6 +18739,16 @@ mod tests {
             "the rewrite after the mutation must serve the new state"
         );
         assert_workspace_snapshots_identical(&served, &mutated);
+        let loaded = store
+            .backend
+            .prepared_payload_bytes_loaded
+            .load(Ordering::SeqCst);
+        eprintln!("eligible prepared positive control: loaded_bytes={loaded}");
+        assert!(
+            loaded > 65_536,
+            "an eligible artifact must actually load its payload"
+        );
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -18854,6 +20121,48 @@ mod tests {
         assert_eq!(base_bytes as usize, full.payload_bytes);
         assert_eq!(frames, 1);
         assert_eq!(journal_bytes as usize, frame.payload_bytes);
+    }
+
+    #[test]
+    fn a_native_commit_keeps_reopened_history_on_disk() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, seeded) = framed_local_repository(&directory);
+        drop(seeded);
+        let manager = reopen(&directory);
+        let before = manager.read_authority();
+        let history_len = before.snapshot().changes.len();
+        assert!(history_len > 0);
+        assert!(!before.snapshot().changes.is_decoded());
+        let decodes = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2200);
+        let change_id = removal.changes[0].id;
+        let outcome = manager.commit_repository_transaction(removal).unwrap();
+        let after = manager.read_authority();
+        assert_eq!(after.snapshot().changes.len(), history_len + 1);
+        assert!(after
+            .snapshot()
+            .changes
+            .read_change(&change_id)
+            .unwrap()
+            .is_some());
+        assert!(!before.snapshot().changes.is_decoded());
+        assert!(!after.snapshot().changes.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decodes,
+            "a native commit must not materialize the shared base history"
+        );
+        let reopened = reopen(&directory);
+        let durable = reopened.read_authority();
+        assert_eq!(durable.roots(), &outcome.roots_after);
+        assert_eq!(durable.snapshot().changes.len(), history_len + 1);
+        assert!(durable
+            .snapshot()
+            .changes
+            .read_change(&change_id)
+            .unwrap()
+            .is_some());
+        assert!(!durable.snapshot().changes.is_decoded());
     }
 
     #[test]
@@ -21446,9 +22755,10 @@ mod tests {
             "the control: this open has no record to trust"
         );
         let lease = reopened.read_authority();
+        lease.snapshot().changes.decoded().unwrap();
         assert!(
             lease.snapshot().changes.is_decoded(),
-            "the control: an unproven open holds its history in memory"
+            "the control explicitly materializes history before workspace resolution"
         );
         let workspace_id = lease.metadata().workspaces[0].workspace_id;
         let base = lease
@@ -21463,7 +22773,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_without_a_verified_record_decodes_eagerly_and_validates_in_full() {
+    fn an_open_without_a_verified_record_streams_and_validates_in_full() {
         let directory = TempDir::new().unwrap();
         drop(committed_local_repository(&directory));
         let mut record = read_authority_json(directory.path());
@@ -21477,8 +22787,8 @@ mod tests {
         let reopened = reopen(&directory);
         assert!(!reopened.opened_by_history_validation());
         assert!(
-            reopened.read_authority().snapshot().changes.is_decoded(),
-            "with no record to trust, the open validates the whole history and holds it"
+            !reopened.read_authority().snapshot().changes.is_decoded(),
+            "with no record to trust, the open validates the whole history without retaining bodies"
         );
     }
 
@@ -22094,6 +23404,7 @@ mod replaywall_measurements {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -22216,6 +23527,7 @@ mod replaywall_measurements {
                 local_overlay_delta: None,
                 merge_transaction_delta: None,
                 sealed_observation: None,
+                collaboration_delta: None,
             };
             drop(lease);
 
@@ -22462,6 +23774,7 @@ mod clockhalf_whole_history {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
 
@@ -22698,7 +24011,7 @@ mod clockhalf_git_origin {
             order.push(change.id);
             snapshot.changes.insert(change.id, change);
         }
-        snapshot.change_children = derive_change_children(&snapshot.changes);
+        snapshot.change_children = derive_change_children(&snapshot.changes).unwrap();
         GitHistory {
             snapshot,
             targets,
@@ -22738,7 +24051,7 @@ mod clockhalf_git_origin {
             println!("[git] commits={commits} files={files} churn={churn}");
 
             lap("derive_change_children_ms", || {
-                let children = derive_change_children(&history.snapshot.changes);
+                let children = derive_change_children(&history.snapshot.changes).unwrap();
                 assert_eq!(children.len(), commits.saturating_sub(1));
             });
 
@@ -23024,6 +24337,7 @@ mod native_admission_lineage {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         transaction

@@ -10,7 +10,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::storage::body_walk::{map_entry_count, top_level_element_ranges};
-use crate::storage::change_map::{ChangeMap, ChangeMapInner, EncodedChanges, HistorySource};
+use crate::storage::change_map::{
+    ChangeMap, ChangeMapInner, EncodedChanges, HistoryRecord, HistorySource,
+};
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{
     GitProjectionTreeReplay, PersistedRepositoryAuthority, RootRecomputation,
@@ -159,57 +161,44 @@ pub(crate) fn decode_change_map_element(
 /// the header's own count.
 fn stream_change_map(
     element: &[u8],
+    file_offset: usize,
     visit: &mut dyn FnMut(&SemanticChange) -> Result<(), crate::error::KinDbError>,
-) -> Result<usize, crate::error::KinDbError> {
-    use serde::de::{DeserializeSeed, MapAccess};
-
-    struct StreamChanges<'v> {
-        visit: &'v mut dyn FnMut(&SemanticChange) -> Result<(), crate::error::KinDbError>,
-        failure: Option<crate::error::KinDbError>,
-    }
-
-    impl<'de> Visitor<'de> for &mut StreamChanges<'_> {
-        type Value = usize;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a map of semantic changes")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut visited = 0usize;
-            while let Some((_, change)) = map.next_entry::<SemanticChangeId, SemanticChange>()? {
-                if let Err(error) = (self.visit)(&change) {
-                    self.failure = Some(error);
-                    return Err(serde::de::Error::custom("change visitor refused"));
-                }
-                visited += 1;
-            }
-            Ok(visited)
-        }
-    }
-
-    impl<'de> DeserializeSeed<'de> for &mut StreamChanges<'_> {
-        type Value = usize;
-
-        fn deserialize<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_map(self)
-        }
-    }
-
-    let mut seed = StreamChanges {
-        visit,
-        failure: None,
+) -> Result<HashMap<SemanticChangeId, HistoryRecord>, crate::error::KinDbError> {
+    let failure = |error| {
+        crate::error::KinDbError::StorageError(format!("change map stream failed: {error}"))
     };
-    let mut deserializer = rmp_serde::Deserializer::from_read_ref(element);
-    match (&mut seed).deserialize(&mut deserializer) {
-        Ok(visited) => Ok(visited),
-        Err(error) => Err(seed.failure.take().unwrap_or_else(|| {
-            crate::error::KinDbError::StorageError(format!("change map stream failed: {error}"))
-        })),
+    let mut cursor = std::io::Cursor::new(element);
+    let count =
+        rmp::decode::read_map_len(&mut cursor).map_err(|error| failure(error.to_string()))?;
+    let mut index = HashMap::new();
+    for _ in 0..count {
+        let id: SemanticChangeId =
+            rmp_serde::from_read(&mut cursor).map_err(|error| failure(error.to_string()))?;
+        let start = cursor.position() as usize;
+        let change: SemanticChange =
+            rmp_serde::from_read(&mut cursor).map_err(|error| failure(error.to_string()))?;
+        let end = cursor.position() as usize;
+        if id != change.id || index.contains_key(&id) {
+            return Err(failure(format!(
+                "duplicate or mismatched change identity {id}"
+            )));
+        }
+        visit(&change)?;
+        let record = HistoryRecord {
+            range: (file_offset + start)..(file_offset + end),
+            sha256: Sha256::digest(&element[start..end]).into(),
+            parents: change.parents.clone(),
+            leaf_digest: crate::storage::repository::canonical_leaf_hash(
+                "changes",
+                &(&id, &change),
+            )?,
+        };
+        index.insert(id, record);
     }
+    if cursor.position() as usize != element.len() {
+        return Err(failure("trailing bytes after change map".to_string()));
+    }
+    Ok(index)
 }
 
 /// What a frame turned out to be once it was written.
@@ -1371,20 +1360,22 @@ impl GraphSnapshot {
         let changes = ranges[CHANGES_FIELD_INDEX].clone();
         let element = &frame.body[changes.clone()];
         let change_count = map_entry_count(element)?;
-        {
+        let index = {
             let _span = tracing::info_span!(
                 "kindb.snapshot.stream_change_map",
                 changes = change_count,
                 encoded_bytes = element.len()
             )
             .entered();
-            let visited = stream_change_map(element, visit_change)?;
-            if visited != change_count {
+            let index = stream_change_map(element, 16 + changes.start, visit_change)?;
+            if index.len() != change_count {
                 return Err(crate::error::KinDbError::StorageError(format!(
-                    "snapshot change map declares {change_count} entries and streamed {visited}"
+                    "snapshot change map declares {change_count} entries and streamed {}",
+                    index.len()
                 )));
             }
-        }
+            index
+        };
         // Everything but the change map, decoded by the one decoder every full
         // open uses, over a body in which the map is one empty-map marker.
         let mut partial = Vec::with_capacity(frame.body.len() - element.len() + 1);
@@ -1405,12 +1396,9 @@ impl GraphSnapshot {
             )));
         }
         debug_assert_eq!(snapshot.version, snapshot.wire_version());
-        snapshot.changes = ChangeMap::encoded(EncodedChanges::new(
-            source,
-            changes,
-            change_count,
-            body_checksum,
-        ));
+        snapshot.changes = ChangeMap::encoded(
+            EncodedChanges::new(source, changes, change_count, body_checksum).with_index(index),
+        );
         let persisted_root_hash = Self::decode_root_hash_trailer(data, &frame)?;
         Ok((snapshot, persisted_root_hash))
     }
@@ -1679,15 +1667,11 @@ impl GraphSnapshot {
         envelope: AuthorityEnvelope,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
-        // A change map that is still on disk was left there by a recovery that
-        // a durable validation record licensed, and that record is this
-        // validator's verdict on those exact bytes, this pass included. Running
-        // the pass would decode the whole history to reach the conclusion the
-        // record already carries, and then hold it: on a converted store that
-        // is most of what a serving daemon retains, for a history nothing on
-        // the serving path reads. `AdmittedChangeMap::on_disk` returns `None`
-        // for a map in memory, which carries no such record, so every other
-        // snapshot takes the pass exactly as before.
+        // Indexed recovery either verified an exact durable proof or admitted
+        // each record while building the index. Appends admit their records
+        // before publishing metadata. This witness carries that change-level
+        // validation only; envelope, roots and replay checks still run below.
+        // Explicitly decoded maps take the ordinary admission pass.
         let on_disk = AdmittedChangeMap::on_disk(&self.changes);
         let admitted = match on_disk {
             Some(admitted) => admitted,
@@ -2565,7 +2549,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
     pub external_references: &'a hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     // ChangeData fields
-    pub changes: &'a ChangeMapInner,
+    pub changes: &'a ChangeMap,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
     // WorkData fields
     pub work_items: &'a hashbrown::HashMap<WorkId, WorkItem>,
@@ -4853,6 +4837,90 @@ mod tests {
     }
 
     #[test]
+    fn indexed_history_reads_and_root_folds_leave_bodies_on_disk() {
+        let original = a_snapshot_with_history(64);
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let (indexed, _) = decode_lazily(&frame, memory_source(&frame));
+        let before = decoded_on_this_thread();
+        let mut ids = indexed.changes.change_ids().unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 64);
+        for id in &ids {
+            assert_eq!(
+                indexed.changes.read_change(id).unwrap().as_ref(),
+                original.changes.get(id)
+            );
+        }
+        let mut visited = 0;
+        indexed
+            .changes
+            .visit_changes(|_| {
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, 64);
+        let compute = |id: &SemanticChangeId, change: &SemanticChange| {
+            crate::storage::repository::canonical_leaf_hash("changes", &(id, change))
+        };
+        assert_eq!(
+            indexed
+                .changes
+                .sorted_leaf_digests("changes", compute)
+                .unwrap(),
+            original
+                .changes
+                .sorted_leaf_digests("changes", compute)
+                .unwrap()
+        );
+        assert!(!indexed.changes.is_decoded());
+        assert_eq!(decoded_on_this_thread(), before);
+
+        let mut successor = indexed.clone();
+        let added = a_history_change(65, Some(ids[0]));
+        successor.changes.append_change(added.clone()).unwrap();
+        assert_eq!(successor.changes.len(), 65);
+        assert_eq!(indexed.changes.len(), 64);
+        assert!(indexed.changes.read_change(&added.id).unwrap().is_none());
+        assert_eq!(
+            successor.changes.read_change(&added.id).unwrap(),
+            Some(added.clone())
+        );
+        let mut expected = original.clone();
+        expected.changes.insert(added.id, added.clone());
+        assert_eq!(
+            successor
+                .changes
+                .sorted_leaf_digests("changes", compute)
+                .unwrap(),
+            expected
+                .changes
+                .sorted_leaf_digests("changes", compute)
+                .unwrap()
+        );
+        let encoded = rmp_serde::to_vec(&successor.changes).unwrap();
+        let recovered: ChangeMapInner = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(recovered, *expected.changes);
+        assert!(!successor.changes.is_decoded());
+        assert!(!indexed.changes.is_decoded());
+        assert_eq!(decoded_on_this_thread(), before);
+        let mut conflicting = added;
+        conflicting.message.push('!');
+        assert!(successor.changes.append_change(conflicting).is_err());
+
+        let mut corrupted = frame.clone();
+        let position = corrupted
+            .windows(b"history change".len())
+            .position(|part| part == b"history change")
+            .unwrap();
+        corrupted[position] ^= 1;
+        let (damaged, _) = decode_lazily(&frame, memory_source(&corrupted));
+        assert!(damaged.changes.visit_changes(|_| Ok(())).is_err());
+        let (truncated, _) = decode_lazily(&frame, memory_source(&frame[..frame.len() / 2]));
+        assert!(truncated.changes.visit_changes(|_| Ok(())).is_err());
+    }
+
+    #[test]
     fn the_change_field_index_names_the_change_map() {
         let snapshot = a_snapshot_with_history(3);
         let body = rmp_serde::to_vec(&snapshot).expect("encodes");
@@ -4918,7 +4986,7 @@ mod tests {
         // equality of a re-encoding would be the wrong check: a map's
         // encoding order is its iteration order, which two maps do not share.
         assert_eq!(
-            crate::storage::authority_frame::first_difference(&lazy, &eager),
+            crate::storage::authority_frame::first_difference(&lazy, &eager).unwrap(),
             None
         );
     }
@@ -5017,30 +5085,260 @@ mod tests {
         );
     }
 
+    fn unindexed_history(frame_bytes: &[u8], source: HistorySource) -> ChangeMap {
+        let frame = GraphSnapshot::decode_frame(frame_bytes, true).expect("intact frame verifies");
+        let ranges = top_level_element_ranges(frame.body).expect("walks");
+        let range = ranges[CHANGES_FIELD_INDEX].clone();
+        let count = map_entry_count(&frame.body[range.clone()]).expect("change map header");
+        ChangeMap::encoded(EncodedChanges::new(
+            source,
+            range,
+            count,
+            frame.body_checksum.expect("frame checksum"),
+        ))
+    }
+
     #[test]
-    fn an_encoded_clone_shares_its_source_and_a_decoded_clone_copies() {
+    fn change_ids_refuses_a_corrupt_record_instead_of_panicking() {
+        let intact = encode_snapshot_without_admission_validation(&a_snapshot_with_history(2));
+        let mut corrupted = intact.clone();
+        let position = corrupted
+            .windows(b"history change".len())
+            .position(|part| part == b"history change")
+            .expect("fixture contains a change body");
+        corrupted[position] ^= 1;
+        let changes = unindexed_history(&intact, memory_source(&corrupted));
+        let error = changes
+            .change_ids()
+            .expect_err("corruption must be an error");
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        assert!(error.to_string().contains("change map"), "{error}");
+        assert_eq!(changes.len(), 2, "failure must not clear history metadata");
+        assert!(!changes.is_decoded());
+
+        let mut visited = 0;
+        let error = changes
+            .visit_changes(|_| {
+                visited += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        assert_eq!(
+            visited, 0,
+            "unreadable enumeration cannot visit a partial history"
+        );
+        let error = rmp_serde::to_vec(&changes).unwrap_err();
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        let error = crate::storage::repository::derive_change_children(&changes).unwrap_err();
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        let result = crate::storage::change_validation::AdmittedChangeMap::admit(&changes, "test");
+        assert!(
+            result.is_err(),
+            "corrupt history cannot receive an admission witness"
+        );
+    }
+
+    #[test]
+    fn change_ids_refuses_checksum_valid_malformed_records() {
+        let id = a_history_change(0, None).id;
+        let body = rmp_serde::to_vec(&HashMap::from([(id, 42u32)])).unwrap();
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&GraphSnapshot::MAGIC);
+        frame.extend_from_slice(&GraphSnapshot::MIN_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&checksum);
+        GraphSnapshot::decode_frame(&frame, true).expect("checksum-valid frame");
+        let changes = ChangeMap::encoded(EncodedChanges::new(
+            memory_source(&frame),
+            0..body.len(),
+            1,
+            checksum,
+        ));
+        let error = changes.change_ids().unwrap_err();
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        assert!(
+            error.to_string().contains("change map decode failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn change_ids_refuses_an_unreadable_file_without_caching_empty_history() {
+        use std::io::{Seek, SeekFrom, Write};
+        let snapshot = a_snapshot_with_history(3);
+        let frame = encode_snapshot_without_admission_validation(&snapshot);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let changes = unindexed_history(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "change enumeration fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let expected = snapshot.changes.change_ids().unwrap();
+        assert_eq!(changes.change_ids().unwrap(), expected);
+        file.set_len(0).unwrap();
+        let error = changes.change_ids().unwrap_err();
+        assert!(error.to_string().contains("change_ids"), "{error}");
+        assert!(
+            error.to_string().contains("change enumeration fixture"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("re-read snapshot"), "{error}");
+        assert!(!changes.is_decoded());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&frame).unwrap();
+        assert_eq!(changes.change_ids().unwrap(), expected);
+    }
+
+    #[test]
+    fn change_ids_preserves_order_seals_and_identity_across_storage_shapes() {
+        let original = a_snapshot_with_history(4);
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let (indexed, _) = decode_lazily(&frame, memory_source(&frame));
+        let unindexed = unindexed_history(&frame, memory_source(&frame));
+        let mut expected_ids: Vec<_> = original.changes.keys().copied().collect();
+        expected_ids.sort_unstable();
+        let compute = |id: &SemanticChangeId, change: &SemanticChange| {
+            crate::storage::repository::canonical_leaf_hash("changes", &(id, change))
+        };
+        let expected_seals = original
+            .changes
+            .sorted_leaf_digests("changes", compute)
+            .unwrap();
+        for changes in [&original.changes, &indexed.changes, &unindexed] {
+            assert_eq!(changes.change_ids().unwrap(), expected_ids);
+            for id in changes.change_ids().unwrap() {
+                let change = changes.read_change(&id).unwrap().unwrap();
+                kin_model::validate_semantic_change_id(&change).unwrap();
+                assert_eq!(Some(&change), original.changes.get(&id));
+            }
+            assert_eq!(
+                changes.sorted_leaf_digests("changes", compute).unwrap(),
+                expected_seals
+            );
+        }
+        let mut appended = indexed.changes.clone();
+        let added = a_history_change(4, Some(expected_ids[0]));
+        appended.append_change(added.clone()).unwrap();
+        appended.append_change(added.clone()).unwrap();
+        expected_ids.push(added.id);
+        expected_ids.sort_unstable();
+        assert_eq!(appended.change_ids().unwrap(), expected_ids);
+        assert_eq!(appended.read_change(&added.id).unwrap(), Some(added));
+        assert!(!appended.is_decoded());
+        assert!(!indexed.changes.is_decoded());
+        assert!(ChangeMap::new().change_ids().unwrap().is_empty());
+        let empty_frame = GraphSnapshot::empty().to_bytes().unwrap();
+        assert!(unindexed_history(&empty_frame, memory_source(&empty_frame))
+            .change_ids()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_clones_share_one_lazy_decode_and_detach_on_mutation() {
         let frame = encode_snapshot_without_admission_validation(&a_snapshot_with_history(3));
         let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
-        let twin = lazy.changes.clone();
+        let twin = lazy.clone();
         assert!(
-            !twin.is_decoded(),
-            "cloning an encoded map costs a pointer, not a history"
+            !twin.changes.is_decoded(),
+            "cloning an encoded snapshot does not decode its history"
         );
 
         let decodes_before = decoded_on_this_thread();
         assert!(lazy.changes.contains_key(&visited[0]));
-        assert!(lazy.changes.is_decoded());
-        assert!(!twin.is_decoded(), "the twin decodes on its own first use");
-        let copy = lazy.changes.clone();
         assert!(
-            copy.is_decoded(),
-            "cloning a decoded map copies its entries"
+            !lazy.changes.is_decoded(),
+            "identity lookup uses the compact index"
         );
+        assert!(lazy.changes.get(&visited[0]).is_some());
+        assert!(lazy.changes.is_decoded());
+        assert!(
+            twin.changes.is_decoded(),
+            "a clone made before first use shares that decode"
+        );
+        let mut copy = lazy.clone();
+        assert!(copy.changes.is_decoded());
+        assert_eq!(copy.changes, twin.changes);
+        assert!(std::ptr::eq(&*lazy.changes, &*twin.changes));
+        assert!(std::ptr::eq(&*lazy.changes, &*copy.changes));
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
         assert_eq!(
-            copy, twin,
-            "the twin decodes from the shared source to the same map"
+            rmp_serde::to_vec(&copy.changes).unwrap(),
+            rmp_serde::to_vec(&*lazy.changes).unwrap(),
+            "sharing preserves the plain map's serialized representation"
         );
-        assert!(twin.is_decoded());
-        assert_eq!(decoded_on_this_thread(), decodes_before + 2);
+
+        assert!(copy.changes.remove(&visited[0]).is_some());
+        assert!(!std::ptr::eq(&*lazy.changes, &*copy.changes));
+        assert!(lazy.changes.contains_key(&visited[0]));
+        assert!(twin.changes.contains_key(&visited[0]));
+        assert!(!copy.changes.contains_key(&visited[0]));
+        assert_eq!(copy.changes.len(), 2);
+        let encoded = rmp_serde::to_vec(&copy.changes).unwrap();
+        let round_trip: ChangeMapInner = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(round_trip, copy.changes);
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
+
+        // Readers racing on clones made before first use must also decode
+        // once. Each reports its own thread-local count after the barrier.
+        let (concurrent, _) = decode_lazily(&frame, memory_source(&frame));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let snapshot = concurrent.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let before = decoded_on_this_thread();
+                    barrier.wait();
+                    assert_eq!(snapshot.changes.iter().count(), 3);
+                    decoded_on_this_thread() - before
+                })
+            })
+            .collect();
+        assert_eq!(
+            readers
+                .into_iter()
+                .map(|reader| reader.join().expect("history reader completes"))
+                .sum::<usize>(),
+            1,
+            "the decode gate is shared across snapshot clones"
+        );
+        assert!(concurrent.changes.is_decoded());
+    }
+
+    #[test]
+    fn indexed_file_history_refuses_overwrite_and_truncation() {
+        use std::io::{Seek, SeekFrom, Write};
+        let snapshot = a_snapshot_with_history(3);
+        let frame = encode_snapshot_without_admission_validation(&snapshot);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let source = HistorySource::File {
+            file: Arc::new(file.try_clone().unwrap()),
+            display: "indexed history test".into(),
+            frame_len: frame.len() as u64,
+        };
+        let (lazy, ids) = decode_lazily(&frame, source);
+        for id in &ids {
+            assert_eq!(
+                lazy.changes.read_change(id).unwrap().as_ref(),
+                snapshot.changes.get(id)
+            );
+        }
+        let before = decoded_on_this_thread();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&vec![0; frame.len()]).unwrap();
+        assert!(lazy.changes.read_change(&ids[0]).is_err());
+        file.set_len(0).unwrap();
+        assert!(lazy.changes.read_change(&ids[1]).is_err());
+        assert_eq!(decoded_on_this_thread(), before);
+        assert!(!lazy.changes.is_decoded());
     }
 }

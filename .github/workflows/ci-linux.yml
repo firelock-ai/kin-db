@@ -67,8 +67,8 @@ jobs:
           # release discovers.
           targets: x86_64-unknown-linux-musl
 
-      - name: Cache cargo registry and sources
-        uses: actions/cache@v6
+      - name: Restore cargo registry and sources cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -161,3 +161,17 @@ jobs:
           # dependency graph stops resolving it.
           cargo update -p libc --precise 0.2.186
           cargo check --workspace --all-targets --target x86_64-unknown-linux-musl
+
+      # Actions caches are scoped to the ref that saved them, so only main's
+      # cache is readable from every other ref. Every PR and merge-queue leg
+      # saving into its own private scope is what pushed this repo's cache
+      # past the 10 GB repo-wide cap and evicted main's own cache. Save only
+      # from main; every other ref just restores what main already saved.
+      - name: Save cargo registry and sources cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-linux-sources-${{ hashFiles('kin-db/**/Cargo.toml', 'kin-db/.cargo/config.toml') }}

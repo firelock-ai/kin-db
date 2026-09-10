@@ -2274,7 +2274,7 @@ pub(crate) struct RecoveredRepositoryAuthority {
     pub recovered: RecoveredSnapshot,
     pub reused_complete_validation: bool,
     /// Whether the change map was streamed through the caller's visitor and
-    /// left on disk. When this is false the visitor saw nothing and the
+    /// left encoded, with acknowledged frame changes appended. When this is false the visitor saw nothing and the
     /// snapshot's `changes` is decoded, so a caller that needs every change
     /// once reads it from the map instead.
     pub history_streamed: bool,
@@ -2324,8 +2324,8 @@ pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
 /// order the map stores them, and none is retained; the recovered snapshot's
 /// `changes` decodes itself the first time a reader asks for an entry. When
 /// the base cannot be decoded that way, because the backend kept no file
-/// handle, the journal is not empty, or no durable validation names these
-/// exact bytes, recovery decodes the whole body exactly as the plain entry
+/// handle, or the journal contains legacy graph deltas, recovery decodes the
+/// whole body exactly as the plain entry
 /// point does and the visitor is never called, which
 /// [`RecoveredRepositoryAuthority::history_streamed`] reports.
 pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + ?Sized>(
@@ -2342,14 +2342,14 @@ pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + 
     )
 }
 
-/// How recovery decodes a journal-free base that a durable validation names.
+/// How recovery decodes a base, independently of complete-validation reuse.
 pub(crate) enum HistoryDecode<'v> {
     /// The whole body, change map included, as every open did before
     /// FIR-3064.
     Eager,
     /// Every other element decoded, the change map streamed once through the
     /// visitor and left on disk. Falls back to `Eager` when the backend has no
-    /// file to hand back or the base is not journal-free and proven.
+    /// file to hand back or the journal contains legacy graph deltas.
     Streamed(&'v mut dyn FnMut(&kin_model::SemanticChange) -> Result<(), KinDbError>),
 }
 
@@ -2402,7 +2402,7 @@ pub(crate) fn recover_snapshot_from_state(
     authority: &SnapshotAuthority,
     raw_deltas: &[PersistedDelta],
     expected_validator_version: Option<u32>,
-    history: HistoryDecode<'_>,
+    mut history: HistoryDecode<'_>,
 ) -> Result<RecoveredRepositoryAuthority, KinDbError> {
     if authority.snapshot_generation > authority.head_generation {
         return Err(KinDbError::StorageError(format!(
@@ -2440,13 +2440,15 @@ pub(crate) fn recover_snapshot_from_state(
         let mut history_streamed = false;
         let snapshot = match (
             reused_complete_validation,
-            history,
+            &mut history,
             &authority.snapshot_source,
         ) {
-            (true, HistoryDecode::Streamed(visit_change), Some(source)) => {
-                let _span =
-                    tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation_streamed")
-                        .entered();
+            (_, HistoryDecode::Streamed(visit_change), Some(source)) => {
+                let _span = tracing::info_span!(
+                    "kindb.snapshot.decode_streamed",
+                    reused_complete_validation
+                )
+                .entered();
                 let frame_len = u64::try_from(authority.snapshot_bytes.len()).map_err(|_| {
                     KinDbError::StorageError(format!(
                         "repo {repo_id} snapshot length does not fit u64"
@@ -2459,8 +2461,16 @@ pub(crate) fn recover_snapshot_from_state(
                         display: source.display.clone(),
                         frame_len,
                     },
-                    visit_change,
+                    &mut |change| {
+                        if !reused_complete_validation {
+                            crate::storage::change_validation::validate_semantic_change(change)?;
+                        }
+                        visit_change(change)
+                    },
                 )?;
+                if !reused_complete_validation {
+                    snapshot.validate_storage_admission()?;
+                }
                 history_streamed = true;
                 snapshot
             }
@@ -2650,9 +2660,40 @@ pub(crate) fn recover_snapshot_from_state(
             // validates the reconstructed head, and every base change and every
             // envelope entry the frames carry forward is inside that head, so a
             // separate pass over the base would prove nothing more.
+            let history_streamed = matches!(&history, HistoryDecode::Streamed(_))
+                && authority.snapshot_source.is_some();
             let mut snapshot = {
                 let _span = tracing::info_span!("kindb.snapshot.decode_journal_base").entered();
-                GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+                match (&mut history, &authority.snapshot_source) {
+                    (HistoryDecode::Streamed(visit_change), Some(source)) => {
+                        let frame_len =
+                            u64::try_from(authority.snapshot_bytes.len()).map_err(|_| {
+                                KinDbError::StorageError(format!(
+                                    "repo {repo_id} snapshot length does not fit u64"
+                                ))
+                            })?;
+                        GraphSnapshot::from_bytes_with_encoded_history(
+                            &authority.snapshot_bytes,
+                            crate::storage::change_map::HistorySource::File {
+                                file: std::sync::Arc::clone(&source.file),
+                                display: source.display.clone(),
+                                frame_len,
+                            },
+                            &mut |change| {
+                                if !reused_complete_validation {
+                                    crate::storage::change_validation::validate_semantic_change(
+                                        change,
+                                    )?;
+                                }
+                                visit_change(change)
+                            },
+                        )?
+                        .0
+                    }
+                    _ => GraphSnapshot::from_bytes_reusing_exact_validation(
+                        &authority.snapshot_bytes,
+                    )?,
+                }
             };
             if snapshot.repository_authority.is_none() {
                 return Err(KinDbError::StorageError(format!(
@@ -2672,6 +2713,13 @@ pub(crate) fn recover_snapshot_from_state(
                         "repo {repo_id} authority frame at generation {generation} does not apply: {error}"
                     ))
                 })?;
+                if history_streamed {
+                    if let HistoryDecode::Streamed(visit_change) = &mut history {
+                        for change in &frame.changes {
+                            visit_change(change)?;
+                        }
+                    }
+                }
             }
             if !reused_complete_validation {
                 let _span = tracing::info_span!("kindb.snapshot.validate_journal_head").entered();
@@ -2690,7 +2738,7 @@ pub(crate) fn recover_snapshot_from_state(
                     journal_sha256: Some(journal_sha256),
                 },
                 reused_complete_validation,
-                history_streamed: false,
+                history_streamed,
                 payload_stats,
             })
         }
@@ -2887,6 +2935,21 @@ pub trait StorageBackend: Send + Sync {
             validator_version,
         );
         Ok(false)
+    }
+
+    /// Read only a prepared artifact's binding for an optional refusal preflight.
+    ///
+    /// A binding can rule an artifact out, but cannot authorize its payload.
+    /// Callers must still load and validate the complete artifact after a
+    /// matching preflight. `Ok(None)` means no preflight is available and the
+    /// caller must use the ordinary complete-artifact path.
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let _ = (repo_id, workspace_id);
+        Ok(None)
     }
 
     /// Load the durable prepared query-graph artifact for one workspace.
@@ -6062,12 +6125,17 @@ impl LocalFileBackend {
         })
     }
 
-    /// Whether taking the repository authority lock at `access` would block
+    /// Whether taking the exclusive repository authority lock would block
     /// right now, against the same lock target a real acquisition uses.
     ///
     /// This is how the exclusion property is asserted without a stopwatch:
     /// a blocking acquisition can only be observed by waiting for it, and a
     /// wait that is long enough to mean something is long enough to be flaky.
+    #[cfg(test)]
+    pub(crate) fn repository_writer_would_block(&self, repo_id: &str) -> Result<bool, KinDbError> {
+        self.repository_lock_would_block(repo_id, LocalRepositoryLockAccess::Exclusive)
+    }
+
     #[cfg(test)]
     fn repository_lock_would_block(
         &self,
@@ -6148,9 +6216,24 @@ impl LocalFileBackend {
         &self,
         repo_id: &str,
     ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
+        self.freeze_existing_authority_with_cleanup(repo_id, true)
+    }
+
+    pub(crate) fn freeze_existing_authority_read_only(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
+        self.freeze_existing_authority_with_cleanup(repo_id, false)
+    }
+
+    fn freeze_existing_authority_with_cleanup(
+        &self,
+        repo_id: &str,
+        cleanup: bool,
+    ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self
-            .load_authority_unlocked(&lock.namespace)?
+            .load_authority_with_cleanup_unlocked(&lock.namespace, cleanup)?
             .ok_or_else(|| {
                 KinDbError::StorageError(format!(
                     "repo {repo_id} has no existing local snapshot authority to freeze"
@@ -6158,7 +6241,7 @@ impl LocalFileBackend {
             })?;
         let frames = if authority.snapshot_generation != authority.head_generation {
             let record = self
-                .read_authority_record_unlocked(&lock.namespace)?
+                .read_authority_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
                 .ok_or_else(|| {
                     KinDbError::StorageError(format!(
                         "repo {repo_id} has no existing local snapshot authority to freeze"
@@ -6656,6 +6739,15 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
+        self.validate_retired_quarantines_unlocked(namespace, record, true)
+    }
+
+    fn validate_retired_quarantines_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        record: &LocalAuthorityRecord,
+        cleanup: bool,
+    ) -> Result<(), KinDbError> {
         let repo_id = &namespace.repo_id;
         let Some(deltas) = namespace.surface(Self::deltas_surface_name(), false)? else {
             return Ok(());
@@ -6679,8 +6771,14 @@ impl LocalFileBackend {
                 )));
             }
         }
-        for artifact in &quarantined {
-            delete_quarantined_delta_exact_at(&deltas.directory, artifact, &deltas.display_path)?;
+        if cleanup {
+            for artifact in &quarantined {
+                delete_quarantined_delta_exact_at(
+                    &deltas.directory,
+                    artifact,
+                    &deltas.display_path,
+                )?;
+            }
         }
         namespace.confirm_surface_visible(&deltas)?;
         Ok(())
@@ -6944,12 +7042,25 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
+        self.read_authority_record_raw_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn read_authority_record_raw_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
         let relative = Self::authority_relative_path();
         let path = namespace.display(relative);
         if !namespace.exists(relative)? {
             return Ok(None);
         }
-        mmap::confirm_installed_write_at(&namespace.directory, relative, &namespace.display_path)?;
+        mmap::confirm_installed_write_at(
+            &namespace.directory,
+            relative,
+            &namespace.display_path,
+            cleanup,
+        )?;
         let bytes = namespace.read_regular_bounded(relative, "local authority", 1024 * 1024)?;
         Self::decode_authority_record(&namespace.repo_id, &path, &bytes).map(Some)
     }
@@ -7004,7 +7115,15 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
-        let record = self.read_authority_record_raw_unlocked(namespace)?;
+        self.read_authority_record_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn read_authority_record_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
+        let record = self.read_authority_record_raw_with_cleanup_unlocked(namespace, cleanup)?;
         let Some(record) = record else {
             return Ok(None);
         };
@@ -7112,8 +7231,17 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        self.load_authority_with_cleanup_unlocked(namespace, true)
+    }
+
+    fn load_authority_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
         let repo_id = &namespace.repo_id;
-        let Some(record) = self.read_authority_record_unlocked(namespace)? else {
+        let Some(record) = self.read_authority_record_with_cleanup_unlocked(namespace, cleanup)?
+        else {
             let quarantines = match namespace.surface(Self::deltas_surface_name(), false)? {
                 Some(deltas) => {
                     let quarantines =
@@ -7150,11 +7278,13 @@ impl LocalFileBackend {
             })?;
         // Cleanup is downstream of both authority-directory durability and
         // exact authoritative payload verification.
-        self.finalize_retired_quarantines_unlocked(namespace, &record)?;
-        if let Err(error) =
-            self.clear_superseded_snapshots_unlocked(namespace, record.snapshot_generation)
-        {
-            tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+        self.validate_retired_quarantines_unlocked(namespace, &record, cleanup)?;
+        if cleanup {
+            if let Err(error) =
+                self.clear_superseded_snapshots_unlocked(namespace, record.snapshot_generation)
+            {
+                tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+            }
         }
         namespace.confirm_surface_visible(&snapshots)?;
         self.confirm_repository_visible(namespace)?;
@@ -8831,6 +8961,26 @@ impl StorageBackend for LocalFileBackend {
     /// against a caller that materializes while holding a local authority
     /// freeze, since `flock` blocks a second acquisition from the same
     /// process.
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
+            return Ok(None);
+        };
+        let Some(prepared) = namespace.surface(Self::prepared_surface_name(), false)? else {
+            return Ok(None);
+        };
+        if !prepared.exists(&binding_leaf)? {
+            return Ok(None);
+        }
+        let binding = prepared.read_regular(&binding_leaf, "local prepared workspace binding")?;
+        namespace.confirm_surface_visible(&prepared)?;
+        Ok(Some(binding))
+    }
+
     fn load_prepared_workspace_graph(
         &self,
         repo_id: &str,
@@ -9006,6 +9156,35 @@ impl StorageBackend for LocalFileBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unproven_local_recovery_keeps_history_encoded_without_reusing_validation() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("streamed", &bytes, GENERATION_INIT)
+            .unwrap();
+        let mut seen = 0;
+        let recovered =
+            load_recovered_repository_authority_streaming(&backend, "streamed", 1, &mut |_| {
+                seen += 1;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(recovered.history_streamed);
+        assert!(!recovered.reused_complete_validation);
+        assert!(!recovered.recovered.snapshot.changes.is_decoded());
+        assert_eq!(seen, 0);
+        recovered
+            .recovered
+            .snapshot
+            .validate_storage_admission()
+            .unwrap();
+        assert!(!recovered.recovered.snapshot.changes.is_decoded());
+        assert_eq!(recovered.recovered.snapshot.to_bytes().unwrap(), bytes);
+    }
 
     #[cfg(unix)]
     fn copy_test_directory(source: &Path, destination: &Path) {
@@ -12155,6 +12334,83 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_prepared_binding_does_not_load_the_payload() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+        assert!(backend
+            .load_prepared_workspace_graph_binding("missing", workspace)
+            .unwrap()
+            .is_none());
+        assert!(
+            !dir.path().join("missing").exists(),
+            "a read must not initialize a repository"
+        );
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let artifact = prepared_fixture(br#"{"generation":7}"#, b"prepared payload");
+        backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap();
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(artifact.clone())
+        );
+
+        let payload = backend
+            .prepared_dir("test-repo")
+            .join(format!("{workspace}.kpqg"));
+        std::fs::remove_file(&payload).unwrap();
+        std::fs::create_dir(&payload).unwrap();
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph_binding("test-repo", workspace)
+                .unwrap(),
+            Some(artifact.binding),
+            "binding preflight must not try to read a non-file payload"
+        );
+        assert!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .is_err(),
+            "the ordinary full read must detect the unreadable payload"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_backend_prepared_binding_refuses_symlinks_and_invalid_names() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+        let artifact = prepared_fixture(br#"{"generation":7}"#, b"prepared payload");
+        backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap();
+        let binding = backend
+            .prepared_dir("test-repo")
+            .join(format!("{workspace}.kpqg.json"));
+        let outside = dir.path().join("outside-binding");
+        std::fs::write(&outside, &artifact.binding).unwrap();
+        assert!(backend
+            .load_prepared_workspace_graph_binding("test-repo", workspace)
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(&binding).unwrap();
+        std::os::unix::fs::symlink(&outside, &binding).unwrap();
+        assert!(backend
+            .load_prepared_workspace_graph_binding("test-repo", workspace)
+            .is_err());
+        for invalid in ["../outside-binding", "UPPERCASE", "a/b"] {
+            assert!(backend
+                .load_prepared_workspace_graph_binding("test-repo", invalid)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn local_backend_prepared_workspace_graph_roundtrip() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
@@ -12241,15 +12497,17 @@ mod tests {
             let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
             let recorded =
                 worker.record_prepared_workspace_graph("test-repo", workspace, &artifact);
+            let binding = worker.load_prepared_workspace_graph_binding("test-repo", workspace);
             let loaded = worker.load_prepared_workspace_graph("test-repo", workspace);
-            let _ = sender.send((recorded, loaded));
+            let _ = sender.send((recorded, binding, loaded));
         });
-        let (recorded, loaded) = receiver
+        let (recorded, binding, loaded) = receiver
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("prepared state must not wait on the repository lock");
         drop(held);
 
         assert!(recorded.unwrap());
+        assert!(binding.unwrap().is_some());
         assert!(loaded.unwrap().is_some());
     }
 
@@ -13305,6 +13563,17 @@ mod tests {
             })
             .collect();
         assert_eq!(quarantined.len(), 1);
+
+        let old_snapshot = backend.versioned_snapshot_path(repo_id, gen1);
+        let old_bytes = base.to_bytes().unwrap();
+        std::fs::write(&old_snapshot, &old_bytes).unwrap();
+        let quarantine_bytes = std::fs::read(&quarantined[0]).unwrap();
+        let frozen = backend
+            .freeze_existing_authority_read_only(repo_id)
+            .unwrap();
+        assert_eq!(std::fs::read(&old_snapshot).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&quarantined[0]).unwrap(), quarantine_bytes);
+        drop(frozen);
 
         let reopened = LocalFileBackend::new(dir.path());
         let recovered = load_recovered_snapshot(&reopened, repo_id)

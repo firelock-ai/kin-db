@@ -476,10 +476,66 @@ fn derive_entity_revisions_across_history(
         }
     }
 
+    derive_entity_revisions_from_records(ordered.into_iter().map(Ok), pending_children)
+}
+
+/// Traverse compact parent metadata in the same order as the eager history
+/// walk, retaining only one decoded change body during revision derivation.
+fn derive_indexed_entity_revisions(
+    changes: &crate::storage::change_map::ChangeMap,
+) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
+    let mut ids = changes.change_ids()?;
+    ids.sort_by_key(|id| id.to_string());
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::with_capacity(ids.len());
+    let mut pending_children = HashMap::new();
+    enum Frame {
+        Visit(SemanticChangeId),
+        Emit(SemanticChangeId),
+    }
+    for id in ids {
+        let mut stack = vec![Frame::Visit(id)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Visit(id) => {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    let Some(parents) = changes.change_parents(&id)? else {
+                        continue;
+                    };
+                    if let Some(parent) = parents.first() {
+                        *pending_children.entry(*parent).or_insert(0) += 1;
+                    }
+                    stack.push(Frame::Emit(id));
+                    for parent in parents.into_iter().rev() {
+                        stack.push(Frame::Visit(parent));
+                    }
+                }
+                Frame::Emit(id) => ordered.push(id),
+            }
+        }
+    }
+    derive_entity_revisions_from_records(
+        ordered.into_iter().map(|id| {
+            changes
+                .read_change(&id)?
+                .ok_or_else(|| KinDbError::StorageError(format!("history record {id} missing")))
+        }),
+        pending_children,
+    )
+}
+
+fn derive_entity_revisions_from_records<C: std::borrow::Borrow<SemanticChange>>(
+    ordered: impl IntoIterator<Item = Result<C, KinDbError>>,
+    mut pending_children: HashMap<SemanticChangeId, usize>,
+) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
     let mut states: HashMap<SemanticChangeId, LineageEntities> = HashMap::new();
     let mut revisions: HashMap<EntityId, Vec<EntityRevision>> = HashMap::new();
 
     for change in ordered {
+        let change = change?;
+        let change = change.borrow();
         let change_id = change.id;
         // The last child to read a parent takes ownership of its state, so a
         // linear history moves one map forward rather than copying the whole
@@ -1520,6 +1576,18 @@ where
     V: Clone + serde::Serialize,
     F: Fn(&V) -> K,
 {
+    // An unchanged value leaves the delta exactly as it already stands, and
+    // that has to be settled before the key is cleared out of `added` below.
+    // Clearing first and returning here afterwards left the key with no entry
+    // at all: it dropped a creation this delta had made, and it reduced a
+    // modification this delta had made to the bare removal of the base value,
+    // which replays as a deletion of a record that exists.
+    if let Some(ref old) = old {
+        if delta_values_equal(old, &new) {
+            return;
+        }
+    }
+
     let new_key = key_of(&new);
     delta.added.retain(|existing| key_of(existing) != new_key);
 
@@ -1540,9 +1608,6 @@ where
     }
 
     if let Some(old) = old {
-        if delta_values_equal(&old, &new) {
-            return;
-        }
         if !delta
             .removed
             .iter()
@@ -2568,13 +2633,17 @@ impl InMemoryGraph {
         }
         if snapshot.entity_revisions.is_empty() && !snapshot.changes.is_empty() {
             let _span = tracing::info_span!(
-                "kindb.graph.derive_entity_revisions",
+                "kindb.graph.validate_history",
                 changes = snapshot.changes.len()
             )
             .entered();
-            derive_entity_revisions_across_history(topologically_order_changes(
-                snapshot.changes.iter(),
-            ))?;
+            // Revision construction can fail only on the same entity
+            // transitions this replay validates. Its revision output is not
+            // consumed by this proof, so retain one replay state instead.
+            crate::storage::history_replay::validate_first_parent_history(
+                &snapshot.changes,
+                &snapshot.changes.change_ids()?,
+            )?;
         }
         Ok(())
     }
@@ -2753,7 +2822,7 @@ impl InMemoryGraph {
                     changes = changes.len()
                 )
                 .entered();
-                derive_entity_revisions_across_history(topologically_order_changes(changes.iter()))?
+                derive_indexed_entity_revisions(&changes)?
             } else {
                 entity_revisions.into_iter().collect()
             };
@@ -4003,8 +4072,11 @@ impl InMemoryGraph {
 
     /// Return the exact authority digest that persisted lexical/vector
     /// sidecars must match before they can answer queries.
+    ///
+    /// Reads the served retrieval domains under their read lock without
+    /// exporting a snapshot or copying change history and annotation stores.
     #[cfg(any(feature = "vector", test))]
-    pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
+    pub fn retrieval_authority_hash(&self) -> [u8; 32] {
         let ent = self.entities.read();
         self.flush_merkle(&ent);
         let graph_root_hash = self.merkle.read().root_hash();
@@ -9395,18 +9467,17 @@ impl ChangeStore for InMemoryGraph {
     fn get_entity_history(&self, id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
         let chg = self.changes.read();
         // Find all changes that mention this entity in their deltas
-        let mut history: Vec<SemanticChange> = chg
-            .changes
-            .values()
-            .filter(|change| {
-                change.entity_deltas.iter().any(|delta| match delta {
-                    EntityDelta::Added { new } => new.id == *id,
-                    EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
-                    EntityDelta::Removed { old } => old.id == *id,
-                })
-            })
-            .cloned()
-            .collect();
+        let mut history = Vec::new();
+        chg.changes.visit_changes(|change| {
+            if change.entity_deltas.iter().any(|delta| match delta {
+                EntityDelta::Added { new } => new.id == *id,
+                EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
+                EntityDelta::Removed { old } => old.id == *id,
+            }) {
+                history.push(change.clone());
+            }
+            Ok(())
+        })?;
         // Sort by timestamp ascending
         history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         Ok(history)
@@ -9424,8 +9495,8 @@ impl ChangeStore for InMemoryGraph {
         let mut stack = vec![*a];
         while let Some(cid) = stack.pop() {
             if ancestors_a.insert(cid) {
-                if let Some(change) = chg.changes.get(&cid) {
-                    stack.extend_from_slice(&change.parents);
+                if let Some(parents) = chg.changes.change_parents(&cid)? {
+                    stack.extend(parents);
                 }
             }
         }
@@ -9444,8 +9515,8 @@ impl ChangeStore for InMemoryGraph {
                 // Don't traverse further past a merge base
                 continue;
             }
-            if let Some(change) = chg.changes.get(&cid) {
-                for parent in &change.parents {
+            if let Some(parents) = chg.changes.change_parents(&cid)? {
+                for parent in &parents {
                     queue.push_back((*parent, depth + 1));
                 }
             }
@@ -9473,13 +9544,15 @@ impl ChangeStore for InMemoryGraph {
         let entities_lock_ms = timer.lap_ms();
         let mut chg = self.changes.write();
         let changes_lock_ms = timer.lap_ms();
-        if let Some(existing) = chg.changes.get(&change.id) {
-            if semantic_change_payload(existing)? == payload {
+        if let Some(existing) = chg.changes.read_change(&change.id)? {
+            if semantic_change_payload(&existing)? == payload {
                 return Ok(());
             }
             return Err(KinDbError::DuplicateChange(change.id.to_string()));
         }
 
+        let mut next_changes = chg.changes.clone();
+        next_changes.append_change(change.clone())?;
         // Revisions, child edges, and the change payload are one durable
         // mutation. Keep the pending-delta lock for the entire authority
         // transition so a concurrent persistence detach cannot split them
@@ -9522,7 +9595,7 @@ impl ChangeStore for InMemoryGraph {
             );
         }
 
-        chg.changes.insert(change.id, change.clone());
+        chg.changes = next_changes;
         delta_map_upsert(&mut pending.delta.changes, change.id, change.clone());
         let pending_entity_revisions = pending.delta.entity_revisions.added.len()
             + pending.delta.entity_revisions.modified.len();
@@ -9575,7 +9648,7 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
-        Ok(self.changes.read().changes.get(id).cloned())
+        self.changes.read().changes.read_change(id)
     }
 
     fn get_changes_since(
@@ -9594,9 +9667,9 @@ impl ChangeStore for InMemoryGraph {
             if cid == *base || !visited.insert(cid) {
                 continue;
             }
-            if let Some(change) = chg.changes.get(&cid) {
-                result.push(change.clone());
+            if let Some(change) = chg.changes.read_change(&cid)? {
                 stack.extend_from_slice(&change.parents);
+                result.push(change);
             }
         }
 
@@ -9724,8 +9797,8 @@ impl InMemoryGraph {
         let mut unique_changes = Vec::with_capacity(validated.len());
         let mut batch_payloads = HashMap::new();
         for (change, payload) in validated {
-            if let Some(existing) = chg.changes.get(&change.id) {
-                if semantic_change_payload(existing)? == payload {
+            if let Some(existing) = chg.changes.read_change(&change.id)? {
+                if semantic_change_payload(&existing)? == payload {
                     continue;
                 }
                 return Err(KinDbError::DuplicateChange(change.id.to_string()));
@@ -9741,6 +9814,11 @@ impl InMemoryGraph {
         }
         if unique_changes.is_empty() {
             return Ok(());
+        }
+
+        let mut next_changes = chg.changes.clone();
+        for change in &unique_changes {
+            next_changes.append_change(change.clone())?;
         }
 
         let mut pending = self.pending_delta.lock();
@@ -9781,9 +9859,9 @@ impl InMemoryGraph {
             // The pending delta and live graph both own the change. Clone once
             // for the delta, then move the original into the graph.
             pending_changes.push((change_id, change.clone()));
-            chg.changes.insert(change_id, change);
         }
 
+        chg.changes = next_changes;
         delta_map_upsert_batch(&mut pending.delta.changes, pending_changes);
 
         // Sequential create_change updates the same pending-delta entry on
@@ -15698,8 +15776,27 @@ mod tests {
         let mut snapshot = graph.to_snapshot();
         snapshot.entity_revisions.clear();
 
-        let reloaded = InMemoryGraph::from_snapshot(snapshot)
+        let expected = derive_entity_revisions_across_history(topologically_order_changes(
+            snapshot.changes.iter(),
+        ))
+        .unwrap();
+        let bytes = snapshot.to_bytes().unwrap();
+        let source =
+            crate::storage::change_map::HistorySource::Memory(std::sync::Arc::from(bytes.clone()));
+        let (indexed, _) =
+            GraphSnapshot::from_bytes_with_encoded_history(&bytes, source, &mut |_| Ok(()))
+                .unwrap();
+        let history = indexed.changes.clone();
+        assert!(!history.is_decoded());
+        let decoded_before = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        assert_eq!(derive_indexed_entity_revisions(&history).unwrap(), expected);
+        let reloaded = InMemoryGraph::from_snapshot(indexed)
             .expect("merge history must reload without a stale-payload refusal");
+        assert!(!history.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decoded_before,
+        );
         let repaired = reloaded.to_snapshot();
         let revisions = repaired
             .entity_revisions
@@ -17033,6 +17130,144 @@ mod tests {
         let fetched = graph.get_shallow_file(&sf2.file_id).unwrap().unwrap();
         assert_eq!(fetched.file_id, sf2.file_id);
         assert_eq!(fetched.declaration_count, sf2.declaration_count);
+    }
+
+    /// Writing the same value twice inside one pending delta must leave the
+    /// delta's own record of the creation in place.
+    ///
+    /// The function used to clear the key out of `added` before it checked
+    /// whether the value had changed, so the identical second write took the
+    /// entry out and the equality early return left it out.
+    #[test]
+    fn identical_reupsert_keeps_the_pending_creation() {
+        let graph = InMemoryGraph::new();
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("src/created.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256::from_bytes([0x41; 32]),
+            signature_hash: None,
+            declaration_names: vec!["created".into()],
+            import_paths: vec!["std::fmt".into()],
+        };
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_shallow_file(&shallow).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the creation must still be pending after an identical re-upsert");
+        assert_eq!(
+            pending.shallow_files.added.len(),
+            1,
+            "an identical re-upsert must not drop the creation this delta made"
+        );
+        assert_eq!(pending.shallow_files.added[0].file_id, shallow.file_id);
+        assert_eq!(pending.shallow_files.added[0].declaration_count, 2);
+        assert!(pending.shallow_files.removed.is_empty());
+    }
+
+    /// The same reordering, on the shape that loses more: a record the delta
+    /// modifies keeps both halves, so replay writes the new value instead of
+    /// deleting the base one.
+    #[test]
+    fn identical_reupsert_keeps_the_pending_modification() {
+        let graph = InMemoryGraph::new();
+        let base = ShallowTrackedFile {
+            file_id: FilePathId::new("src/modified.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 3,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x42; 32]),
+            signature_hash: None,
+            declaration_names: vec!["before".into()],
+            import_paths: Vec::new(),
+        };
+        let modified = ShallowTrackedFile {
+            declaration_count: 9,
+            declaration_names: vec!["after".into()],
+            ..base.clone()
+        };
+        admit_enrichment(&graph, &base.file_id, base.syntax_hash);
+        graph.upsert_shallow_file(&base).unwrap();
+        // Everything above is the persistence base this delta is measured from.
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the modification must still be pending after an identical re-upsert");
+        assert_eq!(
+            pending.shallow_files.added.len(),
+            1,
+            "an identical re-upsert must not reduce a modification to a bare removal"
+        );
+        assert_eq!(pending.shallow_files.added[0].declaration_count, 9);
+        assert_eq!(pending.shallow_files.removed.len(), 1);
+        assert_eq!(pending.shallow_files.removed[0].declaration_count, 3);
+    }
+
+    /// The mirror on the removed set: after an identical re-upsert, removing
+    /// the record still records the removal of the value the base holds, and
+    /// removing a record this delta created still nets out to nothing.
+    #[test]
+    fn removal_after_an_identical_reupsert_records_the_base_removal() {
+        let graph = InMemoryGraph::new();
+        let base = ShallowTrackedFile {
+            file_id: FilePathId::new("src/removed.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 4,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x43; 32]),
+            signature_hash: None,
+            declaration_names: vec!["before".into()],
+            import_paths: Vec::new(),
+        };
+        let modified = ShallowTrackedFile {
+            declaration_count: 11,
+            ..base.clone()
+        };
+        let created = ShallowTrackedFile {
+            file_id: FilePathId::new("src/created-then-removed.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x44; 32]),
+            signature_hash: None,
+            declaration_names: vec!["transient".into()],
+            import_paths: Vec::new(),
+        };
+        admit_enrichment(&graph, &base.file_id, base.syntax_hash);
+        admit_enrichment(&graph, &created.file_id, created.syntax_hash);
+        graph.upsert_shallow_file(&base).unwrap();
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.delete_shallow_file(&base.file_id).unwrap();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.delete_shallow_file(&created.file_id).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("removing the base value is itself a pending change");
+        assert!(
+            pending.shallow_files.added.is_empty(),
+            "neither removal may leave a pending add behind"
+        );
+        assert_eq!(
+            pending.shallow_files.removed.len(),
+            1,
+            "only the record the base holds is removed on replay"
+        );
+        assert_eq!(pending.shallow_files.removed[0].file_id, base.file_id);
+        assert_eq!(pending.shallow_files.removed[0].declaration_count, 4);
     }
 
     #[test]

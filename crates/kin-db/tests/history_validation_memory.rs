@@ -1,47 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! What opening a persisted authority holds while it decodes one.
-//!
-//! An authority open reads the persisted snapshot, hashes it, and decodes it
-//! into owned structures. The decode is the whole point; the bytes it decodes
-//! from are not, and they used to be read onto the heap first, so a whole
-//! second copy of the store stood beside the graph for exactly as long as the
-//! decode ran. That is the moment an open is at its highest, which makes the
-//! transient the ceiling rather than a detail.
-//!
-//! Measured on the full VS Code tree, 18,508 files admitted as one commit into
-//! a 3.59 GiB store: the open peaked at 9.81 GiB, of which 3.61 GiB was the
-//! byte buffer and 6.20 GiB the graph it decoded. The bytes came back the
-//! instant recovery returned. `kin init` performs this open on the store it has
-//! just written, so on a conversion the term lands on top of everything the
-//! admission ladder still holds (FIR-3064).
-//!
-//! The answer is that a backend holding the snapshot in a file hands back a
-//! mapping rather than a copy. Nothing above it changes: the digest and the
-//! decoder both read a slice, and the mapping is read-only and opened through
-//! the same `nofollow` capability the copying read used.
-//!
-//! Live heap rather than resident set, for the reason the sibling guards give:
-//! resident set keeps counting memory the allocator has freed and not returned,
-//! so it moves with the platform, while live heap moves when and only when the
-//! code holds differently. A mapping is not heap at all, which is exactly the
-//! property being asserted.
-//!
-//! The ceiling is charged against what the open RETAINS, so the decoded graph
-//! is subtracted rather than priced: this guard is about the copy beside the
-//! decode, and putting the decode itself into the number would let a change
-//! that shrank the graph hide a byte buffer that came back.
-//!
-//! This file is its own test binary and holds one test on purpose. The counters
-//! below are process-global, so a second test running beside this one would be
-//! measured into it.
+//! Full history validation selects identities without retaining duplicate change payloads.
+//! One test owns the process-wide allocator counters.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, VersionedAuthorityState};
+use kin_db::{
+    LocalFileBackend, RepositoryAuthorityManager, StorageBackend, VersionedAuthorityState,
+};
 use kin_model::{
     compute_semantic_change_id, AdmissionPolicyDelta, AuthorId, ChangeOrigin, Entity, EntityDelta,
     EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256,
@@ -120,11 +89,11 @@ fn peak_growth_since(floor: usize) -> usize {
 
 /// Enough history that the persisted snapshot is worth measuring a copy of
 /// rather than lost in the harness's own allocation.
-const COMMITS: usize = 800;
+const COMMITS: usize = 96;
 
-/// Documentation bytes per change, so the change map is the dominant term the
+/// Message bytes per change, so the change map is the dominant term the
 /// way a converted repository's is.
-const CHANGE_PAYLOAD_BYTES: usize = 32_768;
+const CHANGE_PAYLOAD_BYTES: usize = 131_072;
 
 fn fixed_timestamp() -> Timestamp {
     Timestamp(
@@ -156,7 +125,7 @@ fn measurement_entity(index: usize) -> Entity {
         signature: format!("fn {name}()"),
         visibility: Visibility::Public,
         role: EntityRole::Source,
-        doc_summary: Some(format!("{name} ").repeat(CHANGE_PAYLOAD_BYTES / 8)),
+        doc_summary: None,
         metadata: EntityMetadata::default(),
         lineage_parent: None,
         created_in: None,
@@ -173,8 +142,9 @@ fn history_chain(commits: usize, shared: &SharedAdmissionPolicy) -> Vec<Semantic
             origin: ChangeOrigin::Native,
             parents: parent.into_iter().collect(),
             timestamp: fixed_timestamp(),
-            author: AuthorId::new("fir3064-measurement"),
-            message: format!("synthetic converted commit {index}"),
+            author: AuthorId::new("history-validation-measurement"),
+            message: format!("synthetic converted commit {index}: ")
+                + &"history ".repeat(CHANGE_PAYLOAD_BYTES / 8),
             entity_deltas: vec![EntityDelta::Added {
                 new: measurement_entity(index),
             }],
@@ -209,7 +179,7 @@ fn publish_bootstrap(directory: &std::path::Path, repository: &RepositoryId) {
         repository_id: repository.clone(),
         expected_generation: lease.generation(),
         expected_roots: lease.roots().clone(),
-        actor: AuthorId::new("fir3064-measurement"),
+        actor: AuthorId::new("history-validation-measurement"),
         reason: "synthetic whole-history bootstrap".to_string(),
         external_objects: Vec::new(),
         git_authority_delta: None,
@@ -233,66 +203,93 @@ fn publish_bootstrap(directory: &std::path::Path, repository: &RepositoryId) {
     );
 }
 
-// --- the guard ------------------------------------------------------------
-
-/// Copies of the persisted snapshot an open may hold on top of the graph it
-/// decodes and keeps.
-///
-/// Set from measurement on this fixture, not from taste. Reading the snapshot
-/// into a `Vec` before decoding it measures about 1.0 copies, because the
-/// buffer lives for the whole decode and is dropped the moment recovery
-/// returns. Mapping it measures about 0.0, because nothing it allocates scales
-/// with the store.
-///
-/// 0.5 sits halfway between the two, so it fails the whole regression and has
-/// no room to pass a partial one: there is no half-measure between a copy and a
-/// mapping.
-const OPEN_TRANSIENT_COPIES: f64 = 0.5;
-
-/// Opening an authority must not hold a copy of the store beside the graph.
-#[test]
-fn opening_an_authority_does_not_hold_the_snapshot_beside_the_graph() {
-    let directory = tempfile::tempdir().expect("scratch store");
-    let repository = RepositoryId::new("fir3064-measurement").expect("repository id");
-    publish_bootstrap(directory.path(), &repository);
-
-    // A fresh backend, so the measured open recovers from the file rather than
-    // from anything the publishing manager still held.
-    let backend = Arc::new(LocalFileBackend::new(directory.path()));
-
+fn transient_copies<T>(name: &str, bytes: usize, run: impl FnOnce() -> T) -> (T, f64) {
     let floor = arm_peak();
-    let (manager, payload) =
-        RepositoryAuthorityManager::open_with_payload_stats(repository.clone(), backend)
-            .expect("the published authority reopens");
-    let growth = peak_growth_since(floor);
+    let value = run();
+    let peak = peak_growth_since(floor);
     let retained = live_bytes().saturating_sub(floor);
-
-    let snapshot_bytes = payload
-        .expect("a persisted authority reports its payload")
-        .snapshot_bytes() as usize;
+    let transient = peak.saturating_sub(retained);
+    let copies = transient as f64 / bytes as f64;
+    println!("{name}: history={bytes} peak={peak} retained={retained} transient={transient} copies={copies:.3}");
     assert!(
-        snapshot_bytes > 8_000_000,
-        "the fixture's store must be large enough to price a copy of it, got {snapshot_bytes} bytes"
+        peak < bytes / 2,
+        "{name} retained or transiently decoded the complete history: peak={peak}, history={bytes}"
     );
-    assert_eq!(
-        manager.read_authority().generation(),
-        1,
-        "the reopened authority must carry the published generation, or this measured an open \
-         that did not happen"
-    );
+    (value, copies)
+}
 
-    let transient = growth.saturating_sub(retained);
-    let copies = transient as f64 / snapshot_bytes as f64;
-    println!(
-        "store: {snapshot_bytes} bytes\n\
-         opening it peaked {growth} bytes above the floor and retained {retained}, \
-         so the transient is {transient} bytes, {copies:.2} copies of the store"
-    );
-
+#[test]
+fn complete_history_validation_does_not_copy_change_payloads_to_select_targets() {
+    let directory = tempfile::tempdir().expect("validated store");
+    let repository = RepositoryId::new("history-validation-measurement").unwrap();
+    publish_bootstrap(directory.path(), &repository);
+    let backend = Arc::new(LocalFileBackend::new(directory.path()));
+    let (manager, payload) = RepositoryAuthorityManager::open_with_payload_stats(
+        repository.clone(),
+        Arc::clone(&backend),
+    )
+    .unwrap();
+    let bytes = payload.unwrap().snapshot_bytes() as usize;
     assert!(
-        copies <= OPEN_TRANSIENT_COPIES,
-        "opening a {snapshot_bytes}-byte authority held {transient} transient bytes beside the \
-         graph it decoded, {copies:.2} copies of the store, at or over the \
-         {OPEN_TRANSIENT_COPIES} copy ceiling"
+        bytes > COMMITS * CHANGE_PAYLOAD_BYTES,
+        "the payload must be persisted"
     );
+    assert!(manager.opened_by_history_validation());
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let changes = lease.snapshot().changes.decoded().unwrap();
+    assert_eq!(changes.len(), COMMITS);
+
+    // The control makes a real payload copy and must be visible to the allocator.
+    let copy_floor = arm_peak();
+    let copy = changes.values().cloned().collect::<Vec<_>>();
+    let copied_bytes = live_bytes().saturating_sub(copy_floor);
+    println!("copy control: history={bytes} copied={copied_bytes}");
+    assert!(
+        copied_bytes >= COMMITS * CHANGE_PAYLOAD_BYTES,
+        "the instrument must see a real history copy"
+    );
+    let copy_payload: usize = copy.iter().map(|change| change.message.len()).sum();
+    assert!(copy_payload >= COMMITS * CHANGE_PAYLOAD_BYTES);
+    drop(copy);
+    drop(lease);
+
+    let (frozen, freeze_copies) = transient_copies("full freeze", bytes, || {
+        manager
+            .freeze_current_authority(&roots)
+            .expect("full frozen validation")
+    });
+    assert!(!frozen.authority().snapshot().changes.is_decoded());
+    drop(frozen);
+
+    // Save through the unvalidated backend boundary so this open cannot reuse a proof.
+    let unproven_directory = tempfile::tempdir().expect("unproven store");
+    let unproven_backend = Arc::new(LocalFileBackend::new(unproven_directory.path()));
+    {
+        let authority = backend
+            .load_snapshot_authority(repository.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unproven_backend
+                .save_snapshot(repository.as_str(), &authority.snapshot_bytes, 0)
+                .unwrap(),
+            1
+        );
+        assert!(unproven_backend
+            .load_snapshot_authority(repository.as_str())
+            .unwrap()
+            .unwrap()
+            .history_validation
+            .is_none());
+    }
+    let (reopened, reopen_copies) = transient_copies("unproven reopen", bytes, || {
+        RepositoryAuthorityManager::open(repository.clone(), unproven_backend)
+            .expect("full reopen validation")
+    });
+    assert!(!reopened.opened_by_history_validation());
+    assert!(!reopened.read_authority().snapshot().changes.is_decoded());
+    assert_eq!(reopened.read_authority().snapshot().changes.len(), COMMITS);
+    assert!(freeze_copies < 0.5 && reopen_copies < 0.5,
+        "complete validation held change-payload copies only to select replay targets: freeze={freeze_copies:.3}, reopen={reopen_copies:.3}");
 }

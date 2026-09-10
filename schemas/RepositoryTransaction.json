@@ -32,6 +32,18 @@
         "$ref": "#/definitions/SemanticChange"
       }
     },
+    "collaboration_delta": {
+      "description": "The collaboration records this transaction admits.\n\n`RootBundle::collaboration` is replicated truth and `has_same_replicated_truth` compares it, so two replicas that complete a transfer must agree on it. Before this field existed nothing could move it: no field here named a collaboration record, and `prepare_successor` on the kin-db side had no collaboration domain to admit one into. Two replicas could finish a successful transfer holding different collaboration roots, with nothing erroring and no test failing.\n\nOptional and omitted when absent, so a transaction that touches no collaboration serializes to the bytes it always did and keeps its identity under the existing hash domain. That is what lets `REPOSITORY_TRANSACTION_SCHEMA_VERSION` stay at 4: the version is gated by exact equality, so moving it would refuse every transaction every shipped binary builds, in both directions, to buy a compatibility this field does not need.\n\nDeliberately last. Positional serialization emits explicit absent merge and sealed slots when this field is present without them.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CollaborationDelta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "default_ref_mutation": {
       "anyOf": [
         {
@@ -110,7 +122,7 @@
       "minimum": 0.0
     },
     "sealed_observation": {
-      "description": "Fingerprint and coverage of the admitted content closure observed by the enforcement layer.\n\nRepository storage validates only the binding's internal shape and binds it into transaction identity. It cannot re-derive the fingerprint; admission remains responsible for verifying it against graph-owned content before committing this transaction.\n\nDeliberately last. Positional serialization emits an explicit absent merge slot when this field is present without a merge delta.",
+      "description": "Fingerprint and coverage of the admitted content closure observed by the enforcement layer.\n\nRepository storage validates only the binding's internal shape and binds it into transaction identity. It cannot re-derive the fingerprint; admission remains responsible for verifying it against graph-owned content before committing this transaction.\n\nPositional serialization emits an explicit absent merge slot when this field is present without a merge delta.",
       "default": null,
       "anyOf": [
         {
@@ -134,6 +146,48 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "Actor": {
+      "type": "object",
+      "required": [
+        "actor_id",
+        "display_name",
+        "external_refs",
+        "kind"
+      ],
+      "properties": {
+        "actor_id": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "external_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalRef"
+          }
+        },
+        "kind": {
+          "$ref": "#/definitions/ActorKind"
+        }
+      }
+    },
+    "ActorId": {
+      "description": "Unique identifier for an actor.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "ActorKind": {
+      "type": "string",
+      "enum": [
+        "Human",
+        "Assistant",
+        "Service"
+      ]
+    },
     "AdmissionCase": {
       "description": "Filesystem case behavior frozen into one local admission overlay.\n\nThis is authority, not a host hint: the exact same policy bytes produce different answers under case-sensitive and ASCII-folded matching. Persisting the behavior in the overlay identity keeps reopen, replication-local workspace state, and later scans on the same matcher semantics.",
       "type": "string",
@@ -247,10 +301,228 @@
         "kin_ignore"
       ]
     },
+    "Annotation": {
+      "description": "A living annotation attached to one or more semantic scopes.\n\nAnnotations are anchored to entity/contract/artifact identities, not line numbers, so they are designed to stay attached across renames and moves. When the anchored entity's fingerprint drifts, staleness is detected.",
+      "type": "object",
+      "required": [
+        "annotation_id",
+        "authored_by",
+        "body",
+        "created_at",
+        "kind",
+        "scopes",
+        "staleness"
+      ],
+      "properties": {
+        "anchored_fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SemanticAnchor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "annotation_id": {
+          "$ref": "#/definitions/AnnotationId"
+        },
+        "authored_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "body": {
+          "type": "string"
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "kind": {
+          "$ref": "#/definitions/AnnotationKind"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkScope"
+          }
+        },
+        "staleness": {
+          "$ref": "#/definitions/StalenessState"
+        }
+      }
+    },
+    "AnnotationId": {
+      "description": "Unique identifier for an Annotation.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "AnnotationKind": {
+      "description": "The kind of annotation attached to a semantic scope.",
+      "type": "string",
+      "enum": [
+        "Comment",
+        "Warning",
+        "Instruction",
+        "Reasoning"
+      ]
+    },
+    "AnnotationTarget": {
+      "description": "What an annotation is attached to.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Scope"
+          ],
+          "properties": {
+            "Scope": {
+              "$ref": "#/definitions/WorkScope"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Work"
+          ],
+          "properties": {
+            "Work": {
+              "$ref": "#/definitions/WorkId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Approval": {
+      "type": "object",
+      "required": [
+        "approval_id",
+        "approver",
+        "change_id",
+        "decision",
+        "reason",
+        "timestamp"
+      ],
+      "properties": {
+        "approval_id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "approver": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "change_id": {
+          "$ref": "#/definitions/SemanticChangeId"
+        },
+        "decision": {
+          "$ref": "#/definitions/ApprovalDecision"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "timestamp": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      }
+    },
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "Approved",
+        "Rejected",
+        "Conditional"
+      ]
+    },
+    "ApprovalId": {
+      "description": "Unique identifier for an approval.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
     "ArtifactId": {
       "description": "Stable graph-assigned identity for a retrievable non-entity artifact.\n\nA path is a mutable location, not an identity seed. Importers allocate an ID once and persist the path-to-ID association in graph state.",
       "type": "string",
       "format": "uuid"
+    },
+    "Assertion": {
+      "type": "object",
+      "required": [
+        "assertion_id",
+        "expected_behavior",
+        "summary",
+        "target_scope"
+      ],
+      "properties": {
+        "assertion_id": {
+          "$ref": "#/definitions/AssertionId"
+        },
+        "expected_behavior": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "target_scope": {
+          "$ref": "#/definitions/WorkScope"
+        }
+      }
+    },
+    "AssertionId": {
+      "description": "Unique identifier for an assertion.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "AuditEvent": {
+      "type": "object",
+      "required": [
+        "action",
+        "actor_id",
+        "event_id",
+        "timestamp"
+      ],
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "actor_id": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "details": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_id": {
+          "$ref": "#/definitions/AuditEventId"
+        },
+        "target_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      }
+    },
+    "AuditEventId": {
+      "description": "Unique identifier for an audit event.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
     },
     "AuthorId": {
       "description": "Author identifier (human or assistant).",
@@ -347,10 +619,197 @@
         }
       ]
     },
+    "CollaborationDelta": {
+      "description": "The collaboration records one repository transaction admits.\n\nSeventeen collections, mirroring the receiver's own snapshot layout: a keyed collection travels as [`Keyed`] entries, an unkeyed one as bare values. Every collection is empty in the common case, and an entirely empty delta is refused by [`Self::validate`] rather than admitted as a no-op, so a transaction either carries collaboration or omits the field.\n\nThis type is persisted through the same positional MessagePack encoding as the transaction that carries it, so a field added here must be appended after every existing field, exactly as on [`RepositoryTransaction`](crate::RepositoryTransaction). Adding one in the middle reassigns every field after it and silently mis-decodes stores already on disk.",
+      "type": "object",
+      "required": [
+        "actors",
+        "annotations",
+        "approvals",
+        "assertions",
+        "audit_events",
+        "contracts",
+        "delegations",
+        "mock_hints",
+        "review_assignments",
+        "review_decisions",
+        "review_discussions",
+        "review_notes",
+        "reviews",
+        "test_cases",
+        "verification_runs",
+        "work_items",
+        "work_links"
+      ],
+      "properties": {
+        "actors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_ActorId_and_Actor"
+          }
+        },
+        "annotations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_AnnotationId_and_Annotation"
+          }
+        },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Approval"
+          }
+        },
+        "assertions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_AssertionId_and_Assertion"
+          }
+        },
+        "audit_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AuditEvent"
+          }
+        },
+        "contracts": {
+          "description": "Keyed by `ContractId` while [`Contract::id`] is a [`crate::ids::EntityId`]. See [`Keyed`] for why the key travels rather than being re-derived.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_ContractId_and_Contract"
+          }
+        },
+        "delegations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Delegation"
+          }
+        },
+        "mock_hints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MockHint"
+          }
+        },
+        "review_assignments": {
+          "description": "A review's assignments, whole, for the reason above. A [`ReviewAssignment`] does carry its `review_id`, but the receiver still holds them grouped, and shipping the group keeps the delta's shape and the snapshot's shape the same.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_ReviewId_and_Array_of_ReviewAssignment"
+          }
+        },
+        "review_decisions": {
+          "description": "A review's decision history, whole.\n\nThe receiver holds this as `ReviewId -> Vec<ReviewDecision>` and a [`ReviewDecision`] carries no identity of its own, not even the review it belongs to. So the unit that travels is the whole history under its review, and the inner order is the history's own and is preserved rather than canonicalized.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_ReviewId_and_Array_of_ReviewDecision"
+          }
+        },
+        "review_discussions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReviewDiscussion"
+          }
+        },
+        "review_notes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReviewNote"
+          }
+        },
+        "reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_ReviewId_and_Review"
+          }
+        },
+        "test_cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_TestId_and_TestCase"
+          }
+        },
+        "verification_runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_VerificationRunId_and_VerificationRun"
+          }
+        },
+        "work_items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Keyed_for_WorkId_and_WorkItem"
+          }
+        },
+        "work_links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkLink"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Contract": {
+      "description": "Cross-language linking primitive.",
+      "type": "object",
+      "required": [
+        "consumers",
+        "id",
+        "kind",
+        "name",
+        "producers",
+        "schema_hash"
+      ],
+      "properties": {
+        "consumers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EntityId"
+          }
+        },
+        "id": {
+          "$ref": "#/definitions/EntityId"
+        },
+        "kind": {
+          "$ref": "#/definitions/ContractKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "producers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EntityId"
+          }
+        },
+        "schema_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "ContractId": {
       "description": "Unique identifier for a Contract.",
       "type": "string",
       "format": "uuid"
+    },
+    "ContractKind": {
+      "description": "Classification of a contract type.",
+      "type": "string",
+      "enum": [
+        "OpenApi",
+        "Protobuf",
+        "GraphQL",
+        "DbSchema",
+        "EventSchema",
+        "TypedInterface"
+      ]
     },
     "DefaultRefExpectation": {
       "description": "CAS expectation for the repository's optional default ref.",
@@ -412,6 +871,54 @@
         }
       },
       "additionalProperties": false
+    },
+    "Delegation": {
+      "type": "object",
+      "required": [
+        "delegate",
+        "delegation_id",
+        "principal",
+        "scope",
+        "started_at"
+      ],
+      "properties": {
+        "delegate": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "delegation_id": {
+          "$ref": "#/definitions/DelegationId"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "principal": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkScope"
+          }
+        },
+        "started_at": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      }
+    },
+    "DelegationId": {
+      "description": "Unique identifier for a delegation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
     },
     "EffectiveAdmissionPolicyStamp": {
       "description": "Complete policy identity consumed by one local workspace.",
@@ -721,6 +1228,28 @@
         }
       },
       "additionalProperties": false
+    },
+    "ExternalRef": {
+      "description": "A reference to an external system (Jira, GitHub Issues, etc.).",
+      "type": "object",
+      "required": [
+        "identifier",
+        "system"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string"
+        },
+        "system": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "ExternalReference": {
       "description": "Immutable, resolved endpoint for a symbol owned outside the local graph.\n\n`resolution_namespace` identifies both the resolver and its normalization contract. It is versioned so a change to that contract cannot silently reinterpret existing coordinates. `canonical_source` and `symbol` are resolver-issued opaque selectors, preserved byte-for-byte after validation.",
@@ -1543,6 +2072,206 @@
       },
       "maxItems": 32,
       "minItems": 32
+    },
+    "IdentityKind": {
+      "description": "Whether an identity is a human or an assistant.",
+      "type": "string",
+      "enum": [
+        "Human",
+        "Assistant"
+      ]
+    },
+    "IdentityRef": {
+      "description": "A lightweight identity reference for authorship.\n\nPhase 8 uses this as a placeholder. Phase 10 hardens it into the full `Actor` / `Delegation` / `Approval` model.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/IdentityKind"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "Keyed_for_ActorId_and_Actor": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/ActorId"
+        },
+        "value": {
+          "$ref": "#/definitions/Actor"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_AnnotationId_and_Annotation": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/AnnotationId"
+        },
+        "value": {
+          "$ref": "#/definitions/Annotation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_AssertionId_and_Assertion": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/AssertionId"
+        },
+        "value": {
+          "$ref": "#/definitions/Assertion"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_ContractId_and_Contract": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/ContractId"
+        },
+        "value": {
+          "$ref": "#/definitions/Contract"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_ReviewId_and_Array_of_ReviewAssignment": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "value": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReviewAssignment"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_ReviewId_and_Array_of_ReviewDecision": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "value": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReviewDecision"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_ReviewId_and_Review": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "value": {
+          "$ref": "#/definitions/Review"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_TestId_and_TestCase": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/TestId"
+        },
+        "value": {
+          "$ref": "#/definitions/TestCase"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_VerificationRunId_and_VerificationRun": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/VerificationRunId"
+        },
+        "value": {
+          "$ref": "#/definitions/VerificationRun"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keyed_for_WorkId_and_WorkItem": {
+      "description": "One entry of a keyed collaboration collection, carrying its key explicitly.\n\nThe receiver's snapshot holds these collections as maps, and this type is one entry of one such map. The key travels rather than being re-derived on arrival, which is not a convenience: `contracts` is keyed by `ContractId` while [`Contract::id`] is an `EntityId`, so kin-db already derives that key from the value at its own write site. A delta that shipped values alone would make every receiver repeat that derivation, and a receiver that derived it differently would land the record under a key the sender never used, moving the collaboration root to a value the sender never had.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/WorkId"
+        },
+        "value": {
+          "$ref": "#/definitions/WorkItem"
+        }
+      },
+      "additionalProperties": false
     },
     "LanguageId": {
       "description": "Supported programming languages (Tier 1).",
@@ -2556,10 +3285,79 @@
       },
       "additionalProperties": false
     },
+    "MockHint": {
+      "description": "Advisory hint that a dependency was mocked during a test run.",
+      "type": "object",
+      "required": [
+        "dependency_scope",
+        "hint_id",
+        "strategy",
+        "test_id"
+      ],
+      "properties": {
+        "dependency_scope": {
+          "$ref": "#/definitions/WorkScope"
+        },
+        "hint_id": {
+          "$ref": "#/definitions/MockHintId"
+        },
+        "strategy": {
+          "$ref": "#/definitions/MockStrategy"
+        },
+        "test_id": {
+          "$ref": "#/definitions/TestId"
+        }
+      }
+    },
+    "MockHintId": {
+      "description": "Unique identifier for a mock hint.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "MockStrategy": {
+      "description": "Strategy used to mock a dependency during a test run.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "InMemory",
+            "Stub",
+            "Fake",
+            "Recorded"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "Custom"
+          ],
+          "properties": {
+            "Custom": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "OperationId": {
       "description": "Caller-stable identity for one repository authority transaction.",
       "type": "string",
       "format": "uuid"
+    },
+    "Priority": {
+      "description": "Priority level for work items.",
+      "type": "string",
+      "enum": [
+        "Critical",
+        "High",
+        "Medium",
+        "Low",
+        "None"
+      ]
     },
     "RefExpectation": {
       "description": "Exact compare-and-swap expectation for a ref mutation.",
@@ -2976,6 +3774,252 @@
     "RepositoryId": {
       "type": "string"
     },
+    "Review": {
+      "description": "A review scoped to semantic changes between two points.",
+      "type": "object",
+      "required": [
+        "base_ref",
+        "completion",
+        "created_at",
+        "created_by",
+        "head_ref",
+        "review_id",
+        "scopes",
+        "state",
+        "title",
+        "updated_at"
+      ],
+      "properties": {
+        "base_ref": {
+          "description": "Base branch or commit reference.",
+          "type": "string"
+        },
+        "completion": {
+          "$ref": "#/definitions/ReviewCompletionState"
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "created_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "head_ref": {
+          "description": "Head branch or commit reference.",
+          "type": "string"
+        },
+        "review_id": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "scopes": {
+          "description": "Entities/changes being reviewed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkScope"
+          }
+        },
+        "state": {
+          "$ref": "#/definitions/ReviewDecisionState"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      }
+    },
+    "ReviewAssignment": {
+      "description": "A reviewer assignment on a review.",
+      "type": "object",
+      "required": [
+        "assigned_at",
+        "assigned_by",
+        "review_id",
+        "reviewer"
+      ],
+      "properties": {
+        "assigned_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "assigned_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "review_id": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "reviewer": {
+          "$ref": "#/definitions/IdentityRef"
+        }
+      }
+    },
+    "ReviewComment": {
+      "description": "A single comment within a review discussion.",
+      "type": "object",
+      "required": [
+        "authored_by",
+        "body",
+        "created_at"
+      ],
+      "properties": {
+        "authored_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "body": {
+          "type": "string"
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        }
+      }
+    },
+    "ReviewCompletionState": {
+      "description": "Completion state for a review.",
+      "type": "string",
+      "enum": [
+        "InReview",
+        "Ready",
+        "Blocked"
+      ]
+    },
+    "ReviewDecision": {
+      "description": "A record of a review decision (part of decision history).",
+      "type": "object",
+      "required": [
+        "decided_at",
+        "reviewer",
+        "state"
+      ],
+      "properties": {
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decided_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "reviewer": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "state": {
+          "$ref": "#/definitions/ReviewDecisionState"
+        }
+      }
+    },
+    "ReviewDecisionState": {
+      "description": "Decision state for a review.",
+      "type": "string",
+      "enum": [
+        "Pending",
+        "Approved",
+        "NeedsWork",
+        "Blocked"
+      ]
+    },
+    "ReviewDiscussion": {
+      "description": "A discussion thread on a review.",
+      "type": "object",
+      "required": [
+        "comments",
+        "created_at",
+        "discussion_id",
+        "review_id",
+        "state"
+      ],
+      "properties": {
+        "comments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReviewComment"
+          }
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "discussion_id": {
+          "$ref": "#/definitions/ReviewDiscussionId"
+        },
+        "review_id": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/ReviewDiscussionState"
+        }
+      }
+    },
+    "ReviewDiscussionId": {
+      "description": "Unique identifier for a ReviewDiscussion.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "ReviewDiscussionState": {
+      "description": "State of a review discussion thread.",
+      "type": "string",
+      "enum": [
+        "Open",
+        "Resolved"
+      ]
+    },
+    "ReviewId": {
+      "description": "Unique identifier for a Review.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "ReviewNote": {
+      "description": "A note attached to a review.",
+      "type": "object",
+      "required": [
+        "authored_by",
+        "body",
+        "created_at",
+        "note_id",
+        "review_id"
+      ],
+      "properties": {
+        "authored_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "body": {
+          "type": "string"
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "note_id": {
+          "$ref": "#/definitions/ReviewNoteId"
+        },
+        "review_id": {
+          "$ref": "#/definitions/ReviewId"
+        },
+        "scope": {
+          "description": "Optionally anchored to a specific entity/file/change.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ReviewNoteId": {
+      "description": "Unique identifier for a ReviewNote.",
+      "type": "string",
+      "format": "uuid"
+    },
     "RiskLevel": {
       "description": "Risk classification.",
       "type": "string",
@@ -3165,6 +4209,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "SemanticAnchor": {
+      "description": "A fingerprint used to detect when an annotation's anchor has drifted.\n\nStored at annotation creation time and compared against the current entity fingerprint to determine staleness.",
+      "type": "object",
+      "required": [
+        "ast_hash",
+        "signature_hash"
+      ],
+      "properties": {
+        "ast_hash": {
+          "$ref": "#/definitions/Hash256"
+        },
+        "signature_hash": {
+          "$ref": "#/definitions/Hash256"
+        }
+      }
     },
     "SemanticChange": {
       "description": "Kin's native commit, the unit of semantic history.\n\nPersisted positionally in every snapshot that carries history, so the crate-level positional-wire rule applies: a new field goes last, and only a trailing field may skip serialization.",
@@ -3513,11 +4573,116 @@
       "type": "string",
       "format": "uuid"
     },
+    "StalenessState": {
+      "description": "How fresh an annotation's anchor is relative to current code state.",
+      "oneOf": [
+        {
+          "description": "The anchored fingerprint matches the current entity state.",
+          "type": "string",
+          "enum": [
+            "Fresh"
+          ]
+        },
+        {
+          "description": "The entity has changed but not structurally — annotation may still apply.",
+          "type": "string",
+          "enum": [
+            "Suspect"
+          ]
+        },
+        {
+          "description": "The entity's signature or behavior has changed materially.",
+          "type": "string",
+          "enum": [
+            "Stale"
+          ]
+        }
+      ]
+    },
+    "TestCase": {
+      "type": "object",
+      "required": [
+        "kind",
+        "language",
+        "name",
+        "runner",
+        "scopes",
+        "test_id"
+      ],
+      "properties": {
+        "file_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FilePathId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/TestKind"
+        },
+        "language": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "runner": {
+          "$ref": "#/definitions/TestRunner"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkScope"
+          }
+        },
+        "test_id": {
+          "$ref": "#/definitions/TestId"
+        }
+      }
+    },
     "TestId": {
       "description": "Unique identifier for a test case.",
       "allOf": [
         {
           "$ref": "#/definitions/Hash256"
+        }
+      ]
+    },
+    "TestKind": {
+      "type": "string",
+      "enum": [
+        "Unit",
+        "Integration",
+        "Contract",
+        "Property"
+      ]
+    },
+    "TestRunner": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Cargo",
+            "Jest",
+            "Pytest",
+            "Go",
+            "JUnit"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "Custom"
+          ],
+          "properties": {
+            "Custom": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3672,12 +4837,87 @@
         }
       ]
     },
+    "VerificationRun": {
+      "description": "A single execution of one or more tests with captured evidence.",
+      "type": "object",
+      "required": [
+        "run_id",
+        "runner",
+        "started_at",
+        "status",
+        "test_ids"
+      ],
+      "properties": {
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "evidence_blob": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "finished_at": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_id": {
+          "$ref": "#/definitions/VerificationRunId"
+        },
+        "runner": {
+          "$ref": "#/definitions/TestRunner"
+        },
+        "started_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "status": {
+          "$ref": "#/definitions/VerificationStatus"
+        },
+        "test_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TestId"
+          }
+        }
+      }
+    },
     "VerificationRunId": {
       "description": "Unique identifier for a verification run.",
       "allOf": [
         {
           "$ref": "#/definitions/Hash256"
         }
+      ]
+    },
+    "VerificationStatus": {
+      "type": "string",
+      "enum": [
+        "Missing",
+        "Pending",
+        "Passing",
+        "Failing"
       ]
     },
     "Visibility": {
@@ -3694,6 +4934,300 @@
       "description": "Unique identifier for a WorkItem.",
       "type": "string",
       "format": "uuid"
+    },
+    "WorkItem": {
+      "description": "The canonical work item: a feature, task, issue, debt item, or TODO anchored to semantic scopes in the code graph.",
+      "type": "object",
+      "required": [
+        "acceptance_criteria",
+        "created_at",
+        "created_by",
+        "description",
+        "external_refs",
+        "kind",
+        "priority",
+        "scopes",
+        "status",
+        "title",
+        "work_id"
+      ],
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "created_by": {
+          "$ref": "#/definitions/IdentityRef"
+        },
+        "description": {
+          "type": "string"
+        },
+        "external_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalRef"
+          }
+        },
+        "kind": {
+          "$ref": "#/definitions/WorkKind"
+        },
+        "priority": {
+          "$ref": "#/definitions/Priority"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkScope"
+          }
+        },
+        "status": {
+          "$ref": "#/definitions/WorkStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "work_id": {
+          "$ref": "#/definitions/WorkId"
+        }
+      }
+    },
+    "WorkKind": {
+      "description": "The kind of work this item represents.",
+      "type": "string",
+      "enum": [
+        "Feature",
+        "Task",
+        "Issue",
+        "Debt",
+        "Todo",
+        "Investigation"
+      ]
+    },
+    "WorkLink": {
+      "description": "The types of relationships in the work graph.\n\nThese correspond to the graph edges defined in PLAN_P3.md Section 4.5: - `(WorkItem)-[:AFFECTS]->(Entity | Contract | Artifact | SemanticChange)` - `(WorkItem)-[:DECOMPOSES_TO]->(WorkItem)` - `(WorkItem)-[:BLOCKED_BY]->(WorkItem)` - `(Entity | Contract | Artifact)-[:IMPLEMENTS]->(WorkItem)` - `(Annotation)-[:ATTACHED_TO]->(Entity | Contract | Artifact | WorkItem)` - `(Annotation)-[:SUPERSEDES]->(Annotation)`",
+      "oneOf": [
+        {
+          "description": "Work item affects a semantic scope.",
+          "type": "object",
+          "required": [
+            "Affects"
+          ],
+          "properties": {
+            "Affects": {
+              "type": "object",
+              "required": [
+                "scope",
+                "work_id"
+              ],
+              "properties": {
+                "scope": {
+                  "$ref": "#/definitions/WorkScope"
+                },
+                "work_id": {
+                  "$ref": "#/definitions/WorkId"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Work item decomposes into a child work item (feature -> task -> subtask).",
+          "type": "object",
+          "required": [
+            "DecomposesTo"
+          ],
+          "properties": {
+            "DecomposesTo": {
+              "type": "object",
+              "required": [
+                "child",
+                "parent"
+              ],
+              "properties": {
+                "child": {
+                  "$ref": "#/definitions/WorkId"
+                },
+                "parent": {
+                  "$ref": "#/definitions/WorkId"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Work item is blocked by another work item.",
+          "type": "object",
+          "required": [
+            "BlockedBy"
+          ],
+          "properties": {
+            "BlockedBy": {
+              "type": "object",
+              "required": [
+                "blocked",
+                "blocker"
+              ],
+              "properties": {
+                "blocked": {
+                  "$ref": "#/definitions/WorkId"
+                },
+                "blocker": {
+                  "$ref": "#/definitions/WorkId"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A semantic scope implements a work item.",
+          "type": "object",
+          "required": [
+            "Implements"
+          ],
+          "properties": {
+            "Implements": {
+              "type": "object",
+              "required": [
+                "scope",
+                "work_id"
+              ],
+              "properties": {
+                "scope": {
+                  "$ref": "#/definitions/WorkScope"
+                },
+                "work_id": {
+                  "$ref": "#/definitions/WorkId"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An annotation is attached to a scope or work item.",
+          "type": "object",
+          "required": [
+            "AttachedTo"
+          ],
+          "properties": {
+            "AttachedTo": {
+              "type": "object",
+              "required": [
+                "annotation_id",
+                "target"
+              ],
+              "properties": {
+                "annotation_id": {
+                  "$ref": "#/definitions/AnnotationId"
+                },
+                "target": {
+                  "$ref": "#/definitions/AnnotationTarget"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An annotation supersedes another annotation.",
+          "type": "object",
+          "required": [
+            "Supersedes"
+          ],
+          "properties": {
+            "Supersedes": {
+              "type": "object",
+              "required": [
+                "new_id",
+                "old_id"
+              ],
+              "properties": {
+                "new_id": {
+                  "$ref": "#/definitions/AnnotationId"
+                },
+                "old_id": {
+                  "$ref": "#/definitions/AnnotationId"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkScope": {
+      "description": "A semantic scope that a work item or annotation is anchored to.\n\nUnlike line numbers, these reference semantic identities in the graph, so anchors are designed to stay attached across renames, moves, and formatting changes.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Entity"
+          ],
+          "properties": {
+            "Entity": {
+              "$ref": "#/definitions/EntityId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Contract"
+          ],
+          "properties": {
+            "Contract": {
+              "$ref": "#/definitions/ContractId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Artifact"
+          ],
+          "properties": {
+            "Artifact": {
+              "$ref": "#/definitions/FilePathId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Change"
+          ],
+          "properties": {
+            "Change": {
+              "$ref": "#/definitions/SemanticChangeId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkStatus": {
+      "description": "Lifecycle status of a work item.",
+      "type": "string",
+      "enum": [
+        "Proposed",
+        "Planned",
+        "InProgress",
+        "Blocked",
+        "Done",
+        "Verified",
+        "Archived"
+      ]
     },
     "WorkspaceExpectation": {
       "description": "Exact compare-and-swap expectation for persisted workspace authority.",

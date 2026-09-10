@@ -1,41 +1,54 @@
-# kin-db: The Semantic Engine for Kin
+# kin-db
 
 > **Software that remembers itself.**
 >
 > Exact context, not more.
 
-The graph is the canonical repository substrate in Kin, not a file index, not a metadata
-overlay, but the primary source of truth for every entity, relation, and provenance record.
-`kin-db` is that substrate: it owns graph storage, snapshot persistence, BM25 lexical
-retrieval, and ANN vector search, and composes `kin-infer` for on-device embedding inference.
-`kin` (the system of record) and `kin-vfs` (the transparent filesystem projection) both build
-on top of it.
+The graph storage engine behind Kin. It handles the entities, relationships,
+snapshots, and change history that a Kin repository is made of.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
 
-## What is Kin?
+In Kin the graph is the repository. It is not an index over files, and not a
+metadata layer sitting beside them. It is where every entity, relation, and
+provenance record actually lives, and `kin-db` is what stores it. It owns graph
+storage, snapshot persistence, BM25 lexical retrieval, and ANN vector search,
+and it composes `kin-infer` for on-device embedding inference. `kin`, the
+system of record, and `kin-vfs`, the transparent filesystem projection, both
+build on top of it.
 
-**AI writes code. Kin proves what changed.** Kin is the semantic system of record for
-AI-written software: your code as a graph of entities, relations, and intents, not a pile
-of files and diffs. AI agents and humans navigate it semantically, with provenance, review,
-and governance built in. It coexists with Git and projects graph truth back to a normal
-filesystem, so any tool works unchanged.
+Apache-2.0, the same as `kin`.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+## What Kin is
 
-## kin-db's role
+**AI writes code. Kin proves what changed.**
 
-`kin-db` owns the canonical graph substrate: entities, relations, provenance,
-sessions, and their indexes. It is not a general-purpose graph database. It is
-built specifically to support Kin's semantic repository model, where every
-function, type, file, and relation is a first-class graph node with a stable
-identity, content hash, and verifiable Merkle ancestry.
+Kin is the system of record for AI-written software. Your code is a graph of
+entities, relations, and change history rather than a pile of files and diffs,
+so agents and humans can ask what a change touches instead of rebuilding that
+picture on every run. Provenance and review are part of the record. Kin
+coexists with Git, and filesystem projections let supported tools keep working
+with ordinary files.
 
-It is the lowest authoritative layer in the open Kin local substrate. `kin`
-(the system of record) and `kin-vfs` (the filesystem projection) build on
-top of it. It composes `kin-search` for BM25 lexical retrieval, `kin-vector`
-for ANN/embedding retrieval, and `kin-infer` for on-device embedding inference.
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** and
+**[kinlab.ai](https://kinlab.ai)**.
+
+## What kin-db does
+
+`kin-db` owns the canonical graph: entities, relations, provenance, sessions,
+and their indexes. It is not a general-purpose graph database. It is built for
+Kin's semantic repository model, where every function, type, file, and relation
+is a first-class node with a stable identity, a content hash, and verifiable
+Merkle ancestry.
+
+It is the lowest authoritative layer in the open Kin local stack. `kin` (the
+system of record) and `kin-vfs` (the filesystem projection) build on top of it.
+It composes `kin-search` for BM25 lexical retrieval, `kin-vector` for ANN and
+embedding retrieval, and `kin-infer` for on-device embedding inference.
+
+`kin-db` is not published on crates.io. It is built from source as part of the
+Kin workspace, and the commands below are how you build and test it here.
 
 ## Build
 
@@ -112,4 +125,4 @@ never becomes retrieval authority.
 
 ## License
 
-[Apache-2.0](LICENSE). Part of the open Kin local substrate.
+[Apache-2.0](LICENSE). Part of the open Kin local stack.
