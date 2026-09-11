@@ -1,11 +1,8 @@
 # kin-db
 
-> **Software that remembers itself.**
->
-> Exact context, not more.
-
-The graph storage engine behind Kin. It handles the entities, relationships,
-snapshots, and change history that a Kin repository is made of.
+The graph storage engine behind Kin, a graph-native code repository for people
+and AI agents. It handles the entities, relationships, snapshots, and change
+history that a Kin repository is made of.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
