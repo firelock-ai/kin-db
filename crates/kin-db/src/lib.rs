@@ -66,7 +66,7 @@ pub use storage::{
     PersistOutcome, VersionedAuthorityState,
 };
 pub use storage::{
-    AuthorityEnvelopeSnapshot, ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze,
+    AuthorityEnvelopeSnapshot, ChangeAdmissionPolicy, DurableHead, LocalRepositoryAuthorityFreeze,
     MaterializedGraphSectionOutcome, PersistedRepositoryAuthority, RepositoryAuthorityManager,
     RepositoryAuthorityMetadata, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
 };

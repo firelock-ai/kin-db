@@ -3472,6 +3472,10 @@ pub struct LocalFileBackend {
     >,
     poisoned_repository_namespaces:
         parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
+    /// The last authority record this backend read or wrote for each
+    /// repository: the head it names, and the SHA-256 of its exact bytes.
+    authority_records:
+        parking_lot::Mutex<std::collections::HashMap<String, (DurableAuthorityIdentity, String)>>,
     #[cfg(unix)]
     source_root_confirmed_for_process: parking_lot::Mutex<bool>,
     #[cfg(test)]
@@ -4496,6 +4500,7 @@ impl LocalFileBackend {
             poisoned_repository_namespaces: parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             ),
+            authority_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
             #[cfg(unix)]
             source_root_confirmed_for_process: parking_lot::Mutex::new(false),
             #[cfg(test)]
@@ -6352,15 +6357,7 @@ impl LocalFileBackend {
         // this freeze keeps: the snapshot's by the authority load above, every
         // frame's by the capture beside it. A journal-free record acknowledges
         // no frame, which the record decoder already enforces.
-        let identity = DurableAuthorityIdentity {
-            snapshot_generation: record.snapshot_generation,
-            snapshot_sha256: record.snapshot_sha256,
-            frames: record
-                .acknowledged_deltas
-                .into_iter()
-                .map(|identity| (identity.generation, identity.sha256))
-                .collect(),
-        };
+        let identity = Self::record_identity(&record);
         self.confirm_existing_lock_visible(&lock.namespace)?;
         Ok(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
@@ -7163,7 +7160,9 @@ impl LocalFileBackend {
             cleanup,
         )?;
         let bytes = namespace.read_regular_bounded(relative, "local authority", 1024 * 1024)?;
-        Self::decode_authority_record(&namespace.repo_id, &path, &bytes).map(Some)
+        let record = Self::decode_authority_record(&namespace.repo_id, &path, &bytes)?;
+        self.remember_authority_record(&namespace.repo_id, &record, &bytes);
+        Ok(Some(record))
     }
 
     fn decode_authority_record(
@@ -7431,7 +7430,10 @@ impl LocalFileBackend {
             &namespace.display_path,
             &bytes,
         )? {
-            AtomicWriteOutcome::Durable => Ok(()),
+            AtomicWriteOutcome::Durable => {
+                self.remember_authority_record(&namespace.repo_id, record, &bytes);
+                Ok(())
+            }
             AtomicWriteOutcome::InstalledButUnconfirmed(error) => {
                 Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
                     "local authority {} was installed but its durability or exact post-install verification is unconfirmed: {error}",
@@ -7439,6 +7441,53 @@ impl LocalFileBackend {
                 )))
             }
         }
+    }
+
+    /// The head one record names, from the digests it binds.
+    fn record_identity(record: &LocalAuthorityRecord) -> DurableAuthorityIdentity {
+        DurableAuthorityIdentity {
+            snapshot_generation: record.snapshot_generation,
+            snapshot_sha256: record.snapshot_sha256.clone(),
+            frames: record
+                .acknowledged_deltas
+                .iter()
+                .map(|identity| (identity.generation, identity.sha256.clone()))
+                .collect(),
+        }
+    }
+
+    /// Remember the last authority record this backend read or wrote for a
+    /// repository, as the head it names and the digest of its exact bytes.
+    fn remember_authority_record(
+        &self,
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+        bytes: &[u8],
+    ) {
+        self.authority_records.lock().insert(
+            repo_id.to_string(),
+            (
+                Self::record_identity(record),
+                hex::encode(Sha256::digest(bytes)),
+            ),
+        );
+    }
+
+    /// The digest of the last authority record this backend read or wrote for
+    /// `repo_id`, when that record names exactly `head`.
+    ///
+    /// A record naming any other head, because another writer moved it, answers
+    /// `None`: its digest describes bytes that are not the caller's head.
+    pub(crate) fn remembered_authority_record_sha256(
+        &self,
+        repo_id: &str,
+        head: &DurableAuthorityIdentity,
+    ) -> Option<String> {
+        self.authority_records
+            .lock()
+            .get(repo_id)
+            .filter(|(remembered, _)| remembered == head)
+            .map(|(_, sha256)| sha256.clone())
     }
 
     fn load_deltas_since_unlocked(

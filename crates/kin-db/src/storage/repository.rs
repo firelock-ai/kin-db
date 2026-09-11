@@ -2266,6 +2266,27 @@ pub struct RepositoryAuthorityManager<B: StorageBackend + ?Sized + 'static> {
     prepared: Option<Arc<PreparedWorkspaceGraphCache>>,
 }
 
+/// The durable head a manager's published state is, named in the currency a
+/// reader of the local `authority.json` labels a held manager with.
+///
+/// Equal record bytes name one durable state, because the record binds the
+/// snapshot digest and every acknowledged frame digest. So a reader that
+/// labeled a held manager with the SHA-256 of the record it read can relabel
+/// it after the manager's own commit with one comparison against
+/// `record_sha256`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableHead {
+    /// Backend compare-and-swap generation of the published state: the cursor
+    /// that loaded or installed it. Not `RootBundle::generation`, which an
+    /// equivalent representation rewrite keeps while this moves.
+    pub backend_generation: Generation,
+    /// SHA-256, lowercase hex, of the exact `authority.json` bytes naming that
+    /// head, as this manager's backend last read or wrote them: at open, at
+    /// this manager's own last persist, or at its own history-validation
+    /// binding.
+    pub record_sha256: String,
+}
+
 /// Result of explicitly persisting one workspace base graph section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterializedGraphSectionOutcome {
@@ -3615,6 +3636,29 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             .into());
         }
         Ok(freeze)
+    }
+
+    /// The durable head of the state [`read_authority`](Self::read_authority)
+    /// serves at this instant, in the currency a reader of `authority.json`
+    /// labels a held manager with.
+    ///
+    /// `None` when that state was never persisted, or when the record this
+    /// manager's backend last read or wrote names a head other than the one
+    /// the state is: another writer moved the head, and the caller has to
+    /// reload rather than relabel. A record another process rewrote without a
+    /// new publication, such as a history proof bound to the same head, leaves
+    /// the reported digest behind the file, which costs the caller one reload
+    /// and never serves a stale state.
+    pub fn durable_head(&self) -> Option<DurableHead> {
+        let published = self.read_authority();
+        let identity = published.durable_identity()?;
+        let record_sha256 = self
+            .backend
+            .remembered_authority_record_sha256(self.repository_id.as_str(), identity)?;
+        Some(DurableHead {
+            backend_generation: identity.head_generation(),
+            record_sha256,
+        })
     }
 }
 
@@ -21888,6 +21932,126 @@ mod tests {
             FreezeRevalidation::FULL,
             "a head moved between a reopen and its freeze is revalidated in full"
         );
+    }
+
+    /// SHA-256 of the exact `authority.json` bytes on disk, the currency a
+    /// reader of the local record labels a held manager with.
+    fn authority_record_sha256(directory: &TempDir) -> String {
+        hex::encode(Sha256::digest(
+            std::fs::read(authority_json_path(directory.path())).unwrap(),
+        ))
+    }
+
+    /// A manager names its published head the way a reader of `authority.json`
+    /// labels it, after an open, after its own commit and after its own
+    /// representation rewrite. Another writer's commit is never reported as
+    /// this manager's head.
+    #[test]
+    fn the_durable_head_names_the_record_bytes_of_the_published_state() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let held = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let opened = held.durable_head().expect("an opened head is named");
+        assert_eq!(
+            opened.record_sha256,
+            authority_record_sha256(&directory),
+            "after the open"
+        );
+
+        held.persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        held.commit_repository_transaction(overlay_publication(&held, 0xf7_3701, 0x81))
+            .unwrap();
+        let committed = held.durable_head().expect("a committed head is named");
+        assert_eq!(
+            committed.record_sha256,
+            authority_record_sha256(&directory),
+            "after its own commit"
+        );
+        assert_eq!(
+            committed.backend_generation,
+            opened.backend_generation + 1,
+            "one commit is one backend generation"
+        );
+
+        let logical = held.read_authority().generation();
+        let workspace_id = held.read_authority().metadata().workspaces[0].workspace_id;
+        assert!(matches!(
+            held.materialize_workspace_base_graph_section(&repository_id(), &workspace_id)
+                .unwrap(),
+            Some(MaterializedGraphSectionOutcome::Persisted { .. })
+        ));
+        let rewritten = held.durable_head().expect("a rewritten head is named");
+        assert_eq!(
+            rewritten.record_sha256,
+            authority_record_sha256(&directory),
+            "after its own rewrite"
+        );
+        assert_eq!(
+            rewritten.backend_generation,
+            committed.backend_generation + 1,
+            "the rewrite moved the cursor"
+        );
+        assert_eq!(
+            held.read_authority().generation(),
+            logical,
+            "and kept the logical generation"
+        );
+
+        // Another process commits. The file moves on; this manager's head does not.
+        let other_process = reopen(&directory);
+        other_process
+            .commit_repository_transaction(overlay_publication(&other_process, 0xf7_3702, 0x82))
+            .unwrap();
+        assert_ne!(authority_record_sha256(&directory), rewritten.record_sha256);
+        assert_eq!(
+            held.durable_head(),
+            Some(rewritten),
+            "another process's commit is not this manager's head"
+        );
+
+        // A second manager on this very backend reads and writes newer records.
+        // The backend's last record then names a head the held manager does not
+        // hold, and it names none rather than somebody else's.
+        let same_backend =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        same_backend
+            .commit_repository_transaction(overlay_publication(&same_backend, 0xf7_3703, 0x83))
+            .unwrap();
+        assert_eq!(held.durable_head(), None);
+        let theirs = same_backend
+            .durable_head()
+            .expect("the other manager names its own head");
+        assert_eq!(theirs.record_sha256, authority_record_sha256(&directory));
+    }
+
+    /// An open that finds no history proof validates in full and binds one,
+    /// rewriting the record, and then names the rewritten record's bytes.
+    #[test]
+    fn the_durable_head_names_the_record_a_history_binding_rewrote() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let mut record = read_authority_json(directory.path());
+        record.as_object_mut().unwrap().remove("history_validation");
+        write_authority_json(directory.path(), &record);
+        let unproven = authority_record_sha256(&directory);
+
+        let bound = reopen(&directory);
+        assert!(
+            !bound.opened_by_history_validation(),
+            "the record carried no proof"
+        );
+        assert!(
+            read_authority_json(directory.path())
+                .get("history_validation")
+                .is_some(),
+            "the open bound a proof"
+        );
+        let head = bound.durable_head().expect("the bound head is named");
+        assert_ne!(head.record_sha256, unproven);
+        assert_eq!(head.record_sha256, authority_record_sha256(&directory));
     }
 
     /// One snapshot byte corrupted under an unchanged record refuses the
