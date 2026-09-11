@@ -105,4 +105,4 @@ sha1 = "0.11"
 # A bare "<1.13" does NOT work: it admits the 0.x line, so cargo takes tinyvec
 # 0.4.1 for this entry and leaves 1.13.0 in the graph for the transitive users.
 # Remove this entry once 1.13.0 is yanked or a fixed tinyvec is published.
-tinyvec = ">=1.6, <1.13"
+tinyvec = ">=1.6, <1.14"
