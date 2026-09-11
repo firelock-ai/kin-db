@@ -1339,10 +1339,7 @@ fn upsert<K: Copy + Eq + Hash, V: Clone>(target: &mut HashMap<K, V>, entries: &[
 }
 
 /// Refuse keyed entries that are not strictly increasing by encoded key.
-fn require_keyed_order<K: Serialize, V>(
-    entries: &[(K, V)],
-    label: &str,
-) -> Result<(), KinDbError> {
+fn require_keyed_order<K: Serialize, V>(entries: &[(K, V)], label: &str) -> Result<(), KinDbError> {
     let mut previous: Option<Vec<u8>> = None;
     for (key, _) in entries {
         let current = encoded_key(key)?;

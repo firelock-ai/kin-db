@@ -21365,8 +21365,9 @@ mod tests {
         let mut actor = first.actors[0].clone();
         actor.value.display_name = format!("renamed actor {seed}");
         let mut note = first.review_notes[0].clone();
-        note.note_id =
-            kin_model::ReviewNoteId(Uuid::from_u128((0xfd << 120) | (u128::from(seed) << 64) | 6));
+        note.note_id = kin_model::ReviewNoteId(Uuid::from_u128(
+            (0xfd << 120) | (u128::from(seed) << 64) | 6,
+        ));
         note.body = "second note".to_string();
         let mut event = first.audit_events[0].clone();
         let mut event_bytes = [0xfd; 32];
@@ -21395,7 +21396,11 @@ mod tests {
         context: &str,
     ) -> RepositoryAuthorityManager<LocalFileBackend> {
         let reopened = reopen(directory);
-        assert_same_authority(&manager.read_authority(), &reopened.read_authority(), context);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            context,
+        );
         assert_eq!(
             crate::storage::authority_frame::first_difference(
                 reopened.read_authority().snapshot(),
@@ -21552,9 +21557,7 @@ mod tests {
                 .to_string();
             let label = name.replace('_', " ");
             assert!(
-                error.contains(&format!(
-                    "does not reproduce the successor: {label} differ"
-                )),
+                error.contains(&format!("does not reproduce the successor: {label} differ")),
                 "{name}: {error}"
             );
         }
@@ -21615,7 +21618,9 @@ mod tests {
     }
 
     fn rehashed<K: Copy + Eq + std::hash::Hash, V: Clone>(map: &HashMap<K, V>) -> HashMap<K, V> {
-        map.iter().map(|(key, value)| (*key, value.clone())).collect()
+        map.iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
     }
 
     /// One successor always encodes to one byte string, whatever order its
