@@ -1,8 +1,6 @@
 # kin-db
 
-> **Software that remembers itself.**
->
-> Exact context, not more.
+kin-db is the graph storage engine behind Kin, a graph-native code repository for people and AI agents.
 
 The graph storage engine behind Kin. It handles the entities, relationships,
 snapshots, and change history that a Kin repository is made of.
