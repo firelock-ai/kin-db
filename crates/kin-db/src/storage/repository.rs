@@ -21854,6 +21854,42 @@ mod tests {
         );
     }
 
+    /// Eject's shape: it reopens the repository and then freezes the manager it
+    /// just reopened. Another process that commits in between moves the head
+    /// the reopened manager holds, so the freeze revalidates in full and
+    /// refuses, exactly as it does for a manager that committed.
+    #[test]
+    fn a_freeze_of_a_reopened_manager_revalidates_in_full_when_another_process_moved_the_head() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let reopened = reopen(&directory);
+        assert!(
+            reopened.opened_by_history_validation(),
+            "eject's reopen trusts the history proof, as every open does"
+        );
+        let reopened_roots = reopened.read_authority().roots().clone();
+        let external = reopen(&directory);
+        external
+            .commit_repository_transaction(overlay_publication(&external, 0xf7_3607, 0x77))
+            .unwrap();
+        let before = FreezeRevalidation::now();
+        let error = reopened
+            .freeze_current_authority(&reopened_roots)
+            .expect_err("a reopened manager whose head moved before its freeze must not freeze");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted authority moved from the expected root bundle"),
+            "{error}"
+        );
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::FULL,
+            "a head moved between a reopen and its freeze is revalidated in full"
+        );
+    }
+
     /// One snapshot byte corrupted under an unchanged record refuses the
     /// freeze, even of the head this manager holds: the snapshot is hashed
     /// against the record under the lock before anything is trusted.
