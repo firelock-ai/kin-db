@@ -2165,7 +2165,7 @@ impl AuthorityPayloadStats {
         )
     }
 
-    fn from_components(
+    pub(crate) fn from_components(
         snapshot_generation: Generation,
         head_generation: Generation,
         snapshot_bytes: u64,
@@ -2297,6 +2297,12 @@ impl DurableAuthorityIdentity {
             snapshot_sha256,
             frames: Vec::new(),
         }
+    }
+
+    /// Backend generation of the full snapshot every frame in this identity
+    /// extends.
+    pub(crate) fn snapshot_generation(&self) -> Generation {
+        self.snapshot_generation
     }
 
     /// Backend generation of the head this identity names.

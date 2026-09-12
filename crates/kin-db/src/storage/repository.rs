@@ -1954,6 +1954,45 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         ))))
     }
 
+    /// What the head this writer holds occupies: the full snapshot it extends
+    /// plus every acknowledged frame over it.
+    ///
+    /// Reads no bytes. Every count here was recorded when the bytes were
+    /// admitted, by the recovery that read the snapshot or by this writer as it
+    /// installed each frame, so a caller can name the payload of a head it did
+    /// not open for.
+    ///
+    /// Answers only for the exact head asked about. A caller holding one head's
+    /// generations must never be handed another head's byte counts, and after
+    /// this writer commits again the head it holds is no longer the one the
+    /// caller named. `None` also when the counts do not account for the
+    /// generations between the snapshot and the head, which is this writer
+    /// disagreeing with itself: the caller reads the store instead of being
+    /// told a total nothing measured.
+    fn payload_stats_for(&self, head: &DurableAuthorityIdentity) -> Option<AuthorityPayloadStats> {
+        let state = self.state.lock();
+        if state.head.as_ref() != Some(head) {
+            return None;
+        }
+        match AuthorityPayloadStats::from_components(
+            head.snapshot_generation(),
+            state.cursor.backend_generation(),
+            state.base_bytes,
+            state.journal_frames,
+            state.journal_bytes,
+        ) {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                tracing::debug!(
+                    repository = %self.repository_id,
+                    error = %error,
+                    "writer cannot name the payload of the head it holds"
+                );
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
     fn set_max_journal_frames_for_test(&self, max_frames: u64) {
         self.max_journal_frames
@@ -2285,6 +2324,12 @@ pub struct DurableHead {
     /// this manager's own last persist, or at its own history-validation
     /// binding.
     pub record_sha256: String,
+    /// What that head occupies, on the same terms an open reports it.
+    ///
+    /// A reader that adopts this head instead of opening for it has no receipt
+    /// from a recovery, and its own reports name the payload the store holds.
+    /// Reported here so adopting costs no read and no missing answer.
+    pub payload: AuthorityPayloadStats,
 }
 
 /// Result of explicitly persisting one workspace base graph section.
@@ -3642,22 +3687,27 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
     /// serves at this instant, in the currency a reader of `authority.json`
     /// labels a held manager with.
     ///
-    /// `None` when that state was never persisted, or when the record this
-    /// manager's backend last read or wrote names a head other than the one
-    /// the state is: another writer moved the head, and the caller has to
-    /// reload rather than relabel. A record another process rewrote without a
-    /// new publication, such as a history proof bound to the same head, leaves
-    /// the reported digest behind the file, which costs the caller one reload
-    /// and never serves a stale state.
+    /// `None` when that state was never persisted, when the record this
+    /// manager's backend last read or wrote names a head other than the one the
+    /// state is, or when this writer cannot account for what that head
+    /// occupies. The first two mean another writer moved the head, so the
+    /// caller has to reload rather than relabel; the third means the answer
+    /// would be incomplete, and a caller that reloads gets a complete one. A
+    /// record another process rewrote without a new publication, such as a
+    /// history proof bound to the same head, leaves the reported digest behind
+    /// the file, which costs the caller one reload and never serves a stale
+    /// state.
     pub fn durable_head(&self) -> Option<DurableHead> {
         let published = self.read_authority();
         let identity = published.durable_identity()?;
         let record_sha256 = self
             .backend
             .remembered_authority_record_sha256(self.repository_id.as_str(), identity)?;
+        let payload = self.publication.persistence().payload_stats_for(identity)?;
         Some(DurableHead {
             backend_generation: identity.head_generation(),
             record_sha256,
+            payload,
         })
     }
 }
@@ -22052,6 +22102,108 @@ mod tests {
         let head = bound.durable_head().expect("the bound head is named");
         assert_ne!(head.record_sha256, unproven);
         assert_eq!(head.record_sha256, authority_record_sha256(&directory));
+    }
+
+    /// Both halves of one reported head name the same head.
+    ///
+    /// The digest and the payload are read under two different locks, so a
+    /// commit landing between them could otherwise pair one head's generations
+    /// with another head's byte counts. The writer refuses that pairing rather
+    /// than reporting it, and this is the shape of the answer that refusal
+    /// leaves: a head is reported whole or not at all.
+    fn names_one_head(head: &DurableHead) {
+        assert_eq!(
+            head.payload.head_generation(),
+            head.backend_generation,
+            "a reported head's payload must be the payload of that head"
+        );
+    }
+
+    /// The payload receipt a fresh open of the bytes on disk recovers, read
+    /// through a backend of its own so the manager under test keeps the record
+    /// its own backend remembers.
+    fn reopened_payload_stats(directory: &TempDir) -> AuthorityPayloadStats {
+        RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("a valid store reopens")
+        .1
+        .expect("a persisted store recovers a payload receipt")
+    }
+
+    /// A manager reports, for the head it holds, the payload a fresh open of
+    /// those exact bytes recovers.
+    ///
+    /// A reader that adopts the head instead of opening for it has no receipt
+    /// from a recovery and still owes its own readers the payload the store
+    /// holds, so the two answers have to be one answer. Checked after an open,
+    /// after a frame this writer appended and after a full snapshot it wrote,
+    /// because those are the three places the counts come from: seeded from
+    /// recovery, incremented per frame, and reset by a promotion.
+    #[test]
+    fn the_durable_head_reports_the_payload_a_fresh_open_recovers() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+
+        let (held, opened) = RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let opened = opened.expect("a persisted open receipts its payload");
+        let opened_head = held.durable_head().expect("an opened head is named");
+        assert_eq!(
+            opened_head.payload, opened,
+            "after an open, the head reports the receipt that open returned"
+        );
+        names_one_head(&opened_head);
+
+        held.persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        held.commit_repository_transaction(overlay_publication(&held, 0xf7_3801, 0x91))
+            .unwrap();
+        let framed = held.durable_head().expect("a committed head is named");
+        names_one_head(&framed);
+        assert_eq!(
+            framed.payload.acknowledged_delta_count(),
+            opened.acknowledged_delta_count() + 1,
+            "the commit appended one frame over the same snapshot"
+        );
+        assert_eq!(
+            framed.payload.snapshot_bytes(),
+            opened.snapshot_bytes(),
+            "a frame leaves the snapshot it extends alone"
+        );
+        assert_eq!(
+            framed.payload,
+            reopened_payload_stats(&directory),
+            "after a frame this writer appended"
+        );
+
+        // A full snapshot instead of a frame, which retires the journal it
+        // replaced rather than adding to it.
+        held.persistence().set_max_journal_frames_for_test(0);
+        held.commit_repository_transaction(overlay_publication(&held, 0xf7_3802, 0x92))
+            .unwrap();
+        let full = held.durable_head().expect("a rewritten head is named");
+        names_one_head(&full);
+        assert_eq!(
+            full.payload.acknowledged_delta_count(),
+            0,
+            "a full snapshot retires every frame it replaced"
+        );
+        assert_eq!(
+            full.payload.snapshot_generation(),
+            full.backend_generation,
+            "the snapshot is the head"
+        );
+        assert_eq!(
+            full.payload,
+            reopened_payload_stats(&directory),
+            "after a full snapshot this writer wrote"
+        );
     }
 
     /// One snapshot byte corrupted under an unchanged record refuses the

@@ -207,7 +207,9 @@ where
         AuthorityReadLease(Arc::clone(&self.current.read()))
     }
 
-    #[cfg(test)]
+    /// The writer behind this publication, for a reader that needs what the
+    /// writer recorded about the bytes it installed rather than the state
+    /// itself.
     pub(crate) fn persistence(&self) -> &P {
         &self.persistence
     }
