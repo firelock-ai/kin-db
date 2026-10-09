@@ -286,7 +286,7 @@ jobs:
         with:
           files: cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: firelock-ai/kin-db
+          slug: kinlab-ai/kin-db
           fail_ci_if_error: false
 
       # Save only from main, for the same reason as the check job's cache:
