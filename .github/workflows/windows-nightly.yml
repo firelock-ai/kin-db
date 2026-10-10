@@ -26,10 +26,15 @@ name: Windows Authority (nightly)
 # matrix they came out of.
 
 on:
-  schedule:
-    # 07:17 UTC. Off the hour deliberately: GitHub delays scheduled runs
-    # queued on the hour, when everyone else's crons fire.
-    - cron: "17 7 * * *"
+  # Schedule temporarily disabled: every nightly run currently fails fetching
+  # crates because the kinlab.ai cargo registry returns HTTP 502, which pages
+  # through scheduled-failure-alarm.yml without saying anything about Windows.
+  # Re-enable this schedule once the kinlab.ai cargo registry stops returning
+  # 502. Manual runs via workflow_dispatch still work in the meantime.
+  # schedule:
+  #   # 07:17 UTC. Off the hour deliberately: GitHub delays scheduled runs
+  #   # queued on the hour, when everyone else's crons fire.
+  #   - cron: "17 7 * * *"
   workflow_dispatch:
 
 concurrency:
